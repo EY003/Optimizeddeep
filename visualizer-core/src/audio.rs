@@ -52,14 +52,14 @@ impl AudioEngine {
                 // Wait for a packet
                 // inside the loop, replace the packet size and read logic
 
-// Fix 1: Handle Result<Option<u32>>
+// Wait for a packet
+// Fix 1: Use get_next_nbr_frames (correct for wasapi 0.15.0)
 let mut packet_size = 0;
 while packet_size == 0 {
-    // Safely unwrap Result then Option
     packet_size = capture_client
-        .get_next_packet_size()
+        .get_next_nbr_frames() // <-- Correct method name for 0.15
         .unwrap_or(None) // Handle WasapiError
-        .unwrap_or(0);   // Handle None
+        .unwrap_or(0); // Handle None
     if packet_size == 0 {
         thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -68,10 +68,10 @@ while packet_size == 0 {
 // Read the raw bytes
 let mut buffer = vec![0u8; packet_size as usize * (format.get_blockalign() as usize)];
 
-// Fix 2: Use BufferFlags::empty() as default
+// Fix 2: Use BufferFlags::none() instead of empty()
 let (frames_read, _) = capture_client
     .read_from_device(&mut buffer)
-    .unwrap_or((0, BufferFlags::empty())); // <-- Correct default type
+    .unwrap_or((0, BufferFlags::none())); // <-- Correct constructor
                 if frames_read > 0 {
                     // Convert bytes to f32 (WASAPI loopback usually provides 32-bit float)
                     let samples: &[f32] = bytemuck_cast_slice(&buffer);
