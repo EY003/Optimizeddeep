@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::thread;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use wasapi::*;
 use realfft::RealFftPlanner;
 
