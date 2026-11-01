@@ -50,3 +50,13 @@ jobs:
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            - name: Debug - Print visualizer-app manifest
+      run: Get-Content visualizer-app/Cargo.toml
+      shell: pwsh
+    - name: Cache Rust Dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "."
+        cache-on-failure: true
+        # Set to false to bypass the cache for this run
+        enable-cache: false
