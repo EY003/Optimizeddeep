@@ -1,21 +1,52 @@
-name: Build Windows Visualizer
+name: Build and Release
 
-on: [push]
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Allows you to run this manually from the Actions tab
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        
-      - name: Build Release Binary
-        run: cargo build --release
-        
-      - name: Upload Executable Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: music_visualizer_exe
-          path: target/release/music_visualizer.exe
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Rust Toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-msvc
+
+    - name: Cache Rust Dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        # Cache the workspace target directory
+        workspaces: "."
+
+    - name: Build Release
+      run: cargo build --release --workspace
+
+    - name: Upload Executable Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Rust-Visualizer-Windows
+        # Uploads the final .exe from the target/release folder
+        path: target/release/visualizer-app.exe
+        if-no-files-found: error
+
+    - name: Create GitHub Release (Only on Tags)
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: target/release/visualizer-app.exe
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
