@@ -50,7 +50,7 @@ jobs:
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-            - name: Debug - Print visualizer-app manifest
+    - name: Debug - Print visualizer-app manifest
       run: Get-Content visualizer-app/Cargo.toml
       shell: pwsh
     - name: Cache Rust Dependencies
