@@ -20,15 +20,17 @@ pub fn extract_colors(img: &DynamicImage) -> TrackColors {
         .expect("Failed to extract color palette");
 
     // 3. Get the dominant color
-    let dominant = palette
-        .find_swatches(1)
-        .first()
-        .map(|swatch| {
-            let (r, g, b) = swatch.color().to_rgb();
-            [r, g, b]
-        })
-        .unwrap_or([255, 255, 255]);
+    // Inside extract_colors, replace the swatch color extraction
 
+let dominant = palette
+    .find_swatches(1)
+    .first()
+    .map(|swatch| {
+        let rgb = swatch.color().to_rgb();
+        // Access fields directly
+        [rgb.r, rgb.g, rgb.b]
+    })
+    .unwrap_or([255, 255, 255]);
     // 4. Calculate contrasting text color based on luminance
     let luminance = 0.299 * dominant[0] as f32
         + 0.587 * dominant[1] as f32
