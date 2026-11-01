@@ -40,7 +40,7 @@ impl AudioEngine {
                 true, // TRUE = Enable Loopback (System Audio)
             ).expect("Failed to initialize loopback client");
 
-            let capture_client = audio_client.get_iaudiocaptureclient().expect("Failed to get capture client");
+            let capture_client = audio_client.get_audiocaptureclient().expect("Failed to get capture client");
             audio_client.start_stream().expect("Failed to start audio stream");
 
             // 4. Setup FFT Processor
