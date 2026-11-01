@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "visualizer-core",
+    "visualizer-app",
+]
+resolver = "2"
