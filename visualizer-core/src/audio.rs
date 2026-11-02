@@ -147,14 +147,18 @@ impl FFTProcessor {
         let min_bin = 1;
         let max_bin = (fft_size / 3).max(min_bin + 1);
 
-        for (i, bar) in bars.iter_mut().enumerate() {
-            let low = min_bin as f32 * ((max_bin as f32 / min_bin as f32).powf(i as f32 / num_bars as f32));
-            let high = min_bin as f32 * ((max_bin as f32 / min_bin as f32).powf((i + 1) as f32 / num_bars as f32));
+                for (i, bar) in bars.iter_mut().enumerate() {
+            // ✅ FIXED MATH: floor() and ceil() prevent empty ranges
+            let low = min_bin as f32 * ((max_bin as f32 / min_bin as f32).powf(i as f32 / num_bars as f32)).floor();
+            let high = min_bin as f32 * ((max_bin as f32 / min_bin as f32).powf((i + 1) as f32 / num_bars as f32)).ceil();
             
+            let start = low as usize;
+            let end = (high as usize).max(start + 1); // Guarantee at least 1 bin
+
             let mut magnitude = 0.0;
             let mut count = 0;
 
-            for bin in (low as usize)..(high as usize).min(nyquist) {
+            for bin in start..end.min(nyquist) {
                 magnitude += self.output_buffer[bin].norm();
                 count += 1;
             }
@@ -163,12 +167,10 @@ impl FFTProcessor {
                 magnitude /= count as f32;
             }
 
-            // Normalize and map to decibels
             let normalized_magnitude = magnitude / (fft_size as f32 / 2.0);
             let db = 20.0 * (normalized_magnitude + 1e-9).log10();
             let normalized = ((db + 80.0) / 80.0).clamp(0.0, 1.0);
             
-            // Apply a slight curve
             *bar = normalized.powf(1.5); 
         }
 
