@@ -71,7 +71,8 @@ impl eframe::App for VisualizerApp {
             self.draw_settings_ui(ui);
         });
 
-        ctx.request_repaint();
+                // ✅ FIX: Limit to ~60 FPS to drastically reduce CPU/GPU usage
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 }
 
