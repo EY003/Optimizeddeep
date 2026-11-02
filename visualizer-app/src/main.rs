@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 use eframe::egui;
 use visualizer_core::{
     audio::AudioEngine, 
