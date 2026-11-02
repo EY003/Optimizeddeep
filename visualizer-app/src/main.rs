@@ -83,16 +83,26 @@ impl VisualizerApp {
         let total_width = (self.config.num_bars as f32) * (bar_width + gap) - gap;
         let start_x = rect.center().x - (total_width / 2.0);
 
-        for (i, &h) in self.current_bars.iter().enumerate() {
-            let height = (h * self.config.sensitivity / 10.0 * rect.height())
-                .min(rect.height())
-                .max(0.0);
+                for (i, &height_normalized) in self.current_bars.iter().enumerate() {
+            // ✅ FIX: Use a gentler scaling factor for the UI
+            let sensitivity_multiplier = self.config.sensitivity / 15.0; 
+            
+            let final_height_normalized = (height_normalized * sensitivity_multiplier).clamp(0.0, 1.0);
+            let final_height = final_height_normalized * rect.height();
+            
             let x = start_x + (i as f32 * (bar_width + gap));
             let bar_rect = egui::Rect::from_min_max(
-                egui::pos2(x, rect.bottom() - height),
+                egui::pos2(x, rect.bottom() - final_height),
                 egui::pos2(x + bar_width, rect.bottom()),
             );
-            painter.rect_filled(bar_rect, self.config.bar_radius, egui::Color32::LIGHT_GREEN);
+            
+            let color = if self.config.dynamic_colors {
+                egui::Color32::from_rgb(180, 200, 180) 
+            } else {
+                egui::Color32::WHITE
+            };
+
+            painter.rect_filled(bar_rect, self.config.bar_radius, color);
         }
     }
 
