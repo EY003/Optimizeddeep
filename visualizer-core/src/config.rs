@@ -18,6 +18,11 @@ pub struct AppConfig {
     pub color_presets: Vec<[u8; 3]>,
     pub x_offset: f32,
     pub y_offset: f32,
+    
+    // New settings
+    pub max_bar_height: f32, // 0 = unlimited (full screen)
+    pub target_fps: f32,
+    pub show_fps: bool,
 }
 
 impl Default for AppConfig {
@@ -26,7 +31,7 @@ impl Default for AppConfig {
             bar_width: 9.0,
             bar_gap: 1.0,
             bar_radius: 2.0,
-            sensitivity: 10.0, // ✅ Lowered default
+            sensitivity: 10.0,
             fft_size: 1024,
             num_bars: 86,
             dynamic_colors: true,
@@ -36,16 +41,15 @@ impl Default for AppConfig {
             bar_color: [0, 255, 255],
             bg_opacity: 0,
             color_presets: vec![
-                [255, 255, 255], // White
-                [0, 255, 255],   // Cyan
-                [255, 0, 255],   // Magenta
-                [255, 255, 0],   // Yellow
-                [255, 0, 0],     // Red
-                [0, 255, 0],     // Green
-                [0, 0, 255],     // Blue
+                [255, 255, 255], [0, 255, 255], [255, 0, 255],
+                [255, 255, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255],
             ],
             x_offset: 0.0,
             y_offset: 0.0,
+            
+            max_bar_height: 0.0,
+            target_fps: 60.0,
+            show_fps: false,
         }
     }
 }
