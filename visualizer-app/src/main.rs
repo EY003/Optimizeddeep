@@ -75,7 +75,13 @@ impl VisualizerApp {
 }
 
 impl eframe::App for VisualizerApp {
+    // ✅ FIX: Set the clear color to fully transparent
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ... (the rest of your update logic remains unchanged)
         // --- Handle Events ---
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id { self.show_settings = true; } 
