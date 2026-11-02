@@ -169,9 +169,13 @@ impl FFTProcessor {
 
             let normalized_magnitude = magnitude / (fft_size as f32 / 2.0);
             let db = 20.0 * (normalized_magnitude + 1e-9).log10();
-            let normalized = ((db + 80.0) / 80.0).clamp(0.0, 1.0);
             
-            *bar = normalized.powf(1.5); 
+            // ✅ FIX: Map -90dB to -20dB instead of -80dB to 0dB. 
+            // This makes the base values lower, giving you a better range on the sensitivity slider.
+            let normalized = ((db + 90.0) / 70.0).clamp(0.0, 1.0);
+            
+            // Steeper curve so quiet sounds stay quiet
+            *bar = normalized.powf(2.0); 
         }
 
         Some(bars)
