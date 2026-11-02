@@ -22,6 +22,7 @@ struct VisualizerApp {
     should_quit: Arc<AtomicBool>,
     
     show_settings: bool,
+    current_fps: f32,
     
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
@@ -66,6 +67,7 @@ impl VisualizerApp {
             config,
             should_quit,
             show_settings: true, 
+            current_fps: 0.0,
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             settings_menu_id: settings_item.id().clone(),
@@ -75,14 +77,21 @@ impl VisualizerApp {
 }
 
 impl eframe::App for VisualizerApp {
-    // ✅ FIX: Set the clear color to fully transparent
+    // ✅ FIX: Transparent window background
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ... (the rest of your update logic remains unchanged)
-        // --- Handle Events ---
+        // ✅ Calculate FPS
+        let dt = ctx.input(|i| i.unstable_dt);
+        if dt > 0.0 {
+            let instant_fps = 1.0 / dt;
+            // Smooth the FPS display so it doesn't jump around
+            self.current_fps = self.current_fps * 0.9 + instant_fps * 0.1;
+        }
+
+        // --- Handle Events (Tray & Hotkeys) ---
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id { self.show_settings = true; } 
             else if event.id == self.quit_menu_id { self.should_quit.store(true, Ordering::Relaxed); }
@@ -116,7 +125,6 @@ impl eframe::App for VisualizerApp {
         // ==========================================
         // 1. MAIN WINDOW (THE OVERLAY)
         // ==========================================
-        // Ensure main window stays click-through
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
 
         let rect = ctx.screen_rect();
@@ -125,14 +133,23 @@ impl eframe::App for VisualizerApp {
             .show(ctx, |ui| {
                 ui.set_min_size(rect.size());
                 
-                // ✅ FIX: Use unmultiplied RGBA for background
                 if self.config.bg_opacity > 0 {
                     let bg_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, self.config.bg_opacity);
                     ui.painter().rect_filled(rect, 0.0, bg_color);
                 }
                 
                 self.draw_bars(ui, rect);
-                self.draw_song_info(ui, rect);
+                
+                // ✅ Show FPS on overlay if enabled
+                if self.config.show_fps {
+                    ui.painter().text(
+                        rect.left_top() + egui::vec2(20.0, 20.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("FPS: {:.1}", self.current_fps),
+                        egui::FontId::monospace(16.0),
+                        egui::Color32::GREEN,
+                    );
+                }
             });
 
         // ==========================================
@@ -141,16 +158,22 @@ impl eframe::App for VisualizerApp {
         if self.show_settings {
             let settings_builder = egui::ViewportBuilder::default()
                 .with_title("Visualizer Settings")
-                .with_inner_size([400.0, 700.0])
+                .with_inner_size([400.0, 750.0])
                 .with_decorations(true)
                 .with_resizable(true)
-                .with_always_on_top(); // ✅ FIX: Force settings above the overlay
+                .with_always_on_top();
+
+            let mut close_window = false;
 
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("settings"),
                 settings_builder,
                 |ctx, _class| {
-                    // ✅ FIX: Give the settings window a solid background so it's readable
+                    // ✅ Catch the OS "X" button click
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        close_window = true;
+                    }
+
                     egui::CentralPanel::default()
                         .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 25)))
                         .show(ctx, |ui| {
@@ -158,14 +181,21 @@ impl eframe::App for VisualizerApp {
                             
                             ui.separator();
                             if ui.button("❌ Close Settings").clicked() {
-                                self.show_settings = false;
+                                close_window = true;
                             }
                         });
                 },
             );
+
+            if close_window {
+                self.show_settings = false;
+                // Tell egui to actually destroy the window
+                ctx.send_viewport_cmd_to(egui::ViewportId::from_hash_of("settings"), egui::ViewportCommand::Close);
+            }
         }
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // ✅ Limit FPS to save GPU resources
+        ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / self.config.target_fps));
     }
     
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
@@ -184,10 +214,13 @@ impl VisualizerApp {
         let bottom_y = rect.bottom() + self.config.y_offset;
 
         for (i, &height_normalized) in self.current_bars.iter().enumerate() {
-            // ✅ FIX: Divided by 30.0 instead of 10.0 (Sensitivity 30 = Normal)
             let sensitivity_multiplier = self.config.sensitivity / 30.0; 
-            let final_height_normalized = (height_normalized * sensitivity_multiplier).clamp(0.0, 1.0);
-            let final_height = final_height_normalized * rect.height();
+            let mut final_height = height_normalized * sensitivity_multiplier * rect.height();
+
+            // ✅ Apply Max Bar Height
+            if self.config.max_bar_height > 0.0 {
+                final_height = final_height.min(self.config.max_bar_height);
+            }
 
             let x = start_x + (i as f32 * (bar_width + gap));
             let bar_rect = egui::Rect::from_min_max(
@@ -209,22 +242,18 @@ impl VisualizerApp {
         }
     }
 
-    fn draw_song_info(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let pos = rect.right_top() + egui::vec2(-30.0 + self.config.x_offset, 50.0 + self.config.y_offset);
-        ui.painter().text(
-            pos,
-            egui::Align2::RIGHT_TOP,
-            "Waiting for MusicBee...",
-            egui::FontId::proportional(32.0),
-            egui::Color32::WHITE,
-        );
-    }
-
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Performance");
+        ui.add(egui::Slider::new(&mut self.config.target_fps, 15.0..=144.0).text("Target FPS"));
+        ui.checkbox(&mut self.config.show_fps, "Show FPS Counter on Overlay");
+        ui.label(format!("Current FPS: {:.1}", self.current_fps));
+        
+        ui.separator();
         ui.heading("Layout");
         ui.add(egui::Slider::new(&mut self.config.bar_width, 1.0..=50.0).text("Bar width"));
         ui.add(egui::Slider::new(&mut self.config.bar_gap, 0.0..=20.0).text("Bar gap"));
         ui.add(egui::Slider::new(&mut self.config.sensitivity, 1.0..=100.0).text("Sensitivity"));
+        ui.add(egui::Slider::new(&mut self.config.max_bar_height, 0.0..=1000.0).text("Max Bar Height (0 = Full)"));
         ui.add(egui::Slider::new(&mut self.config.num_bars, 16..=256).text("Number of Bars"));
         
         ui.separator();
@@ -287,6 +316,7 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_always_on_top()
             .with_maximized(true),
+        vsync: true, // ✅ Enforce VSync
         ..Default::default()
     };
 
