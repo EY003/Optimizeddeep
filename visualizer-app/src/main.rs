@@ -1,4 +1,6 @@
 #![windows_subsystem = "windows"]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use eframe::egui;
 use visualizer_core::{
     audio::AudioEngine, 
@@ -10,66 +12,100 @@ struct VisualizerApp {
     show_settings: bool,
     current_bars: Vec<f32>,
     audio_rx: crossbeam_channel::Receiver<Vec<f32>>,
+    should_quit: Arc<AtomicBool>,
 }
 
 impl VisualizerApp {
     fn new() -> Self {
-        let config = AppConfig::default();
-        
-        // Start the WASAPI loopback audio engine
-        let engine = AudioEngine::new(config.num_bars);
-        
-        Self {
-            current_bars: vec![0.0; config.num_bars],
-            audio_rx: engine.data_rx,
-            config,
-            show_settings: false,
+    let config = AppConfig::default();
+    let engine = AudioEngine::new(config.num_bars);
+    let should_quit = Arc::new(AtomicBool::new(false));
+
+    // Spawn a thread that listens for ESC key on stdin (debug helper)
+    let quit_flag = should_quit.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            if line.is_err() { break; }
+            // Any Enter keypress quits during testing
+            quit_flag.store(true, Ordering::Relaxed);
+            break;
         }
+    });
+
+    Self {
+        current_bars: vec![0.0; config.num_bars],
+        audio_rx: engine.data_rx,
+        config,
+        show_settings: true, // 👈 START WITH SETTINGS OPEN so you can see it
+        should_quit,
     }
 }
 
 impl eframe::App for VisualizerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Fetch new audio data from the background thread
-        while let Ok(bars) = self.audio_rx.try_recv() {
-            for (i, &val) in bars.iter().enumerate() {
-                if i < self.current_bars.len() {
-                    // Smoothing: Interpolate between old height and new height
-                    // This prevents the bars from flickering too fast
-                    self.current_bars[i] = self.current_bars[i] * 0.6 + val * 0.4;
-                }
+ fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // Allow exiting via Enter key (debug helper)
+    if self.should_quit.load(Ordering::Relaxed) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        return;
+    }
+
+    // Debug: print how many audio frames we're receiving per second
+    // (remove later)
+    while let Ok(bars) = self.audio_rx.try_recv() {
+        let max_val = bars.iter().cloned().fold(0.0_f32, f32::max);
+        eprintln!("Audio packet received. Max bar: {:.3}", max_val);
+        for (i, &val) in bars.iter().enumerate() {
+            if i < self.current_bars.len() {
+                self.current_bars[i] = self.current_bars[i] * 0.6 + val * 0.4;
             }
         }
-
-        // 2. Render the Click-Through Overlay
-        if !self.show_settings {
-            let rect = ctx.screen_rect();
-            egui::Area::new(egui::Id::new("overlay"))
-                .fixed_pos(rect.min)
-                .show(ctx, |ui| {
-                    ui.set_min_size(rect.size());
-                    // Clear background to be fully transparent
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::TRANSPARENT);
-                    
-                    self.draw_bars(ui, rect);
-                    self.draw_song_info(ui, rect);
-                });
-        }
-
-        // 3. Render the Settings Window
-if self.show_settings {
-    let mut is_open = self.show_settings;
-    egui::Window::new("Settings")
-        .open(&mut is_open)
-        .show(ctx, |ui| {
-            self.draw_settings_ui(ui);
-        });
-    self.show_settings = is_open;
-}
-
-        // Request continuous repaint for the 60 FPS animation
-        ctx.request_repaint();
     }
+
+    // Overlay rendering
+    if !self.show_settings {
+        let rect = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("overlay"))
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(rect.size());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::TRANSPARENT);
+
+                // 👇 TEMPORARY: Draw a red reference line so you can confirm rendering
+                ui.painter().line_segment(
+                    [rect.left_bottom(), rect.right_bottom()],
+                    egui::Stroke::new(3.0, egui::Color32::RED),
+                );
+
+                self.draw_bars(ui, rect);
+                self.draw_song_info(ui, rect);
+            });
+    }
+
+    // Settings window
+    if self.show_settings {
+        let mut is_open = self.show_settings;
+        egui::Window::new("Settings")
+            .open(&mut is_open)
+            .resizable(true)
+            .default_size([400.0, 600.0])
+            .show(ctx, |ui| {
+                self.draw_settings_ui(ui);
+                ui.separator();
+                ui.label(format!(
+                    "Audio received: {}",
+                    self.current_bars.iter().filter(|v| **v > 0.01).count()
+                ));
+                if ui.button("Close Settings (Start Overlay)").clicked() {
+                    self.show_settings = false;
+                }
+            });
+        self.show_settings = is_open;
+    }
+
+    ctx.request_repaint();
+}
 }
 
 impl VisualizerApp {
