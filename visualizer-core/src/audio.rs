@@ -167,7 +167,7 @@ impl FFTProcessor {
         let min_bin = 1;
         let max_bin = nyquist;
 
-        for (i, bar) in bars.iter_mut().enumerate() {
+                for (i, bar) in bars.iter_mut().enumerate() {
             // Logarithmic mapping
             let low = min_bin as f32 * ((max_bin as f32 / min_bin as f32).powf(i as f32 / self.num_bars as f32));
             let high = min_bin as f32 * ((max_bin as f32 / min_bin as f32).powf((i + 1) as f32 / self.num_bars as f32));
@@ -184,8 +184,12 @@ impl FFTProcessor {
                 magnitude /= count as f32;
             }
 
-            // Convert to decibels and normalize
-            let db = 20.0 * (magnitude + 1e-6).log10();
+            // ✅ FIX: Normalize the magnitude by the FFT size
+            let normalized_magnitude = magnitude / (fft_size as f32 / 2.0);
+
+            // Convert to decibels
+            let db = 20.0 * (normalized_magnitude + 1e-9).log10();
+            
             // Map -80dB to 0dB into 0.0 -> 1.0 range
             let normalized = ((db + 80.0) / 80.0).clamp(0.0, 1.0);
             
