@@ -12,6 +12,13 @@ pub struct AppConfig {
     pub dynamic_colors: bool,
     pub text_border: bool,
     pub font_path: Option<String>,
+    
+    // New settings
+    pub bar_color: [u8; 3],
+    pub bg_opacity: u8,
+    pub color_presets: Vec<[u8; 3]>,
+    pub x_offset: f32,
+    pub y_offset: f32,
 }
 
 impl Default for AppConfig {
@@ -26,6 +33,12 @@ impl Default for AppConfig {
             dynamic_colors: true,
             text_border: false,
             font_path: None,
+            
+            bar_color: [180, 200, 180],
+            bg_opacity: 0, // 0 = fully transparent
+            color_presets: vec![],
+            x_offset: 0.0,
+            y_offset: 0.0,
         }
     }
 }
