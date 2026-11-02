@@ -65,7 +65,7 @@ impl VisualizerApp {
             audio_target_bars,
             config,
             should_quit,
-            show_settings: true, // Start with settings open
+            show_settings: true, 
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             settings_menu_id: settings_item.id().clone(),
@@ -76,7 +76,7 @@ impl VisualizerApp {
 
 impl eframe::App for VisualizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- Handle Events (Tray & Hotkeys) ---
+        // --- Handle Events ---
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id { self.show_settings = true; } 
             else if event.id == self.quit_menu_id { self.should_quit.store(true, Ordering::Relaxed); }
@@ -108,9 +108,9 @@ impl eframe::App for VisualizerApp {
         }
 
         // ==========================================
-        // 1. MAIN WINDOW (THE OVERLAY - ALWAYS CLICK-THROUGH)
+        // 1. MAIN WINDOW (THE OVERLAY)
         // ==========================================
-        // Force the main window to remain click-through permanently
+        // Ensure main window stays click-through
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
 
         let rect = ctx.screen_rect();
@@ -119,40 +119,42 @@ impl eframe::App for VisualizerApp {
             .show(ctx, |ui| {
                 ui.set_min_size(rect.size());
                 
-                // Background Opacity Fix
-                let bg_color = if self.config.bg_opacity == 0 {
-                    egui::Color32::TRANSPARENT
-                } else {
-                    egui::Color32::from_black_alpha(self.config.bg_opacity)
-                };
-                ui.painter().rect_filled(rect, 0.0, bg_color);
+                // ✅ FIX: Use unmultiplied RGBA for background
+                if self.config.bg_opacity > 0 {
+                    let bg_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, self.config.bg_opacity);
+                    ui.painter().rect_filled(rect, 0.0, bg_color);
+                }
                 
                 self.draw_bars(ui, rect);
                 self.draw_song_info(ui, rect);
             });
 
         // ==========================================
-        // 2. SETTINGS WINDOW (A SEPARATE NATIVE WINDOW)
+        // 2. SETTINGS WINDOW (SEPARATE VIEWPORT)
         // ==========================================
         if self.show_settings {
             let settings_builder = egui::ViewportBuilder::default()
                 .with_title("Visualizer Settings")
                 .with_inner_size([400.0, 700.0])
                 .with_decorations(true)
-                .with_resizable(true);
+                .with_resizable(true)
+                .with_always_on_top(); // ✅ FIX: Force settings above the overlay
 
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("settings"),
                 settings_builder,
                 |ctx, _class| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        self.draw_settings_ui(ui);
-                        
-                        ui.separator();
-                        if ui.button("❌ Close Settings").clicked() {
-                            self.show_settings = false;
-                        }
-                    });
+                    // ✅ FIX: Give the settings window a solid background so it's readable
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 25)))
+                        .show(ctx, |ui| {
+                            self.draw_settings_ui(ui);
+                            
+                            ui.separator();
+                            if ui.button("❌ Close Settings").clicked() {
+                                self.show_settings = false;
+                            }
+                        });
                 },
             );
         }
@@ -176,7 +178,8 @@ impl VisualizerApp {
         let bottom_y = rect.bottom() + self.config.y_offset;
 
         for (i, &height_normalized) in self.current_bars.iter().enumerate() {
-            let sensitivity_multiplier = self.config.sensitivity / 10.0;
+            // ✅ FIX: Divided by 30.0 instead of 10.0 (Sensitivity 30 = Normal)
+            let sensitivity_multiplier = self.config.sensitivity / 30.0; 
             let final_height_normalized = (height_normalized * sensitivity_multiplier).clamp(0.0, 1.0);
             let final_height = final_height_normalized * rect.height();
 
@@ -278,6 +281,8 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_always_on_top()
             .with_maximized(true),
+        // ✅ FIX: Explicitly tell the window manager to clear the background with Alpha 0
+        clear_color: egui::Color32::TRANSPARENT.into(),
         ..Default::default()
     };
 
