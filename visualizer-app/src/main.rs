@@ -281,8 +281,6 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_always_on_top()
             .with_maximized(true),
-        // ✅ FIX: Explicitly tell the window manager to clear the background with Alpha 0
-        clear_color: egui::Color32::TRANSPARENT.into(),
         ..Default::default()
     };
 
