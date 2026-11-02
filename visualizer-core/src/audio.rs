@@ -159,13 +159,13 @@ impl FFTProcessor {
             return None;
         }
 
-        // Map FFT bins to visualizer bars (Logarithmic scale)
-        let mut bars = vec![0.0; self.num_bars];
+               let mut bars = vec![0.0; self.num_bars];
         let nyquist = fft_size / 2;
         
-        // We ignore the very low frequencies (bass rumble) and very high
+        // ✅ FIX: Cap max_bin to roughly 14kHz (instead of the full 22kHz)
+        // This forces the active musical frequencies to stretch across all 86 bars.
         let min_bin = 1;
-        let max_bin = nyquist;
+        let max_bin = (fft_size / 3).max(min_bin + 1); 
 
                 for (i, bar) in bars.iter_mut().enumerate() {
             // Logarithmic mapping
