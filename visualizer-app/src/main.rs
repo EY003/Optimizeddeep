@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"] // Hides the console window
+#![windows_subsystem = "windows"]
 
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +8,6 @@ use visualizer_core::{
     config::AppConfig,
 };
 
-// Global Hotkeys & Tray imports
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, hotkey::{Code, HotKey, Modifiers}};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
@@ -19,12 +18,12 @@ struct VisualizerApp {
     config: AppConfig,
     current_bars: Vec<f32>,
     audio_rx: crossbeam_channel::Receiver<Vec<f32>>,
+    audio_target_bars: Arc<std::sync::atomic::AtomicUsize>,
     should_quit: Arc<AtomicBool>,
     
     show_settings: bool,
     last_show_settings: bool,
 
-    // We must keep these alive so they aren't dropped and destroyed
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
     settings_menu_id: tray_icon::menu::MenuId,
@@ -33,21 +32,20 @@ struct VisualizerApp {
 
 impl VisualizerApp {
     fn new() -> Self {
-        let config = AppConfig::load(); // Load from disk
+        let config = AppConfig::load();
         let engine = AudioEngine::new(config.num_bars);
         let should_quit = Arc::new(AtomicBool::new(false));
+        let audio_target_bars = engine.target_bars.clone();
 
-        // 1. Setup System Tray
         let tray_menu = Menu::new();
         let settings_item = MenuItem::new("Open Settings", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
         tray_menu.append_items(&[&settings_item, &quit_item]).unwrap();
 
-        // Create a simple 16x16 green square icon programmatically
         let mut icon_rgba = vec![0; 16 * 16 * 4];
         for i in 0..(16 * 16) {
-            icon_rgba[i * 4 + 1] = 255; // Green
-            icon_rgba[i * 4 + 3] = 255; // Alpha
+            icon_rgba[i * 4 + 1] = 255;
+            icon_rgba[i * 4 + 3] = 255;
         }
         let icon = tray_icon::Icon::from_rgba(icon_rgba, 16, 16).unwrap();
 
@@ -58,7 +56,6 @@ impl VisualizerApp {
             .build()
             .unwrap();
 
-        // 2. Setup Global Hotkey (Ctrl+Shift+V)
         let hotkey_manager = GlobalHotKeyManager::new().unwrap();
         let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
         hotkey_manager.register(hotkey).unwrap();
@@ -66,9 +63,10 @@ impl VisualizerApp {
         Self {
             current_bars: vec![0.0; config.num_bars],
             audio_rx: engine.data_rx,
+            audio_target_bars,
             config,
             should_quit,
-            show_settings: true, // Start with settings open on first launch
+            show_settings: true,
             last_show_settings: false, 
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
@@ -80,19 +78,14 @@ impl VisualizerApp {
 
 impl eframe::App for VisualizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- Handle Events (Tray & Hotkeys) ---
+        // Events
         if let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == self.settings_menu_id {
-                self.show_settings = true;
-            } else if event.id == self.quit_menu_id {
-                self.should_quit.store(true, Ordering::Relaxed);
-            }
+            if event.id == self.settings_menu_id { self.show_settings = true; } 
+            else if event.id == self.quit_menu_id { self.should_quit.store(true, Ordering::Relaxed); }
         }
 
         if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if event.state == global_hotkey::HotKeyState::Pressed {
-                self.show_settings = !self.show_settings;
-            }
+            if event.state == global_hotkey::HotKeyState::Pressed { self.show_settings = !self.show_settings; }
         }
 
         if self.should_quit.load(Ordering::Relaxed) {
@@ -100,24 +93,24 @@ impl eframe::App for VisualizerApp {
             return;
         }
 
-        // --- Handle Window State Changes (Overlay vs Settings) ---
-        // We only send these commands if the state has changed, to prevent flickering
+        // Window State Management
         if self.show_settings != self.last_show_settings {
             if self.show_settings {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(500.0, 600.0)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             }
             self.last_show_settings = self.show_settings;
         }
 
-        // --- Process Audio ---
+        // Update Audio Engine if slider changed
+        let current_target = self.audio_target_bars.load(Ordering::Relaxed);
+        if current_target != self.config.num_bars {
+            self.audio_target_bars.store(self.config.num_bars, Ordering::Relaxed);
+            self.current_bars.resize(self.config.num_bars, 0.0);
+        }
+
+        // Process Audio
         while let Ok(bars) = self.audio_rx.try_recv() {
             for (i, &val) in bars.iter().enumerate() {
                 if i < self.current_bars.len() {
@@ -126,37 +119,38 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        // --- Render UI ---
+        // --- Render Overlay (Always visible) ---
+        let rect = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("overlay"))
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(rect.size());
+                
+                // Background Opacity
+                let bg_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, self.config.bg_opacity);
+                ui.painter().rect_filled(rect, 0.0, bg_color);
+                
+                self.draw_bars(ui, rect);
+                self.draw_song_info(ui, rect);
+            });
+
+        // --- Render Settings Window ---
         if self.show_settings {
-            // Draw Settings Window (Opaque background)
-            egui::CentralPanel::default()
-                .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 25)))
+            let mut is_open = self.show_settings;
+            egui::Window::new("Visualizer Settings")
+                .open(&mut is_open)
+                .default_pos(egui::pos2(50.0, 50.0))
+                .resizable(true)
+                .default_size([400.0, 700.0])
                 .show(ctx, |ui| {
                     self.draw_settings_ui(ui);
-                    if ui.button("Close Settings (Show Overlay)").clicked() {
-                        self.show_settings = false;
-                    }
                 });
-        } else {
-            // Draw Transparent Overlay
-            let rect = ctx.screen_rect();
-            egui::Area::new(egui::Id::new("overlay"))
-                .fixed_pos(rect.min)
-                .show(ctx, |ui| {
-                    ui.set_min_size(rect.size());
-                    // Clear background
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::TRANSPARENT);
-                    
-                    self.draw_bars(ui, rect);
-                    self.draw_song_info(ui, rect);
-                });
+            if !is_open { self.show_settings = false; } // Handle clicking X
         }
 
-        // Limit to ~60 FPS
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
     
-    // Save config automatically when app closes
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
         self.config.save();
     }
@@ -168,7 +162,10 @@ impl VisualizerApp {
         let bar_width = self.config.bar_width;
         let gap = self.config.bar_gap;
         let total_width = (self.config.num_bars as f32) * (bar_width + gap) - gap;
-        let start_x = rect.center().x - (total_width / 2.0);
+        
+        // Apply X/Y Offset
+        let start_x = rect.center().x - (total_width / 2.0) + self.config.x_offset;
+        let bottom_y = rect.bottom() + self.config.y_offset;
 
         for (i, &height_normalized) in self.current_bars.iter().enumerate() {
             let sensitivity_multiplier = self.config.sensitivity / 15.0;
@@ -177,14 +174,19 @@ impl VisualizerApp {
 
             let x = start_x + (i as f32 * (bar_width + gap));
             let bar_rect = egui::Rect::from_min_max(
-                egui::pos2(x, rect.bottom() - final_height),
-                egui::pos2(x + bar_width, rect.bottom()),
+                egui::pos2(x, bottom_y - final_height),
+                egui::pos2(x + bar_width, bottom_y),
             );
 
+            // Use Static Color if dynamic colors are off
             let color = if self.config.dynamic_colors {
                 egui::Color32::from_rgb(180, 200, 180)
             } else {
-                egui::Color32::WHITE
+                egui::Color32::from_rgb(
+                    self.config.bar_color[0], 
+                    self.config.bar_color[1], 
+                    self.config.bar_color[2]
+                )
             };
 
             painter.rect_filled(bar_rect, self.config.bar_radius, color);
@@ -192,7 +194,7 @@ impl VisualizerApp {
     }
 
     fn draw_song_info(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let pos = rect.right_top() + egui::vec2(-30.0, 50.0);
+        let pos = rect.right_top() + egui::vec2(-30.0 + self.config.x_offset, 50.0 + self.config.y_offset);
         ui.painter().text(
             pos,
             egui::Align2::RIGHT_TOP,
@@ -203,25 +205,56 @@ impl VisualizerApp {
     }
 
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Visualizer Settings");
-        ui.separator();
+        ui.heading("Layout");
         ui.add(egui::Slider::new(&mut self.config.bar_width, 1.0..=50.0).text("Bar width"));
         ui.add(egui::Slider::new(&mut self.config.bar_gap, 0.0..=20.0).text("Bar gap"));
         ui.add(egui::Slider::new(&mut self.config.sensitivity, 1.0..=100.0).text("Sensitivity"));
         ui.add(egui::Slider::new(&mut self.config.num_bars, 16..=256).text("Number of Bars"));
         
         ui.separator();
-        ui.heading("Style");
+        ui.heading("Positioning (X / Y)");
+        ui.add(egui::Slider::new(&mut self.config.x_offset, -1000.0..=1000.0).text("X Offset"));
+        ui.add(egui::Slider::new(&mut self.config.y_offset, -1000.0..=1000.0).text("Y Offset"));
+
+        ui.separator();
+        ui.heading("Appearance");
         ui.checkbox(&mut self.config.dynamic_colors, "Dynamic colors (Cover)");
-        ui.checkbox(&mut self.config.text_border, "Text border");
         
-        if ui.button("Select Custom Font").clicked() {
-            if let Some(path) = rfd::FileDialog::new().add_filter("Font", &["ttf", "otf"]).pick_file() {
-                self.config.font_path = Some(path.to_string_lossy().to_string());
+        if !self.config.dynamic_colors {
+            ui.horizontal(|ui| {
+                ui.label("Bar Color:");
+                if ui.color_edit_button_srgb(&mut self.config.bar_color).changed() {
+                    // Color changed
+                }
+                if ui.button("Save Preset").clicked() {
+                    if !self.config.color_presets.contains(&self.config.bar_color) {
+                        self.config.color_presets.push(self.config.bar_color);
+                    }
+                }
+            });
+
+            // Presets
+            if !self.config.color_presets.is_empty() {
+                ui.label("Presets:");
+                ui.horizontal_wrapped(|ui| {
+                    for preset in &self.config.color_presets {
+                        let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+                        if ui.is_rect_visible(rect) {
+                            let color = egui::Color32::from_rgb(preset[0], preset[1], preset[2]);
+                            ui.painter().rect_filled(rect, 2.0, color);
+                            if response.clicked() {
+                                self.config.bar_color = *preset;
+                            }
+                        }
+                    }
+                });
             }
         }
+
+        ui.add(egui::Slider::new(&mut self.config.bg_opacity, 0..=255).text("Background Opacity"));
         
         ui.separator();
+        ui.checkbox(&mut self.config.text_border, "Text border");
         ui.label("Press Ctrl+Shift+V to toggle this menu.");
     }
 }
@@ -229,8 +262,10 @@ impl VisualizerApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_transparent(true) // Required for the overlay to work
-            .with_title("Rust Visualizer"),
+            .with_transparent(true)
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_maximized(true),
         ..Default::default()
     };
 
