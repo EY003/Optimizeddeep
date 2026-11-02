@@ -32,16 +32,24 @@ impl AudioEngine {
             let format = audio_client.get_mixformat().expect("Failed to get mix format");
             let (_, min_time) = audio_client.get_periods().expect("Failed to get periods");
 
-            audio_client.initialize_client(
-                &format,
-                min_time,
-                &Direction::Capture,
-                &ShareMode::Shared,
-                true, // TRUE = Enable Loopback (System Audio)
-            ).expect("Failed to initialize loopback client");
+audio_client.initialize_client(
+    &format,
+    min_time,
+    &Direction::Capture,
+    &ShareMode::Shared,
+    true, // TRUE = Enable Loopback (System Audio)
+).expect("Failed to initialize loopback client");
 
-            let capture_client = audio_client.get_audiocaptureclient().expect("Failed to get capture client");
-            audio_client.start_stream().expect("Failed to start audio stream");
+// ✅ FIX: Create and set the event handle for event-driven mode
+let h_event = audio_client
+    .set_get_eventhandle()
+    .expect("Failed to set event handle");
+
+let capture_client = audio_client
+    .get_audiocaptureclient()
+    .expect("Failed to get capture client");
+
+audio_client.start_stream().expect("Failed to start audio stream");
 
             // 4. Setup FFT Processor
             let channels = format.get_nchannels() as usize;
