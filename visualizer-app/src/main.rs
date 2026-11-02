@@ -56,13 +56,15 @@ impl eframe::App for VisualizerApp {
         }
 
         // 3. Render the Settings Window
-        if self.show_settings {
-            egui::Window::new("Settings")
-                .open(&mut self.show_settings)
-                .show(ctx, |ui| {
-                    self.draw_settings_ui(ui);
-                });
-        }
+if self.show_settings {
+    let mut is_open = self.show_settings;
+    egui::Window::new("Settings")
+        .open(&mut is_open)
+        .show(ctx, |ui| {
+            self.draw_settings_ui(ui);
+        });
+    self.show_settings = is_open;
+}
 
         // Request continuous repaint for the 60 FPS animation
         ctx.request_repaint();
