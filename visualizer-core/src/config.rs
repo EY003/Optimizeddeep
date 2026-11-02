@@ -13,7 +13,6 @@ pub struct AppConfig {
     pub text_border: bool,
     pub font_path: Option<String>,
     
-    // New settings
     pub bar_color: [u8; 3],
     pub bg_opacity: u8,
     pub color_presets: Vec<[u8; 3]>,
@@ -27,16 +26,24 @@ impl Default for AppConfig {
             bar_width: 9.0,
             bar_gap: 1.0,
             bar_radius: 2.0,
-            sensitivity: 33.0,
+            sensitivity: 10.0, // ✅ Lowered default
             fft_size: 1024,
             num_bars: 86,
             dynamic_colors: true,
             text_border: false,
             font_path: None,
             
-            bar_color: [180, 200, 180],
-            bg_opacity: 0, // 0 = fully transparent
-            color_presets: vec![],
+            bar_color: [0, 255, 255],
+            bg_opacity: 0,
+            color_presets: vec![
+                [255, 255, 255], // White
+                [0, 255, 255],   // Cyan
+                [255, 0, 255],   // Magenta
+                [255, 255, 0],   // Yellow
+                [255, 0, 0],     // Red
+                [0, 255, 0],     // Green
+                [0, 0, 255],     // Blue
+            ],
             x_offset: 0.0,
             y_offset: 0.0,
         }
