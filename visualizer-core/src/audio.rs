@@ -41,7 +41,7 @@ audio_client.initialize_client(
 ).expect("Failed to initialize loopback client");
 
 // ✅ FIX: Create and set the event handle for event-driven mode
-let h_event = audio_client
+let _h_event = audio_client
     .set_get_eventhandle()
     .expect("Failed to set event handle");
 
