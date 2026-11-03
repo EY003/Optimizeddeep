@@ -606,6 +606,8 @@ impl VisualizerApp {
                 });
 
                 let mut to_remove = None;
+                // Fix: cache length to avoid immutable borrow while iterating mutably
+                let current_len = self.config.static_colors.len();
                 for (i, color) in self.config.static_colors.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.color_edit_button_srgb(color);
@@ -670,7 +672,7 @@ impl VisualizerApp {
                     
                     let handle_color = egui::Color32::from_rgb(stop.color[0], stop.color[1], stop.color[2]);
                     painter.rect_filled(stop_rect, 2.0, handle_color);
-                    painter.rect_stroke(stop_rect, 2.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    painter.rect_stroke(stop_rect, 2.0_f32, egui::Stroke::new(2.0_f32, egui::Color32::WHITE)); // Fix: explicitly typed as f32
                 }
 
                 // Double-click to add a stop
@@ -686,11 +688,13 @@ impl VisualizerApp {
 
                 // List of stops
                 let mut to_remove = None;
+                // Fix: cache length to avoid immutable borrow while iterating mutably
+                let current_len = self.config.gradient_stops.len();
                 for (i, stop) in self.config.gradient_stops.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.color_edit_button_srgb(&mut stop.color);
                         ui.label(format!("Pos: {:.2}", stop.position));
-                        if self.config.gradient_stops.len() > 2 && ui.button("❌").clicked() {
+                        if current_len > 2 && ui.button("❌").clicked() {
                             to_remove = Some(i);
                         }
                     });
@@ -722,10 +726,12 @@ impl VisualizerApp {
             ColorMode::ColorChanging => {
                 ui.heading("Color Changing");
                 let mut to_remove = None;
+                // Fix: cache length to avoid immutable borrow while iterating mutably
+                let current_len = self.config.color_change_colors.len();
                 for (i, color) in self.config.color_change_colors.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.color_edit_button_srgb(color);
-                        if self.config.color_change_colors.len() > 2 && ui.button("❌").clicked() {
+                        if current_len > 2 && ui.button("❌").clicked() {
                             to_remove = Some(i);
                         }
                     });
@@ -768,7 +774,7 @@ impl VisualizerApp {
         ui.add(egui::Slider::new(&mut self.config.bg_opacity, 0..=255).text("Background Opacity"));
 
         ui.separator();
-        if ui.button("⚠️ Reset to Defaults").clicked() {
+        if ui.button("Reset to Defaults").clicked() {
             self.config = AppConfig::default();
             self.audio_target_bars.store(self.config.num_bars, Ordering::Relaxed);
             self.audio_update_interval.store(self.config.audio_update_ms, Ordering::Relaxed);
