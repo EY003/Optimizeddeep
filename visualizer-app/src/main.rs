@@ -1,18 +1,18 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use visualizer_core::{
-    audio::AudioEngine,
-    config::AppConfig,
-};
+use visualizer_core::{audio::AudioEngine, config::AppConfig};
 
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, hotkey::{Code, HotKey, Modifiers}};
+use global_hotkey::{
+    hotkey::{Code, HotKey, Modifiers},
+    GlobalHotKeyEvent, GlobalHotKeyManager,
+};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
-    TrayIconBuilder, TrayIcon,
+    TrayIcon, TrayIconBuilder,
 };
 
 struct VisualizerApp {
@@ -28,8 +28,7 @@ struct VisualizerApp {
     is_passthrough_set: bool,
 
     /// Timestamp at the *start* of the previous `update()` call.
-    /// Used both to measure real inter-frame time for the FPS counter
-    /// and (indirectly) to drive the frame pacer.
+    /// Used to measure real inter-frame time for the FPS counter.
     last_frame_time: Instant,
 
     _tray_icon: TrayIcon,
@@ -49,7 +48,9 @@ impl VisualizerApp {
         let tray_menu = Menu::new();
         let settings_item = MenuItem::new("Open Settings", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
-        tray_menu.append_items(&[&settings_item, &quit_item]).unwrap();
+        tray_menu
+            .append_items(&[&settings_item, &quit_item])
+            .unwrap();
 
         let mut icon_rgba = vec![0; 16 * 16 * 4];
         for i in 0..(16 * 16) {
@@ -94,9 +95,8 @@ impl eframe::App for VisualizerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── 0. FPS counter ──────────────────────────────────────────────
-        // Sample once at the start; `dt` is the true period since the
-        // previous frame *started*, which is the number the user perceives.
+        // ── 0. FPS counter ─────────────────────────────────────────────
+        // `dt` is the true period between two `update()` *starts*.
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
@@ -105,15 +105,17 @@ impl eframe::App for VisualizerApp {
             self.current_fps = self.current_fps * 0.9 + instant_fps * 0.1;
         }
 
-        // ── 1. Force 1.0 pixels-per-point (only when needed) ───────────
-        // Calling this every frame forces egui to re-layout widgets; do it
-        // only on the first frame / after a DPI change.
+        // ── 1. Force 1.0 pixels-per-point (only when needed) ──────────
+        // Fires once on first frame and again if the user moves the
+        // window to a display with different DPI.
         if ctx.pixels_per_point() != 1.0 {
             ctx.set_pixels_per_point(1.0);
         }
 
-        // ── 2. Tray & hotkey events ────────────────────────────────────
-        if let Ok(event) = MenuEvent::receiver().try_recv() {
+        // ── 2. Tray & hotkey events ───────────────────────────────────
+        // Drain *all* pending events per frame (bursts happen if the
+        // event loop was blocked). Cheap; try_recv is non-blocking.
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id {
                 self.show_settings = true;
             } else if event.id == self.quit_menu_id {
@@ -121,9 +123,19 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
             if event.state == global_hotkey::HotKeyState::Pressed {
-                self.show_settings = !self.show_settings;
+                if self.show_settings {
+                    // Explicitly close the settings viewport so the OS
+                    // window doesn't linger after the toggle.
+                    self.show_settings = false;
+                    ctx.send_viewport_cmd_to(
+                        egui::ViewportId::from_hash_of("settings"),
+                        egui::ViewportCommand::Close,
+                    );
+                } else {
+                    self.show_settings = true;
+                }
             }
         }
 
@@ -132,7 +144,7 @@ impl eframe::App for VisualizerApp {
             return;
         }
 
-        // ── 3. Push settings into the audio thread ─────────────────────
+        // ── 3. Push settings into the audio thread ────────────────────
         let current_target = self.audio_target_bars.load(Ordering::Relaxed);
         if current_target != self.config.num_bars {
             self.audio_target_bars
@@ -146,19 +158,17 @@ impl eframe::App for VisualizerApp {
                 .store(self.config.audio_update_ms, Ordering::Relaxed);
         }
 
-        // ── 4. Drain audio channel — keep only the newest frame ────────
+        // ── 4. Drain audio channel — keep only the newest frame ───────
         // Applying every queued frame with the smoothing filter would
-        // compound the lerp and waste CPU; the latest sample is what the
-        // user actually wants to see.
+        // compound the lerp; the latest sample is what the user wants.
         let mut latest_bars: Option<Vec<f32>> = None;
         while let Ok(bars) = self.audio_rx.try_recv() {
             latest_bars = Some(bars);
         }
         if let Some(bars) = latest_bars {
-            for (i, &val) in bars.iter().enumerate() {
-                if i >= self.current_bars.len() {
-                    break;
-                }
+            let limit = self.current_bars.len().min(bars.len());
+            for i in 0..limit {
+                let val = bars[i];
                 if val > self.current_bars[i] {
                     self.current_bars[i] = val;
                 } else {
@@ -167,13 +177,13 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        // ── 5. One-shot mouse passthrough ──────────────────────────────
+        // ── 5. One-shot mouse passthrough ─────────────────────────────
         if !self.is_passthrough_set {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
             self.is_passthrough_set = true;
         }
 
-        // ── 6. Overlay ─────────────────────────────────────────────────
+        // ── 6. Overlay ────────────────────────────────────────────────
         let rect = ctx.screen_rect();
         egui::Area::new(egui::Id::new("overlay"))
             .fixed_pos(rect.min)
@@ -181,9 +191,8 @@ impl eframe::App for VisualizerApp {
                 ui.set_min_size(rect.size());
 
                 if self.config.bg_opacity > 0 {
-                    let bg_color = egui::Color32::from_rgba_unmultiplied(
-                        0, 0, 0, self.config.bg_opacity,
-                    );
+                    let bg_color =
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, self.config.bg_opacity);
                     ui.painter().rect_filled(rect, 0.0, bg_color);
                 }
 
@@ -200,7 +209,7 @@ impl eframe::App for VisualizerApp {
                 }
             });
 
-        // ── 7. Settings viewport ───────────────────────────────────────
+        // ── 7. Settings viewport ──────────────────────────────────────
         if self.show_settings {
             let settings_builder = egui::ViewportBuilder::default()
                 .with_title("Visualizer Settings")
@@ -237,6 +246,8 @@ impl eframe::App for VisualizerApp {
 
             if close_window {
                 self.show_settings = false;
+                // Persist settings even if the app is force-quit later.
+                self.config.save();
                 ctx.send_viewport_cmd_to(
                     egui::ViewportId::from_hash_of("settings"),
                     egui::ViewportCommand::Close,
@@ -244,14 +255,13 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        // ── 8. Frame pacing — the actual fix ───────────────────────────
-        // No `thread::sleep`! egui's `request_repaint_after` schedules a
-        // delayed repaint without blocking the event loop; this is the
-        // correct way to cap FPS in an eframe app.
-        let target_duration =
-            Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0));
+        // ── 8. Frame pacing ──────────────────────────────────────────
+        // `request_repaint_after` schedules a delayed repaint without
+        // blocking the event loop. OS input events may still cause an
+        // earlier wakeup — that's what keeps the UI responsive.
+        let target_duration = Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0));
 
-        // While settings is open, keep the UI responsive (~60 Hz minimum).
+        // While settings is open, cap latency at ~60 Hz.
         let repaint_after = if self.show_settings {
             target_duration.min(Duration::from_millis(16))
         } else {
@@ -273,7 +283,6 @@ impl VisualizerApp {
             return;
         }
 
-        // Pre-compute everything that doesn't depend on the bar index.
         let bar_width = self.config.bar_width;
         let gap = self.config.bar_gap;
         let stride = bar_width + gap;
@@ -287,6 +296,8 @@ impl VisualizerApp {
         let rect_h = rect.height();
         let radius = self.config.bar_radius;
 
+        // NOTE: "Dynamic (cover art)" is currently a fixed tint — this is
+        // where a cover-art sampler would inject its dominant colour.
         let color = if self.config.dynamic_colors {
             egui::Color32::from_rgb(180, 200, 180)
         } else {
@@ -297,10 +308,10 @@ impl VisualizerApp {
             )
         };
 
-        // egui's painter batches all rect shapes into a single draw call
-        // at tessellation time, so 86 `rect_filled` calls are already one
-        // GPU draw. Reusing the painter object (instead of re-querying it)
-        // and hoisting the per-frame math is where the CPU win is.
+        // egui's painter batches all rect shapes into a single draw call,
+        // so N `rect_filled` calls are still one GPU draw. Reusing the
+        // painter object (instead of re-querying it) and hoisting the
+        // per-frame math is where the CPU win is.
         let painter = ui.painter();
         for (i, &height_normalized) in self.current_bars.iter().enumerate() {
             let mut final_height = height_normalized * sensitivity_multiplier * rect_h;
@@ -324,8 +335,13 @@ impl VisualizerApp {
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Performance & Optimization");
         ui.checkbox(&mut self.config.use_vsync, "Enable VSync (Requires Restart)");
-        ui.add(egui::Slider::new(&mut self.config.target_fps, 15.0..=144.0).text("Max Target FPS"));
-        ui.add(egui::Slider::new(&mut self.config.audio_update_ms, 10..=100).text("Audio Poll Rate (ms)"));
+        ui.add(
+            egui::Slider::new(&mut self.config.target_fps, 15.0..=144.0).text("Max Target FPS"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.config.audio_update_ms, 10..=100)
+                .text("Audio Poll Rate (ms)"),
+        );
         ui.label("Higher ms = lower CPU usage but more input latency.");
         ui.checkbox(&mut self.config.show_fps, "Show FPS Counter");
         ui.label(format!("Current FPS: {:.1}", self.current_fps));
@@ -335,8 +351,13 @@ impl VisualizerApp {
         ui.add(egui::Slider::new(&mut self.config.bar_width, 1.0..=50.0).text("Bar width"));
         ui.add(egui::Slider::new(&mut self.config.bar_gap, 0.0..=20.0).text("Bar gap"));
         ui.add(egui::Slider::new(&mut self.config.sensitivity, 1.0..=100.0).text("Sensitivity"));
-        ui.add(egui::Slider::new(&mut self.config.max_bar_height, 0.0..=1000.0).text("Max Bar Height (0 = Full)"));
-        ui.add(egui::Slider::new(&mut self.config.num_bars, 16..=256).text("Number of Bars"));
+        ui.add(
+            egui::Slider::new(&mut self.config.max_bar_height, 0.0..=1000.0)
+                .text("Max Bar Height (0 = Full)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.config.num_bars, 16..=256).text("Number of Bars"),
+        );
 
         ui.separator();
         ui.heading("Positioning");
@@ -367,8 +388,7 @@ impl VisualizerApp {
                     let (rect, response) =
                         ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
                     if ui.is_rect_visible(rect) {
-                        let color =
-                            egui::Color32::from_rgb(preset[0], preset[1], preset[2]);
+                        let color = egui::Color32::from_rgb(preset[0], preset[1], preset[2]);
                         ui.painter().rect_filled(rect, 4.0, color);
                         if response.clicked() {
                             self.config.bar_color = *preset;
@@ -389,7 +409,9 @@ impl VisualizerApp {
                 .store(self.config.num_bars, Ordering::Relaxed);
             self.audio_update_interval
                 .store(self.config.audio_update_ms, Ordering::Relaxed);
-            self.current_bars.resize(self.config.num_bars, 0.0);
+            // Allocate a fresh vec rather than resizing (avoids keeping
+            // capacity for a much larger previous bar count).
+            self.current_bars = vec![0.0; self.config.num_bars];
         }
     }
 }
