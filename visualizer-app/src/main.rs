@@ -4,7 +4,10 @@ use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use visualizer_core::{audio::AudioEngine, config::AppConfig};
+use visualizer_core::{
+    audio::AudioEngine,
+    config::{AppConfig, FrequencyDirection, VisualizerDirection},
+};
 
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
@@ -96,7 +99,6 @@ impl eframe::App for VisualizerApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── 0. FPS counter ─────────────────────────────────────────────
-        // `dt` is the true period between two `update()` *starts*.
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
@@ -106,15 +108,11 @@ impl eframe::App for VisualizerApp {
         }
 
         // ── 1. Force 1.0 pixels-per-point (only when needed) ──────────
-        // Fires once on first frame and again if the user moves the
-        // window to a display with different DPI.
         if ctx.pixels_per_point() != 1.0 {
             ctx.set_pixels_per_point(1.0);
         }
 
         // ── 2. Tray & hotkey events ───────────────────────────────────
-        // Drain *all* pending events per frame (bursts happen if the
-        // event loop was blocked). Cheap; try_recv is non-blocking.
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id {
                 self.show_settings = true;
@@ -126,8 +124,6 @@ impl eframe::App for VisualizerApp {
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
             if event.state == global_hotkey::HotKeyState::Pressed {
                 if self.show_settings {
-                    // Explicitly close the settings viewport so the OS
-                    // window doesn't linger after the toggle.
                     self.show_settings = false;
                     ctx.send_viewport_cmd_to(
                         egui::ViewportId::from_hash_of("settings"),
@@ -159,8 +155,6 @@ impl eframe::App for VisualizerApp {
         }
 
         // ── 4. Drain audio channel — keep only the newest frame ───────
-        // Applying every queued frame with the smoothing filter would
-        // compound the lerp; the latest sample is what the user wants.
         let mut latest_bars: Option<Vec<f32>> = None;
         while let Ok(bars) = self.audio_rx.try_recv() {
             latest_bars = Some(bars);
@@ -213,7 +207,7 @@ impl eframe::App for VisualizerApp {
         if self.show_settings {
             let settings_builder = egui::ViewportBuilder::default()
                 .with_title("Visualizer Settings")
-                .with_inner_size([400.0, 800.0])
+                .with_inner_size([400.0, 860.0])
                 .with_decorations(true)
                 .with_resizable(true)
                 .with_always_on_top();
@@ -234,19 +228,20 @@ impl eframe::App for VisualizerApp {
                                 .fill(egui::Color32::from_rgb(25, 25, 25)),
                         )
                         .show(ctx, |ui| {
-                            self.draw_settings_ui(ui);
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                self.draw_settings_ui(ui);
 
-                            ui.separator();
-                            if ui.button("❌ Close Settings").clicked() {
-                                close_window = true;
-                            }
+                                ui.separator();
+                                if ui.button("❌ Close Settings").clicked() {
+                                    close_window = true;
+                                }
+                            });
                         });
                 },
             );
 
             if close_window {
                 self.show_settings = false;
-                // Persist settings even if the app is force-quit later.
                 self.config.save();
                 ctx.send_viewport_cmd_to(
                     egui::ViewportId::from_hash_of("settings"),
@@ -256,12 +251,8 @@ impl eframe::App for VisualizerApp {
         }
 
         // ── 8. Frame pacing ──────────────────────────────────────────
-        // `request_repaint_after` schedules a delayed repaint without
-        // blocking the event loop. OS input events may still cause an
-        // earlier wakeup — that's what keeps the UI responsive.
         let target_duration = Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0));
 
-        // While settings is open, cap latency at ~60 Hz.
         let repaint_after = if self.show_settings {
             target_duration.min(Duration::from_millis(16))
         } else {
@@ -276,6 +267,27 @@ impl eframe::App for VisualizerApp {
     }
 }
 
+/// Map a visual bar position to the FFT bin it should read from.
+///
+/// - `LeftToRight`: bin order is 0, 1, 2, ...
+/// - `RightToLeft`: bin order is N-1, N-2, ...
+/// - `Mirrored`:    bin order is 0, 1, ..., N/2-1, N/2-1, ..., 1, 0
+///                  (low -> high -> high -> low, symmetric around the centre).
+fn frequency_index(i: usize, num_bars: usize, dir: FrequencyDirection) -> usize {
+    match dir {
+        FrequencyDirection::LeftToRight => i,
+        FrequencyDirection::RightToLeft => num_bars - 1 - i,
+        FrequencyDirection::Mirrored => {
+            let half = num_bars / 2;
+            if i < half {
+                i
+            } else {
+                num_bars - 1 - i
+            }
+        }
+    }
+}
+
 impl VisualizerApp {
     fn draw_bars(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let num_bars = self.current_bars.len();
@@ -286,15 +298,12 @@ impl VisualizerApp {
         let bar_width = self.config.bar_width;
         let gap = self.config.bar_gap;
         let stride = bar_width + gap;
-        let total_width = num_bars as f32 * stride - gap;
-
-        let start_x = rect.center().x - (total_width / 2.0) + self.config.x_offset;
-        let bottom_y = rect.bottom() + self.config.y_offset;
+        let total_size = num_bars as f32 * stride - gap;
 
         let sensitivity_multiplier = self.config.sensitivity / 30.0;
         let max_h = self.config.max_bar_height;
-        let rect_h = rect.height();
         let radius = self.config.bar_radius;
+        let freq_dir = self.config.frequency_direction;
 
         // NOTE: "Dynamic (cover art)" is currently a fixed tint — this is
         // where a cover-art sampler would inject its dominant colour.
@@ -308,27 +317,108 @@ impl VisualizerApp {
             )
         };
 
-        // egui's painter batches all rect shapes into a single draw call,
-        // so N `rect_filled` calls are still one GPU draw. Reusing the
-        // painter object (instead of re-querying it) and hoisting the
-        // per-frame math is where the CPU win is.
         let painter = ui.painter();
-        for (i, &height_normalized) in self.current_bars.iter().enumerate() {
-            let mut final_height = height_normalized * sensitivity_multiplier * rect_h;
-            if max_h > 0.0 {
-                final_height = final_height.min(max_h);
-            }
-            if final_height <= 0.0 {
-                continue;
+
+        match self.config.visualizer_direction {
+            VisualizerDirection::Up => {
+                // Bars grow upward from the bottom edge.
+                let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
+                let bottom_y = rect.bottom() + self.config.y_offset;
+                let rect_h = rect.height();
+
+                for i in 0..num_bars {
+                    let idx = frequency_index(i, num_bars, freq_dir);
+                    let mut h = self.current_bars[idx] * sensitivity_multiplier * rect_h;
+                    if max_h > 0.0 {
+                        h = h.min(max_h);
+                    }
+                    if h <= 0.0 {
+                        continue;
+                    }
+
+                    let x = start_x + i as f32 * stride;
+                    let bar_rect = egui::Rect::from_min_max(
+                        egui::pos2(x, bottom_y - h),
+                        egui::pos2(x + bar_width, bottom_y),
+                    );
+                    painter.rect_filled(bar_rect, radius, color);
+                }
             }
 
-            let x = start_x + i as f32 * stride;
-            let bar_rect = egui::Rect::from_min_max(
-                egui::pos2(x, bottom_y - final_height),
-                egui::pos2(x + bar_width, bottom_y),
-            );
+            VisualizerDirection::Down => {
+                // Bars grow downward from the top edge.
+                let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
+                let top_y = rect.top() + self.config.y_offset;
+                let rect_h = rect.height();
 
-            painter.rect_filled(bar_rect, radius, color);
+                for i in 0..num_bars {
+                    let idx = frequency_index(i, num_bars, freq_dir);
+                    let mut h = self.current_bars[idx] * sensitivity_multiplier * rect_h;
+                    if max_h > 0.0 {
+                        h = h.min(max_h);
+                    }
+                    if h <= 0.0 {
+                        continue;
+                    }
+
+                    let x = start_x + i as f32 * stride;
+                    let bar_rect = egui::Rect::from_min_max(
+                        egui::pos2(x, top_y),
+                        egui::pos2(x + bar_width, top_y + h),
+                    );
+                    painter.rect_filled(bar_rect, radius, color);
+                }
+            }
+
+            VisualizerDirection::Right => {
+                // Horizontal bars extending rightward from the left edge.
+                let left_x = rect.left() + self.config.x_offset;
+                let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
+                let rect_w = rect.width();
+
+                for i in 0..num_bars {
+                    let idx = frequency_index(i, num_bars, freq_dir);
+                    let mut w = self.current_bars[idx] * sensitivity_multiplier * rect_w;
+                    if max_h > 0.0 {
+                        w = w.min(max_h);
+                    }
+                    if w <= 0.0 {
+                        continue;
+                    }
+
+                    let y = start_y + i as f32 * stride;
+                    let bar_rect = egui::Rect::from_min_max(
+                        egui::pos2(left_x, y),
+                        egui::pos2(left_x + w, y + bar_width),
+                    );
+                    painter.rect_filled(bar_rect, radius, color);
+                }
+            }
+
+            VisualizerDirection::Left => {
+                // Horizontal bars extending leftward from the right edge.
+                let right_x = rect.right() + self.config.x_offset;
+                let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
+                let rect_w = rect.width();
+
+                for i in 0..num_bars {
+                    let idx = frequency_index(i, num_bars, freq_dir);
+                    let mut w = self.current_bars[idx] * sensitivity_multiplier * rect_w;
+                    if max_h > 0.0 {
+                        w = w.min(max_h);
+                    }
+                    if w <= 0.0 {
+                        continue;
+                    }
+
+                    let y = start_y + i as f32 * stride;
+                    let bar_rect = egui::Rect::from_min_max(
+                        egui::pos2(right_x - w, y),
+                        egui::pos2(right_x, y + bar_width),
+                    );
+                    painter.rect_filled(bar_rect, radius, color);
+                }
+            }
         }
     }
 
@@ -345,6 +435,53 @@ impl VisualizerApp {
         ui.label("Higher ms = lower CPU usage but more input latency.");
         ui.checkbox(&mut self.config.show_fps, "Show FPS Counter");
         ui.label(format!("Current FPS: {:.1}", self.current_fps));
+
+        ui.separator();
+        ui.heading("Visualizer Direction");
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.config.visualizer_direction,
+                VisualizerDirection::Up,
+                "Up",
+            );
+            ui.radio_value(
+                &mut self.config.visualizer_direction,
+                VisualizerDirection::Down,
+                "Down",
+            );
+            ui.radio_value(
+                &mut self.config.visualizer_direction,
+                VisualizerDirection::Left,
+                "Left",
+            );
+            ui.radio_value(
+                &mut self.config.visualizer_direction,
+                VisualizerDirection::Right,
+                "Right",
+            );
+        });
+        ui.label("Direction the bars grow from their anchor edge.");
+
+        ui.separator();
+        ui.heading("Frequency Direction");
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.config.frequency_direction,
+                FrequencyDirection::LeftToRight,
+                "Low → High",
+            );
+            ui.radio_value(
+                &mut self.config.frequency_direction,
+                FrequencyDirection::RightToLeft,
+                "High → Low",
+            );
+            ui.radio_value(
+                &mut self.config.frequency_direction,
+                FrequencyDirection::Mirrored,
+                "Mirrored",
+            );
+        });
+        ui.label("Mirrored: low → high → high → low (symmetric).");
 
         ui.separator();
         ui.heading("Layout");
@@ -409,8 +546,6 @@ impl VisualizerApp {
                 .store(self.config.num_bars, Ordering::Relaxed);
             self.audio_update_interval
                 .store(self.config.audio_update_ms, Ordering::Relaxed);
-            // Allocate a fresh vec rather than resizing (avoids keeping
-            // capacity for a much larger previous bar count).
             self.current_bars = vec![0.0; self.config.num_bars];
         }
     }
