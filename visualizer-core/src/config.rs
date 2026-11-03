@@ -1,6 +1,36 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VisualizerDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl Default for VisualizerDirection {
+    fn default() -> Self {
+        VisualizerDirection::Up
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrequencyDirection {
+    /// Low frequencies on the left, high on the right (default).
+    LeftToRight,
+    /// High frequencies on the left, low on the right.
+    RightToLeft,
+    /// Low -> high on the first half, high -> low on the second half.
+    Mirrored,
+}
+
+impl Default for FrequencyDirection {
+    fn default() -> Self {
+        FrequencyDirection::LeftToRight
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub bar_width: f32,
@@ -12,20 +42,29 @@ pub struct AppConfig {
     pub dynamic_colors: bool,
     pub text_border: bool,
     pub font_path: Option<String>,
-    
+
     pub bar_color: [u8; 3],
     pub bg_opacity: u8,
     pub color_presets: Vec<[u8; 3]>,
     pub x_offset: f32,
     pub y_offset: f32,
-    
+
     pub max_bar_height: f32,
     pub target_fps: f32,
     pub show_fps: bool,
-    pub audio_update_ms: u64, 
-    
+    pub audio_update_ms: u64,
+
     // ✅ NEW: VSync Option
-    pub use_vsync: bool, 
+    pub use_vsync: bool,
+
+    // ✅ NEW: Bar orientation (Up/Down/Left/Right)
+    // `#[serde(default)]` keeps older config files loadable.
+    #[serde(default)]
+    pub visualizer_direction: VisualizerDirection,
+
+    // ✅ NEW: Frequency ordering (LeftToRight / RightToLeft / Mirrored)
+    #[serde(default)]
+    pub frequency_direction: FrequencyDirection,
 }
 
 impl Default for AppConfig {
@@ -40,21 +79,29 @@ impl Default for AppConfig {
             dynamic_colors: true,
             text_border: false,
             font_path: None,
-            
+
             bar_color: [0, 255, 255],
             bg_opacity: 0,
             color_presets: vec![
-                [255, 255, 255], [0, 255, 255], [255, 0, 255],
-                [255, 255, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255],
+                [255, 255, 255],
+                [0, 255, 255],
+                [255, 0, 255],
+                [255, 255, 0],
+                [255, 0, 0],
+                [0, 255, 0],
+                [0, 0, 255],
             ],
             x_offset: 0.0,
             y_offset: 0.0,
-            
+
             max_bar_height: 0.0,
             target_fps: 60.0,
             show_fps: false,
-            audio_update_ms: 33, 
+            audio_update_ms: 33,
             use_vsync: false, // Default to false so manual FPS limiter works
+
+            visualizer_direction: VisualizerDirection::default(),
+            frequency_direction: FrequencyDirection::default(),
         }
     }
 }
