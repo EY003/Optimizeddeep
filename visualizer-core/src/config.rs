@@ -22,9 +22,10 @@ pub struct AppConfig {
     pub max_bar_height: f32,
     pub target_fps: f32,
     pub show_fps: bool,
-    
-    // ✅ NEW: Audio processing throttle
     pub audio_update_ms: u64, 
+    
+    // ✅ NEW: VSync Option
+    pub use_vsync: bool, 
 }
 
 impl Default for AppConfig {
@@ -52,8 +53,8 @@ impl Default for AppConfig {
             max_bar_height: 0.0,
             target_fps: 60.0,
             show_fps: false,
-            
-            audio_update_ms: 33, // ~30 times per second
+            audio_update_ms: 33, 
+            use_vsync: false, // Default to false so manual FPS limiter works
         }
     }
 }
