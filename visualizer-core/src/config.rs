@@ -17,11 +17,8 @@ impl Default for VisualizerDirection {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FrequencyDirection {
-    /// Low frequencies on the left, high on the right (default).
     LeftToRight,
-    /// High frequencies on the left, low on the right.
     RightToLeft,
-    /// Low -> high on the first half, high -> low on the second half.
     Mirrored,
 }
 
@@ -30,6 +27,61 @@ impl Default for FrequencyDirection {
         FrequencyDirection::LeftToRight
     }
 }
+
+// ── NEW COLOR MODES ──────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorMode {
+    Dynamic,       // Cover art
+    StaticSingle,  // One static color
+    StaticMultiple,// Multiple static colors
+    Gradient,      // Smooth gradient
+    ColorChanging, // Cyclic interpolation
+}
+
+impl Default for ColorMode {
+    fn default() -> Self {
+        ColorMode::Dynamic
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DistributionDirection {
+    Horizontal, // Colors across the bars
+    Vertical,   // Colors stacked inside each bar
+}
+
+impl Default for DistributionDirection {
+    fn default() -> Self {
+        DistributionDirection::Horizontal
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GradientStop {
+    pub color: [u8; 3],
+    pub position: f32, // 0.0 to 1.0
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StaticMultiPreset {
+    pub colors: Vec<[u8; 3]>,
+    pub direction: DistributionDirection,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GradientPreset {
+    pub stops: Vec<GradientStop>,
+    pub angle: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ColorChangePreset {
+    pub colors: Vec<[u8; 3]>,
+    pub speed: f32,
+}
+
+// ── MAIN CONFIG ──────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
@@ -53,18 +105,51 @@ pub struct AppConfig {
     pub target_fps: f32,
     pub show_fps: bool,
     pub audio_update_ms: u64,
-
-    // ✅ NEW: VSync Option
     pub use_vsync: bool,
 
-    // ✅ NEW: Bar orientation (Up/Down/Left/Right)
-    // `#[serde(default)]` keeps older config files loadable.
     #[serde(default)]
     pub visualizer_direction: VisualizerDirection,
-
-    // ✅ NEW: Frequency ordering (LeftToRight / RightToLeft / Mirrored)
     #[serde(default)]
     pub frequency_direction: FrequencyDirection,
+
+    // ── NEW FIELDS ──
+    #[serde(default)]
+    pub color_mode: ColorMode,
+
+    #[serde(default = "default_static_colors")]
+    pub static_colors: Vec<[u8; 3]>,
+    #[serde(default)]
+    pub static_direction: DistributionDirection,
+    #[serde(default)]
+    pub static_multi_presets: Vec<StaticMultiPreset>,
+
+    #[serde(default = "default_gradient_stops")]
+    pub gradient_stops: Vec<GradientStop>,
+    #[serde(default)]
+    pub gradient_angle: f32,
+    #[serde(default)]
+    pub gradient_presets: Vec<GradientPreset>,
+
+    #[serde(default = "default_static_colors")]
+    pub color_change_colors: Vec<[u8; 3]>,
+    #[serde(default = "default_speed")]
+    pub color_change_speed: f32,
+    #[serde(default)]
+    pub color_change_presets: Vec<ColorChangePreset>,
+}
+
+// Defaults for new fields
+fn default_static_colors() -> Vec<[u8; 3]> {
+    vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+}
+fn default_gradient_stops() -> Vec<GradientStop> {
+    vec![
+        GradientStop { color: [255, 0, 0], position: 0.0 },
+        GradientStop { color: [0, 0, 255], position: 1.0 },
+    ]
+}
+fn default_speed() -> f32 {
+    0.5
 }
 
 impl Default for AppConfig {
@@ -98,10 +183,23 @@ impl Default for AppConfig {
             target_fps: 60.0,
             show_fps: false,
             audio_update_ms: 33,
-            use_vsync: false, // Default to false so manual FPS limiter works
+            use_vsync: false,
 
             visualizer_direction: VisualizerDirection::default(),
             frequency_direction: FrequencyDirection::default(),
+
+            color_mode: ColorMode::Dynamic,
+            static_colors: default_static_colors(),
+            static_direction: DistributionDirection::Horizontal,
+            static_multi_presets: vec![],
+
+            gradient_stops: default_gradient_stops(),
+            gradient_angle: 0.0,
+            gradient_presets: vec![],
+
+            color_change_colors: default_static_colors(),
+            color_change_speed: default_speed(),
+            color_change_presets: vec![],
         }
     }
 }
