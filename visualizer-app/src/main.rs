@@ -3,6 +3,7 @@
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant}; // ✅ Import time
 use visualizer_core::{
     audio::AudioEngine,
     config::AppConfig,
@@ -24,9 +25,10 @@ struct VisualizerApp {
     
     show_settings: bool,
     current_fps: f32,
-    
-    // ✅ NEW: Prevent infinite repaint loop
     is_passthrough_set: bool,
+    
+    // ✅ NEW: Track last frame time for manual limiter
+    last_frame_time: Instant, 
     
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
@@ -74,7 +76,8 @@ impl VisualizerApp {
             should_quit,
             show_settings: true, 
             current_fps: 0.0,
-            is_passthrough_set: false, // ✅ Initialize
+            is_passthrough_set: false,
+            last_frame_time: Instant::now(), // ✅ Init
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             settings_menu_id: settings_item.id().clone(),
@@ -89,7 +92,12 @@ impl eframe::App for VisualizerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let dt = ctx.input(|i| i.unstable_dt);
+        // ✅ OPTIMIZATION: Force 1.0 pixels per point to save GPU on high-DPI monitors
+        ctx.set_pixels_per_point(1.0);
+
+        // ✅ FPS Counter logic
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         if dt > 0.0 {
             let instant_fps = 1.0 / dt;
             self.current_fps = self.current_fps * 0.9 + instant_fps * 0.1;
@@ -120,11 +128,9 @@ impl eframe::App for VisualizerApp {
             self.audio_update_interval.store(self.config.audio_update_ms, Ordering::Relaxed);
         }
 
-        // Audio smoothing: interpolate towards the target value smoothly
         while let Ok(bars) = self.audio_rx.try_recv() {
             for (i, &val) in bars.iter().enumerate() {
                 if i < self.current_bars.len() {
-                    // If the new val is higher, snap up. If lower, decay slowly.
                     if val > self.current_bars[i] {
                         self.current_bars[i] = val;
                     } else {
@@ -137,7 +143,6 @@ impl eframe::App for VisualizerApp {
         // ==========================================
         // 1. OVERLAY
         // ==========================================
-        // ✅ FIX: Only send the command once, otherwise it causes an infinite loop
         if !self.is_passthrough_set {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
             self.is_passthrough_set = true;
@@ -207,8 +212,19 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        // ✅ Enforce custom FPS limit
-        ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0)));
+        // ==========================================
+        // 3. MANUAL FPS LIMITER (The Real Fix)
+        // ==========================================
+        self.last_frame_time = Instant::now();
+        let target_duration = Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0));
+        let elapsed = self.last_frame_time.elapsed();
+        
+        if elapsed < target_duration {
+            // Sleep the thread to strictly enforce FPS limit
+            std::thread::sleep(target_duration - elapsed);
+        }
+        
+        ctx.request_repaint_after(target_duration);
     }
     
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
@@ -252,6 +268,7 @@ impl VisualizerApp {
 
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Performance & Optimization");
+        ui.checkbox(&mut self.config.use_vsync, "Enable VSync (Requires Restart)");
         ui.add(egui::Slider::new(&mut self.config.target_fps, 15.0..=144.0).text("Max Target FPS"));
         ui.add(egui::Slider::new(&mut self.config.audio_update_ms, 10..=100).text("Audio Poll Rate (ms)"));
         ui.label("Higher ms = lower CPU usage but more input latency.");
@@ -319,13 +336,16 @@ impl VisualizerApp {
 }
 
 fn main() -> eframe::Result<()> {
+    // ✅ Load config before window creation to set VSync
+    let config = AppConfig::load();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_transparent(true)
             .with_decorations(false)
             .with_always_on_top()
             .with_maximized(true),
-        vsync: false, // ✅ Turn off VSync so manual FPS slider works
+        vsync: config.use_vsync, // ✅ Apply VSync from config
         ..Default::default()
     };
 
