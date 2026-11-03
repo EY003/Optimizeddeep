@@ -268,21 +268,19 @@ impl eframe::App for VisualizerApp {
 }
 
 /// Map a visual bar position to the FFT bin it should read from.
-///
-/// - `LeftToRight`: bin order is 0, 1, 2, ...
-/// - `RightToLeft`: bin order is N-1, N-2, ...
-/// - `Mirrored`:    bin order is 0, 1, ..., N/2-1, N/2-1, ..., 1, 0
-///                  (low -> high -> high -> low, symmetric around the centre).
-fn frequency_index(i: usize, num_bars: usize, dir: FrequencyDirection) -> usize {
+/// 
+/// `base_num_bars` is the actual number of FFT bins (e.g. 86).
+/// If Mirrored is selected, `i` will range from 0 to `base_num_bars * 2 - 1`.
+fn frequency_index(i: usize, base_num_bars: usize, dir: FrequencyDirection) -> usize {
     match dir {
         FrequencyDirection::LeftToRight => i,
-        FrequencyDirection::RightToLeft => num_bars - 1 - i,
+        FrequencyDirection::RightToLeft => base_num_bars - 1 - i,
         FrequencyDirection::Mirrored => {
-            let half = num_bars / 2;
-            if i < half {
+            if i < base_num_bars {
                 i
             } else {
-                num_bars - 1 - i
+                // Maps the second half back down (e.g., 86 -> 85, 87 -> 84...)
+                2 * base_num_bars - 1 - i
             }
         }
     }
@@ -290,23 +288,29 @@ fn frequency_index(i: usize, num_bars: usize, dir: FrequencyDirection) -> usize 
 
 impl VisualizerApp {
     fn draw_bars(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let num_bars = self.current_bars.len();
-        if num_bars == 0 {
+        let base_num_bars = self.current_bars.len();
+        if base_num_bars == 0 {
             return;
         }
+
+        // Double the visual bars if mirrored
+        let visual_num_bars = if self.config.frequency_direction == FrequencyDirection::Mirrored {
+            base_num_bars * 2
+        } else {
+            base_num_bars
+        };
 
         let bar_width = self.config.bar_width;
         let gap = self.config.bar_gap;
         let stride = bar_width + gap;
-        let total_size = num_bars as f32 * stride - gap;
+        // Calculate total size using the visual bar count
+        let total_size = visual_num_bars as f32 * stride - gap;
 
         let sensitivity_multiplier = self.config.sensitivity / 30.0;
         let max_h = self.config.max_bar_height;
         let radius = self.config.bar_radius;
         let freq_dir = self.config.frequency_direction;
 
-        // NOTE: "Dynamic (cover art)" is currently a fixed tint — this is
-        // where a cover-art sampler would inject its dominant colour.
         let color = if self.config.dynamic_colors {
             egui::Color32::from_rgb(180, 200, 180)
         } else {
@@ -321,13 +325,12 @@ impl VisualizerApp {
 
         match self.config.visualizer_direction {
             VisualizerDirection::Up => {
-                // Bars grow upward from the bottom edge.
                 let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
                 let bottom_y = rect.bottom() + self.config.y_offset;
                 let rect_h = rect.height();
 
-                for i in 0..num_bars {
-                    let idx = frequency_index(i, num_bars, freq_dir);
+                for i in 0..visual_num_bars {
+                    let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut h = self.current_bars[idx] * sensitivity_multiplier * rect_h;
                     if max_h > 0.0 {
                         h = h.min(max_h);
@@ -346,13 +349,12 @@ impl VisualizerApp {
             }
 
             VisualizerDirection::Down => {
-                // Bars grow downward from the top edge.
                 let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
                 let top_y = rect.top() + self.config.y_offset;
                 let rect_h = rect.height();
 
-                for i in 0..num_bars {
-                    let idx = frequency_index(i, num_bars, freq_dir);
+                for i in 0..visual_num_bars {
+                    let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut h = self.current_bars[idx] * sensitivity_multiplier * rect_h;
                     if max_h > 0.0 {
                         h = h.min(max_h);
@@ -371,13 +373,12 @@ impl VisualizerApp {
             }
 
             VisualizerDirection::Right => {
-                // Horizontal bars extending rightward from the left edge.
                 let left_x = rect.left() + self.config.x_offset;
                 let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
                 let rect_w = rect.width();
 
-                for i in 0..num_bars {
-                    let idx = frequency_index(i, num_bars, freq_dir);
+                for i in 0..visual_num_bars {
+                    let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut w = self.current_bars[idx] * sensitivity_multiplier * rect_w;
                     if max_h > 0.0 {
                         w = w.min(max_h);
@@ -396,13 +397,12 @@ impl VisualizerApp {
             }
 
             VisualizerDirection::Left => {
-                // Horizontal bars extending leftward from the right edge.
                 let right_x = rect.right() + self.config.x_offset;
                 let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
                 let rect_w = rect.width();
 
-                for i in 0..num_bars {
-                    let idx = frequency_index(i, num_bars, freq_dir);
+                for i in 0..visual_num_bars {
+                    let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut w = self.current_bars[idx] * sensitivity_multiplier * rect_w;
                     if max_h > 0.0 {
                         w = w.min(max_h);
@@ -468,20 +468,19 @@ impl VisualizerApp {
             ui.radio_value(
                 &mut self.config.frequency_direction,
                 FrequencyDirection::LeftToRight,
-                "Low → High",
+                "Left To Right",
             );
             ui.radio_value(
                 &mut self.config.frequency_direction,
                 FrequencyDirection::RightToLeft,
-                "High → Low",
+                "Right To Left",
             );
             ui.radio_value(
                 &mut self.config.frequency_direction,
                 FrequencyDirection::Mirrored,
-                "Mirrored",
+                "Mirrored (Symmetrical)",
             );
         });
-        ui.label("Mirrored: low → high → high → low (symmetric).");
 
         ui.separator();
         ui.heading("Layout");
