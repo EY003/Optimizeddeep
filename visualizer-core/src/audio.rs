@@ -16,6 +16,8 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     pub fn new(initial_bars: usize, initial_interval_ms: u64) -> Self {
+        // Small buffer: UI keeps only the newest frame, so we *want* to
+        // drop stale data if the UI thread falls behind.
         let (tx, rx) = crossbeam_channel::bounded(2);
         let (name_tx, name_rx) = crossbeam_channel::bounded(1);
         let target_bars = Arc::new(AtomicUsize::new(initial_bars));
@@ -25,6 +27,7 @@ impl AudioEngine {
         let interval_clone = update_interval_ms.clone();
 
         thread::spawn(move || {
+            // Non-panicking: harmless if COM was already initialized.
             let _ = initialize_mta();
 
             let device = get_default_device(&Direction::Render)
@@ -53,8 +56,8 @@ impl AudioEngine {
                 )
                 .expect("Failed to initialize loopback client");
 
-            // Keep the event handle alive and wait on it efficiently.
-            let h_event = audio_client
+            // Keep the event handle alive; it must outlive the loop.
+            let _h_event = audio_client
                 .set_get_eventhandle()
                 .expect("Failed to set event handle");
 
@@ -69,37 +72,48 @@ impl AudioEngine {
             let channels = format.get_nchannels() as usize;
             let blockalign = format.get_blockalign() as usize;
 
+            // The visualizer assumes 32-bit float mix format (the same
+            // assumption the original code implicitly made). Assert it
+            // for clarity.
             debug_assert_eq!(
                 blockalign % 4,
                 0,
                 "Expected 32-bit float samples; blockalign={}",
                 blockalign
             );
-            let samples_per_frame = (blockalign / 4).max(1);
+            let samples_per_frame = (blockalign / 4).max(1); // = channels for f32
 
             let mut fft_processor = FFTProcessor::new(1024, target_bars_clone);
 
+            // Reused across iterations; both are 4-byte aligned because
+            // the element type is `f32`.
             let mut sample_buffer: Vec<f32> = Vec::new();
             let mut mono_samples: Vec<f32> = Vec::new();
 
             loop {
                 let start_time = Instant::now();
 
-                // Wait efficiently on the WASAPI event handle instead of busy-spinning
-                let _ = h_event.wait_for_event(100);
-
-                let packet_size = capture_client
-                    .get_next_nbr_frames()
-                    .unwrap_or(None)
-                    .unwrap_or(0);
-
-                if packet_size == 0 {
-                    continue;
+                let mut packet_size = 0u32;
+                while packet_size == 0 {
+                    packet_size = capture_client
+                        .get_next_nbr_frames()
+                        .unwrap_or(None)
+                        .unwrap_or(0);
+                    if packet_size == 0 {
+                        thread::sleep(Duration::from_millis(2));
+                    }
                 }
 
+                // Reserve room for the whole packet as f32 samples.
+                // `resize` preserves capacity, so this reallocates at most
+                // once per distinct packet size.
                 let needed_samples = packet_size as usize * samples_per_frame;
                 sample_buffer.resize(needed_samples, 0.0);
 
+                // Safe cast: `sample_buffer` is backed by `Vec<f32>`, so
+                // its pointer is guaranteed to be 4-byte aligned. We expose
+                // it as a byte slice purely because `read_from_device`
+                // demands `&mut [u8]`.
                 let byte_slice: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(
                         sample_buffer.as_mut_ptr() as *mut u8,
@@ -112,6 +126,9 @@ impl AudioEngine {
                     .unwrap_or((0, BufferFlags::none()));
 
                 if frames_read > 0 {
+                    // Only consume *actually-read* frames — partial reads
+                    // would otherwise include stale bytes from the
+                    // previous, larger packet.
                     let valid_samples =
                         (frames_read as usize * samples_per_frame).min(sample_buffer.len());
                     let samples = &sample_buffer[..valid_samples];
@@ -125,11 +142,14 @@ impl AudioEngine {
 
                     if !mono_samples.is_empty() {
                         if let Some(bars) = fft_processor.process(&mono_samples) {
+                            // If the UI can't keep up, drop the oldest
+                            // queued frame rather than buffering latency.
                             let _ = tx.try_send(bars);
                         }
                     }
                 }
 
+                // Throttle: sleep for the remainder of the interval.
                 let elapsed = start_time.elapsed();
                 let target_duration =
                     Duration::from_millis(interval_clone.load(Ordering::Relaxed));
@@ -182,6 +202,11 @@ impl FFTProcessor {
 
         let fft_size = self.input_buffer.len();
 
+        // ── Sliding window ────────────────────────────────────────────
+        // Keep the last `fft_size` samples. Zero-padding (the previous
+        // behaviour) leaves half the FFT buffer empty for typical
+        // packet sizes, which broadens every spectral peak. Sliding
+        // always hands the FFT a full, continuously-windowed block.
         if samples.len() >= fft_size {
             self.input_buffer
                 .copy_from_slice(&samples[samples.len() - fft_size..]);
@@ -191,6 +216,8 @@ impl FFTProcessor {
             self.input_buffer[keep..].copy_from_slice(samples);
         }
 
+        // Hann window — reduces edge discontinuities (which otherwise
+        // leak energy into neighbouring bins).
         let two_pi = 2.0 * std::f32::consts::PI;
         for i in 0..fft_size {
             let w = 0.5 * (1.0 - (two_pi * i as f32 / fft_size as f32).cos());
@@ -216,6 +243,7 @@ impl FFTProcessor {
         let min_bin = 1;
         let max_bin = (fft_size / 3).max(min_bin + 1);
 
+        // Precompute the log-frequency ratio once instead of per bar.
         let ratio = max_bin as f32 / min_bin as f32;
         let norm = 1.0 / (fft_size as f32 / 2.0);
 
@@ -243,8 +271,10 @@ impl FFTProcessor {
             let normalized_magnitude = magnitude * norm;
             let db = 20.0 * (normalized_magnitude + 1e-9).log10();
 
+            // Map [-90 dB, -20 dB] to [0, 1], then square for a
+            // perceptual (log-ish) response.
             let normalized = ((db + 90.0) / 70.0).clamp(0.0, 1.0);
-            *bar = normalized * normalized;
+            *bar = normalized * normalized; // cheaper than powf(2.0)
         }
 
         Some(bars)
