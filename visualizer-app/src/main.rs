@@ -19,6 +19,7 @@ struct VisualizerApp {
     current_bars: Vec<f32>,
     audio_rx: crossbeam_channel::Receiver<Vec<f32>>,
     audio_target_bars: Arc<std::sync::atomic::AtomicUsize>,
+    audio_update_interval: Arc<std::sync::atomic::AtomicU64>, // ✅ NEW
     should_quit: Arc<AtomicBool>,
     
     show_settings: bool,
@@ -33,9 +34,10 @@ struct VisualizerApp {
 impl VisualizerApp {
     fn new() -> Self {
         let config = AppConfig::load();
-        let engine = AudioEngine::new(config.num_bars);
+        let engine = AudioEngine::new(config.num_bars, config.audio_update_ms);
         let should_quit = Arc::new(AtomicBool::new(false));
         let audio_target_bars = engine.target_bars.clone();
+        let audio_update_interval = engine.update_interval_ms.clone();
 
         let tray_menu = Menu::new();
         let settings_item = MenuItem::new("Open Settings", true, None);
@@ -64,6 +66,7 @@ impl VisualizerApp {
             current_bars: vec![0.0; config.num_bars],
             audio_rx: engine.data_rx,
             audio_target_bars,
+            audio_update_interval,
             config,
             should_quit,
             show_settings: true, 
@@ -77,21 +80,17 @@ impl VisualizerApp {
 }
 
 impl eframe::App for VisualizerApp {
-    // ✅ FIX: Transparent window background
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ✅ Calculate FPS
         let dt = ctx.input(|i| i.unstable_dt);
         if dt > 0.0 {
             let instant_fps = 1.0 / dt;
-            // Smooth the FPS display so it doesn't jump around
             self.current_fps = self.current_fps * 0.9 + instant_fps * 0.1;
         }
 
-        // --- Handle Events (Tray & Hotkeys) ---
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id { self.show_settings = true; } 
             else if event.id == self.quit_menu_id { self.should_quit.store(true, Ordering::Relaxed); }
@@ -106,14 +105,19 @@ impl eframe::App for VisualizerApp {
             return;
         }
 
-        // Update Audio Engine if slider changed
+        // Sync Audio Bars
         let current_target = self.audio_target_bars.load(Ordering::Relaxed);
         if current_target != self.config.num_bars {
             self.audio_target_bars.store(self.config.num_bars, Ordering::Relaxed);
             self.current_bars.resize(self.config.num_bars, 0.0);
         }
 
-        // Process Audio
+        // ✅ Sync Audio Throttle
+        let current_interval = self.audio_update_interval.load(Ordering::Relaxed);
+        if current_interval != self.config.audio_update_ms {
+            self.audio_update_interval.store(self.config.audio_update_ms, Ordering::Relaxed);
+        }
+
         while let Ok(bars) = self.audio_rx.try_recv() {
             for (i, &val) in bars.iter().enumerate() {
                 if i < self.current_bars.len() {
@@ -123,7 +127,7 @@ impl eframe::App for VisualizerApp {
         }
 
         // ==========================================
-        // 1. MAIN WINDOW (THE OVERLAY)
+        // 1. OVERLAY
         // ==========================================
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
 
@@ -140,7 +144,6 @@ impl eframe::App for VisualizerApp {
                 
                 self.draw_bars(ui, rect);
                 
-                // ✅ Show FPS on overlay if enabled
                 if self.config.show_fps {
                     ui.painter().text(
                         rect.left_top() + egui::vec2(20.0, 20.0),
@@ -153,12 +156,12 @@ impl eframe::App for VisualizerApp {
             });
 
         // ==========================================
-        // 2. SETTINGS WINDOW (SEPARATE VIEWPORT)
+        // 2. SETTINGS
         // ==========================================
         if self.show_settings {
             let settings_builder = egui::ViewportBuilder::default()
                 .with_title("Visualizer Settings")
-                .with_inner_size([400.0, 750.0])
+                .with_inner_size([400.0, 800.0])
                 .with_decorations(true)
                 .with_resizable(true)
                 .with_always_on_top();
@@ -169,7 +172,6 @@ impl eframe::App for VisualizerApp {
                 egui::ViewportId::from_hash_of("settings"),
                 settings_builder,
                 |ctx, _class| {
-                    // ✅ Catch the OS "X" button click
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_window = true;
                     }
@@ -189,13 +191,12 @@ impl eframe::App for VisualizerApp {
 
             if close_window {
                 self.show_settings = false;
-                // Tell egui to actually destroy the window
                 ctx.send_viewport_cmd_to(egui::ViewportId::from_hash_of("settings"), egui::ViewportCommand::Close);
             }
         }
 
-        // ✅ Limit FPS to save GPU resources
-        ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / self.config.target_fps));
+        // Enforce custom FPS limit
+        ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0)));
     }
     
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
@@ -217,7 +218,6 @@ impl VisualizerApp {
             let sensitivity_multiplier = self.config.sensitivity / 30.0; 
             let mut final_height = height_normalized * sensitivity_multiplier * rect.height();
 
-            // ✅ Apply Max Bar Height
             if self.config.max_bar_height > 0.0 {
                 final_height = final_height.min(self.config.max_bar_height);
             }
@@ -231,11 +231,7 @@ impl VisualizerApp {
             let color = if self.config.dynamic_colors {
                 egui::Color32::from_rgb(180, 200, 180)
             } else {
-                egui::Color32::from_rgb(
-                    self.config.bar_color[0], 
-                    self.config.bar_color[1], 
-                    self.config.bar_color[2]
-                )
+                egui::Color32::from_rgb(self.config.bar_color[0], self.config.bar_color[1], self.config.bar_color[2])
             };
 
             painter.rect_filled(bar_rect, self.config.bar_radius, color);
@@ -243,9 +239,11 @@ impl VisualizerApp {
     }
 
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Performance");
-        ui.add(egui::Slider::new(&mut self.config.target_fps, 15.0..=144.0).text("Target FPS"));
-        ui.checkbox(&mut self.config.show_fps, "Show FPS Counter on Overlay");
+        ui.heading("Performance & Optimization");
+        ui.add(egui::Slider::new(&mut self.config.target_fps, 15.0..=144.0).text("Max Target FPS"));
+        ui.add(egui::Slider::new(&mut self.config.audio_update_ms, 10..=100).text("Audio Poll Rate (ms)"));
+        ui.label("Higher ms = lower CPU usage but more input latency.");
+        ui.checkbox(&mut self.config.show_fps, "Show FPS Counter");
         ui.label(format!("Current FPS: {:.1}", self.current_fps));
         
         ui.separator();
@@ -297,15 +295,14 @@ impl VisualizerApp {
         ui.separator();
         ui.heading("Appearance");
         ui.add(egui::Slider::new(&mut self.config.bg_opacity, 0..=255).text("Background Opacity"));
-        ui.checkbox(&mut self.config.text_border, "Text border");
         
         ui.separator();
         if ui.button("⚠️ Reset to Defaults").clicked() {
             self.config = AppConfig::default();
             self.audio_target_bars.store(self.config.num_bars, Ordering::Relaxed);
+            self.audio_update_interval.store(self.config.audio_update_ms, Ordering::Relaxed);
             self.current_bars.resize(self.config.num_bars, 0.0);
         }
-        ui.label("Press Ctrl+Shift+V to hide/show settings.");
     }
 }
 
@@ -316,7 +313,7 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_always_on_top()
             .with_maximized(true),
-        vsync: true, // ✅ Enforce VSync
+        vsync: false, // ✅ Turn off VSync so manual FPS slider works
         ..Default::default()
     };
 
