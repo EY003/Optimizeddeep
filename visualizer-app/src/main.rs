@@ -19,11 +19,14 @@ struct VisualizerApp {
     current_bars: Vec<f32>,
     audio_rx: crossbeam_channel::Receiver<Vec<f32>>,
     audio_target_bars: Arc<std::sync::atomic::AtomicUsize>,
-    audio_update_interval: Arc<std::sync::atomic::AtomicU64>, // ✅ NEW
+    audio_update_interval: Arc<std::sync::atomic::AtomicU64>,
     should_quit: Arc<AtomicBool>,
     
     show_settings: bool,
     current_fps: f32,
+    
+    // ✅ NEW: Prevent infinite repaint loop
+    is_passthrough_set: bool,
     
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
@@ -71,6 +74,7 @@ impl VisualizerApp {
             should_quit,
             show_settings: true, 
             current_fps: 0.0,
+            is_passthrough_set: false, // ✅ Initialize
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             settings_menu_id: settings_item.id().clone(),
@@ -105,23 +109,27 @@ impl eframe::App for VisualizerApp {
             return;
         }
 
-        // Sync Audio Bars
         let current_target = self.audio_target_bars.load(Ordering::Relaxed);
         if current_target != self.config.num_bars {
             self.audio_target_bars.store(self.config.num_bars, Ordering::Relaxed);
             self.current_bars.resize(self.config.num_bars, 0.0);
         }
 
-        // ✅ Sync Audio Throttle
         let current_interval = self.audio_update_interval.load(Ordering::Relaxed);
         if current_interval != self.config.audio_update_ms {
             self.audio_update_interval.store(self.config.audio_update_ms, Ordering::Relaxed);
         }
 
+        // Audio smoothing: interpolate towards the target value smoothly
         while let Ok(bars) = self.audio_rx.try_recv() {
             for (i, &val) in bars.iter().enumerate() {
                 if i < self.current_bars.len() {
-                    self.current_bars[i] = self.current_bars[i] * 0.6 + val * 0.4;
+                    // If the new val is higher, snap up. If lower, decay slowly.
+                    if val > self.current_bars[i] {
+                        self.current_bars[i] = val;
+                    } else {
+                        self.current_bars[i] = self.current_bars[i] * 0.8 + val * 0.2;
+                    }
                 }
             }
         }
@@ -129,7 +137,11 @@ impl eframe::App for VisualizerApp {
         // ==========================================
         // 1. OVERLAY
         // ==========================================
-        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+        // ✅ FIX: Only send the command once, otherwise it causes an infinite loop
+        if !self.is_passthrough_set {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+            self.is_passthrough_set = true;
+        }
 
         let rect = ctx.screen_rect();
         egui::Area::new(egui::Id::new("overlay"))
@@ -195,7 +207,7 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        // Enforce custom FPS limit
+        // ✅ Enforce custom FPS limit
         ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0)));
     }
     
