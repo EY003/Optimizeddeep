@@ -589,7 +589,7 @@ impl VisualizerApp {
         }
     }
 
-    /// Turn a motion sample into an `egui::Color32` by looking up the palette.
+        /// Turn a motion sample into an `egui::Color32` by looking up the palette.
     fn sample_color_changing(&self, x: f32, y: f32, time: f32) -> egui::Color32 {
         if self.config.color_change_colors.is_empty() {
             return egui::Color32::WHITE;
@@ -612,9 +612,17 @@ impl VisualizerApp {
         let t = s.blend_t.clamp(0.0, 1.0);
         let k = s.intensity.clamp(0.0, 1.0);
 
-        let r = (ca[0] as f32 * (1.0 - t) + cb[0] as f32 * t) * k;
-        let g = (ca[1] as f32 * (1.0 - t) + cb[1] as f32 * t) * k;
-        let b = (ca[2] as f32 * (1.0 - t) + cb[2] as f32 * t) * k;
+        // Palette colour at this point (after the a↔b blend).
+        let pr = ca[0] as f32 * (1.0 - t) + cb[0] as f32 * t;
+        let pg = ca[1] as f32 * (1.0 - t) + cb[1] as f32 * t;
+        let pb = ca[2] as f32 * (1.0 - t) + cb[2] as f32 * t;
+
+        // Fade between off_color and the palette colour using intensity.
+        // With off_color = black this is identical to the previous behaviour.
+        let off = self.config.color_change_motion.off_color;
+        let r = off[0] as f32 + (pr - off[0] as f32) * k;
+        let g = off[1] as f32 + (pg - off[1] as f32) * k;
+        let b = off[2] as f32 + (pb - off[2] as f32) * k;
 
         egui::Color32::from_rgb(r as u8, g as u8, b as u8)
     }
@@ -1536,7 +1544,29 @@ impl VisualizerApp {
                     )
                     .text("Wipe Softness"));
                 }
-
+                // Off-colour picker — only shown for shapes that actually
+                // fade toward the off colour (intensity-modulating shapes).
+                if shape.uses_intensity() {
+                    ui.horizontal(|ui| {
+                        ui.label("Off color:");
+                        ui.color_edit_button_srgb(
+                            &mut self.config.color_change_motion.off_color,
+                        );
+                        if ui
+                            .add_enabled(
+                                self.config.color_change_motion.off_color != [0, 0, 0],
+                                egui::Button::new("Reset to black"),
+                            )
+                            .clicked()
+                        {
+                            self.config.color_change_motion.off_color = [0, 0, 0];
+                        }
+                    });
+                    ui.label(
+                        "Colour that 'off' pixels fade toward \
+                         (defaults to black — the original behaviour).",
+                    );
+                }
                 // ── Presets ───────────────────────────────────────
                 ui.add_space(10.0);
                 ui.separator();
