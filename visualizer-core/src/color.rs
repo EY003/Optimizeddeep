@@ -56,7 +56,7 @@ pub fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
 pub fn sample_gradient(stops: &[crate::config::GradientStop], t: f32) -> [u8; 3] {
     if stops.is_empty() { return [255, 255, 255]; }
     if stops.len() == 1 { return stops[0].color; }
-    
+
     let t = t.clamp(0.0, 1.0);
     for i in 0..stops.len() - 1 {
         let s1 = &stops[i];
@@ -73,12 +73,12 @@ pub fn sample_gradient(stops: &[crate::config::GradientStop], t: f32) -> [u8; 3]
 pub fn cyclic_color(colors: &[[u8; 3]], phase: f32) -> [u8; 3] {
     if colors.is_empty() { return [255, 255, 255]; }
     if colors.len() == 1 { return colors[0]; }
-    
+
     let n = colors.len() as f32;
     let scaled = phase.fract() * n;
     let idx = scaled.floor() as usize;
     let t = scaled - idx as f32;
-    
+
     let a = colors[idx % colors.len()];
     let b = colors[(idx + 1) % colors.len()];
     lerp_rgb(a, b, t)
