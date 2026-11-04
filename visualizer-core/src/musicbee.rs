@@ -35,7 +35,13 @@ pub fn spawn_smtc_listener(
     std::thread::spawn(move || {
         // ── 1. Initialize COM on this worker thread ───────────
         // SMTC (WinRT) is built on COM and requires an initialized apartment.
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // This call is genuinely unsafe in the `windows` crate — SAFETY: we
+        // pass null for the reserved pointer and only request multithreaded
+        // mode, which is documented as valid for any thread that stays alive
+        // for the duration of the process.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
 
         // ── 2. Acquire the session manager, retrying on failure ─
         // On cold boot the SMTC service may not be ready immediately.
@@ -181,8 +187,7 @@ fn read_thumbnail(
     let reader = DataReader::CreateDataReader(&stream).ok()?;
     reader.LoadAsync(size).ok()?.get().ok()?;
     let mut bytes = vec![0u8; size as usize];
-    unsafe {
-        reader.ReadBytes(&mut bytes).ok()?;
-    }
+    // `DataReader::ReadBytes` is a safe method in `windows` 0.58.
+    reader.ReadBytes(&mut bytes).ok()?;
     Some(bytes)
 }
