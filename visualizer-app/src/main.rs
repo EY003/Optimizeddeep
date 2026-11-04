@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
+use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,8 +9,8 @@ use visualizer_core::{
     audio::AudioEngine,
     color,
     config::{
-        AppConfig, ColorChangePreset, ColorMode, FrequencyDirection, GradientPreset,
-        GradientStop, StaticDistributionMode, StaticMultiPreset, VisualizerDirection,
+        AppConfig, BlendMode, ColorChangePreset, ColorMode, FrequencyDirection, GradientPreset,
+        GradientStop, MotionShape, StaticDistributionMode, StaticMultiPreset, VisualizerDirection,
     },
 };
 
@@ -23,7 +24,53 @@ use tray_icon::{
 };
 
 /// MurmurHash3 32-bit finalizer — excellent avalanche & uniformity.
-/// Used by the `Random` static distribution mode.
+fn hash_u32(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x85EB_CA6B);
+    x ^= x >> 13;
+    x = x.wrapping_mul(0xC2B2_AE35);
+    x ^= x >> 16;
+    x
+}
+
+/// Triangle wave 0 → 1 → 0 over t in [0, 1).
+fn tri01(t: f32) -> f32 {
+    1.0 - (2.0 * t.fract() - 1.0).abs()
+}
+
+/// Smoothstep with graceful handling of reversed/zero-width edges.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Interpolate a wipe boundary into a 0..=1 blend factor.
+fn wipe_blend(pos: f32, boundary: f32, softness: f32, hard: bool) -> f32 {
+    if hard {
+        if pos < boundary { 0.0 } else { 1.0 }
+    } else {
+        smoothstep(boundary - softness, boundary + softness, pos)
+    }
+}
+
+/// Everything the color-sampling layer needs to turn one (x, y, t) point
+/// into an egui colour. Two palette phases plus a blend factor and an
+/// intensity (brightness) multiplier.
+#[derive(Clone, Copy)]
+struct MotionSample {
+    phase_a: f32,
+    phase_b: f32,
+    blend_t: f32,
+    intensity: f32,
+}
+
+impl Default for MotionSample {
+    fn default() -> Self {
+        Self { phase_a: 0.0, phase_b: 0.0, blend_t: 0.0, intensity: 1.0 }
+    }
+}
+
+/// MurmurHash-based random index (used by the `Random` static distribution mode).
 fn random_color_index(i: usize, num_colors: usize) -> usize {
     let mut x = i as u32;
     x ^= x >> 16;
@@ -48,7 +95,6 @@ struct VisualizerApp {
 
     last_frame_time: Instant,
 
-    // Preset naming state
     new_preset_name: String,
 
     _tray_icon: TrayIcon,
@@ -290,6 +336,293 @@ fn frequency_index(i: usize, base_num_bars: usize, dir: FrequencyDirection) -> u
 }
 
 impl VisualizerApp {
+    // ─────────────────────────────────────────────────────────
+    // Color Changing Motion Engine
+    // ─────────────────────────────────────────────────────────
+
+    /// Evaluates a motion shape at a given point `(x, y)` in normalized
+    /// coordinates (both in [0, 1]) and a "base time" `base_t` that already
+    /// has the speed factor folded in.
+    fn evaluate_motion(
+        &self,
+        shape: MotionShape,
+        x: f32,
+        y: f32,
+        time: f32,
+        base_t: f32,
+    ) -> MotionSample {
+        let m = &self.config.color_change_motion;
+        let hard = m.blend == BlendMode::Hard;
+        let freq = m.wave_frequency;
+
+        match shape {
+            // ── Uniform ─────────────────────────────────────
+            MotionShape::Uniform => MotionSample {
+                phase_a: base_t,
+                intensity: 1.0,
+                ..Default::default()
+            },
+
+            // ── Directional Wipes ───────────────────────────
+            MotionShape::HorizontalWipe => {
+                let boundary = tri01(base_t * 0.5);
+                let t = wipe_blend(x, boundary, m.wipe_softness, hard);
+                MotionSample {
+                    phase_a: base_t,
+                    phase_b: base_t + 0.5,
+                    blend_t: t,
+                    intensity: 1.0,
+                }
+            }
+            MotionShape::VerticalWipe => {
+                let boundary = tri01(base_t * 0.5);
+                let t = wipe_blend(y, boundary, m.wipe_softness, hard);
+                MotionSample {
+                    phase_a: base_t,
+                    phase_b: base_t + 0.5,
+                    blend_t: t,
+                    intensity: 1.0,
+                }
+            }
+            MotionShape::DiagonalWipe => {
+                let boundary = tri01(base_t * 0.5);
+                let diag = (x + y) * 0.5;
+                let t = wipe_blend(diag, boundary, m.wipe_softness, hard);
+                MotionSample {
+                    phase_a: base_t,
+                    phase_b: base_t + 0.5,
+                    blend_t: t,
+                    intensity: 1.0,
+                }
+            }
+
+            // ── Wave-based ──────────────────────────────────
+            MotionShape::SineWave => {
+                let w = (x * freq * TAU + base_t * TAU).sin() * 0.5 + 0.5;
+                MotionSample {
+                    phase_a: base_t + w * 0.5,
+                    intensity: 1.0,
+                    ..Default::default()
+                }
+            }
+            MotionShape::TriangleWave => {
+                let w = tri01(x * freq + base_t);
+                MotionSample {
+                    phase_a: base_t + w * 0.5,
+                    intensity: 1.0,
+                    ..Default::default()
+                }
+            }
+            MotionShape::SquareWave => {
+                let w = ((x * freq + base_t).fract() < 0.5) as u8 as f32;
+                MotionSample {
+                    phase_a: base_t + w * 0.5,
+                    intensity: 1.0,
+                    ..Default::default()
+                }
+            }
+            MotionShape::SawtoothWave => {
+                let w = (x * freq + base_t).fract();
+                MotionSample {
+                    phase_a: base_t + w * 0.5,
+                    intensity: 1.0,
+                    ..Default::default()
+                }
+            }
+
+            // ── Stutter & Pulse ─────────────────────────────
+            MotionShape::Strobe => {
+                let on = ((base_t * 4.0).fract() < 0.5) as u8 as f32;
+                let k = if hard {
+                    on
+                } else {
+                    smoothstep(0.35, 0.65, on + base_t.fract() * 0.3)
+                };
+                MotionSample {
+                    phase_a: base_t,
+                    intensity: k,
+                    ..Default::default()
+                }
+            }
+            MotionShape::Pulse => {
+                let k = (base_t * TAU).sin() * 0.5 + 0.5;
+                MotionSample {
+                    phase_a: base_t,
+                    intensity: k,
+                    ..Default::default()
+                }
+            }
+            MotionShape::Heartbeat => {
+                let beat = base_t.fract();
+                let k = if hard {
+                    if beat < 0.10 {
+                        1.0
+                    } else if beat < 0.18 {
+                        0.0
+                    } else if beat < 0.26 {
+                        0.7
+                    } else {
+                        0.0
+                    }
+                } else {
+                    let a = (-((beat - 0.08) / 0.04).powi(2)).exp();
+                    let b = (-((beat - 0.22) / 0.04).powi(2)).exp() * 0.7;
+                    (a + b).clamp(0.0, 1.0)
+                };
+                MotionSample {
+                    phase_a: base_t,
+                    intensity: k,
+                    ..Default::default()
+                }
+            }
+            MotionShape::Stutter => {
+                let step = (time * 10.0) as u32;
+                let pos = (x * 200.0) as u32;
+                let hash = hash_u32(step.wrapping_mul(37).wrapping_add(pos));
+                let event = (hash % 100) as f32 / 100.0 < m.stutter_intensity;
+                let offset = if event { 0.5 } else { 0.0 };
+                MotionSample {
+                    phase_a: base_t + offset,
+                    intensity: 1.0,
+                    ..Default::default()
+                }
+            }
+
+            // ── Particle & Trail ────────────────────────────
+            MotionShape::Comet => {
+                let head = base_t.fract();
+                let raw = (x - head).abs();
+                let dist = raw.min(1.0 - raw);
+                let k = (1.0 - dist / m.trail_length.max(0.01)).clamp(0.0, 1.0);
+                let k = if hard { (k > 0.5) as u8 as f32 } else { k };
+                MotionSample {
+                    phase_a: base_t,
+                    intensity: k,
+                    ..Default::default()
+                }
+            }
+            MotionShape::Chase => {
+                let pos = (x - base_t * 0.5).rem_euclid(1.0);
+                let k = if hard {
+                    (pos < 0.15) as u8 as f32
+                } else {
+                    smoothstep(0.05, 0.15, 0.15 - (pos - 0.075).abs())
+                };
+                MotionSample {
+                    phase_a: base_t,
+                    intensity: k,
+                    ..Default::default()
+                }
+            }
+            MotionShape::BouncingBall => {
+                let head = tri01(base_t * 0.5);
+                let dist = (x - head).abs();
+                let k = (1.0 - dist / m.trail_length.max(0.01)).clamp(0.0, 1.0);
+                let k = if hard { (k > 0.4) as u8 as f32 } else { k };
+                MotionSample {
+                    phase_a: base_t,
+                    intensity: k,
+                    ..Default::default()
+                }
+            }
+            MotionShape::Sparkle => {
+                let step = (time * 12.0) as u32;
+                let pos = (x * 300.0) as u32;
+                let hash = hash_u32(step.wrapping_mul(13).wrapping_add(pos));
+                let p = (hash % 100) as f32 / 100.0;
+                let on = p < 0.04 + m.stutter_intensity * 0.1;
+                MotionSample {
+                    phase_a: base_t + p,
+                    intensity: if on { 1.0 } else { 0.0 },
+                    ..Default::default()
+                }
+            }
+            MotionShape::Sinelon => {
+                let head = tri01(base_t * 0.5);
+                let dist = (x - head).abs();
+                let k = (1.0 - dist / m.trail_length.max(0.01)).clamp(0.0, 1.0);
+                MotionSample {
+                    phase_a: base_t,
+                    intensity: k.powf(2.0),
+                    ..Default::default()
+                }
+            }
+
+            // ── Complex & Organic ───────────────────────────
+            MotionShape::FireSimulation => {
+                let n = (base_t * 1.0 + x * 5.0).sin()
+                    + (base_t * 1.3 + x * 11.0).sin() * 0.5
+                    + (base_t * 2.1 + x * 23.0).sin() * 0.25;
+                MotionSample {
+                    phase_a: base_t + n * 0.05,
+                    intensity: (n * 0.25 + 0.75).clamp(0.0, 1.0),
+                    ..Default::default()
+                }
+            }
+            MotionShape::Plasma => {
+                let p = (x * 6.0 + base_t * 2.0).sin()
+                    + (y * 6.0 - base_t * 1.5).sin()
+                    + ((x + y) * 4.0 + base_t).sin();
+                MotionSample {
+                    phase_a: base_t + p * 0.08,
+                    intensity: 1.0,
+                    ..Default::default()
+                }
+            }
+            MotionShape::RainbowCycle => MotionSample {
+                phase_a: base_t + x,
+                intensity: 1.0,
+                ..Default::default()
+            },
+            MotionShape::Confetti => {
+                let step = (time * 10.0) as u32;
+                let pos = (x * 400.0) as u32;
+                let hash = hash_u32(step.wrapping_mul(97).wrapping_add(pos));
+                let p = (hash % 100) as f32 / 100.0;
+                let on = p < m.stutter_intensity * 0.15;
+                MotionSample {
+                    phase_a: (hash % 1000) as f32 / 1000.0 + base_t * 0.1,
+                    intensity: if on { 1.0 } else { 0.0 },
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
+    /// Turn a motion sample into an `egui::Color32` by looking up the palette.
+    fn sample_color_changing(&self, x: f32, y: f32, time: f32) -> egui::Color32 {
+        if self.config.color_change_colors.is_empty() {
+            return egui::Color32::WHITE;
+        }
+
+        let speed_hz = 0.05 + (self.config.color_change_speed * 1.95);
+        let effective_speed = speed_hz * self.config.color_change_motion.speed;
+        let base_t = time * effective_speed;
+
+        let s = self.evaluate_motion(
+            self.config.color_change_motion.shape,
+            x,
+            y,
+            time,
+            base_t,
+        );
+
+        let ca = color::cyclic_color(&self.config.color_change_colors, s.phase_a);
+        let cb = color::cyclic_color(&self.config.color_change_colors, s.phase_b);
+        let t = s.blend_t.clamp(0.0, 1.0);
+        let k = s.intensity.clamp(0.0, 1.0);
+
+        let r = (ca[0] as f32 * (1.0 - t) + cb[0] as f32 * t) * k;
+        let g = (ca[1] as f32 * (1.0 - t) + cb[1] as f32 * t) * k;
+        let b = (ca[2] as f32 * (1.0 - t) + cb[2] as f32 * t) * k;
+
+        egui::Color32::from_rgb(r as u8, g as u8, b as u8)
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Legacy per-bar color resolution (unchanged except ColorChanging)
+    // ─────────────────────────────────────────────────────────
+
     fn get_bar_color(
         &self,
         i: usize,
@@ -313,14 +646,14 @@ impl VisualizerApp {
 
                 let idx = match self.config.static_mode {
                     StaticDistributionMode::Blocks => {
-                        let mut chunk = (i as f32 / total_bars as f32 * num_colors as f32) as usize;
+                        let mut chunk =
+                            (i as f32 / total_bars as f32 * num_colors as f32) as usize;
                         if chunk >= num_colors {
                             chunk = num_colors - 1;
                         }
                         chunk
                     }
                     StaticDistributionMode::Sequential => {
-                        // Each colour occupies `sequential_bars_per_color` consecutive bars.
                         let bars_per_color = self.config.sequential_bars_per_color.max(1);
                         (i / bars_per_color) % num_colors
                     }
@@ -337,8 +670,6 @@ impl VisualizerApp {
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
             ColorMode::Gradient => {
-                // Fallback single-color sample (only used if a gradient bar can't be
-                // drawn as a mesh, e.g. zero-area rects).
                 let angle_rad = self.config.gradient_angle.to_radians();
                 let dir = egui::vec2(angle_rad.cos(), angle_rad.sin());
 
@@ -369,17 +700,21 @@ impl VisualizerApp {
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
             ColorMode::ColorChanging => {
-                let speed_hz = 0.05 + (self.config.color_change_speed * 1.95);
-                let phase = time * speed_hz;
-                let c = color::cyclic_color(&self.config.color_change_colors, phase);
-                egui::Color32::from_rgb(c[0], c[1], c[2])
+                let x = if total_bars > 1 {
+                    i as f32 / (total_bars - 1) as f32
+                } else {
+                    0.5
+                };
+                self.sample_color_changing(x, 0.5, time)
             }
         }
     }
 
-    /// Renders a single bar as a gradient mesh, so the gradient runs *inside* the bar
-    /// rather than sampling one colour for the whole bar. This makes `angle = 90°`
-    /// produce a genuine vertical gradient.
+    // ─────────────────────────────────────────────────────────
+    // Renderers
+    // ─────────────────────────────────────────────────────────
+
+    /// Renders a single bar as a gradient mesh (Gradient mode).
     fn draw_gradient_bar(
         &self,
         painter: &egui::Painter,
@@ -389,7 +724,6 @@ impl VisualizerApp {
         let angle_rad = self.config.gradient_angle.to_radians();
         let dir = egui::vec2(angle_rad.cos(), angle_rad.sin());
 
-        // Project screen corners so the gradient is coherent across the whole screen.
         let screen_corners = [
             screen_rect.left_top(),
             screen_rect.right_top(),
@@ -405,7 +739,6 @@ impl VisualizerApp {
         }
         let range = (max_proj - min_proj).max(0.0001);
 
-        // Bar corners: top-left, top-right, bottom-right, bottom-left
         let corners = [
             bar_rect.left_top(),
             bar_rect.right_top(),
@@ -427,6 +760,64 @@ impl VisualizerApp {
         mesh.indices.extend_from_slice(&[0u32, 1, 2, 0, 2, 3]);
 
         painter.add(egui::Shape::mesh(mesh));
+    }
+
+    /// Renders a ColorChanging bar. If the active motion shape reads the
+    /// vertical position (VerticalWipe / DiagonalWipe), the bar is subdivided
+    /// vertically so motion becomes visible *inside* the bar. Otherwise it's
+    /// a plain single-coloured rect.
+    fn draw_color_changing_bar(
+        &self,
+        painter: &egui::Painter,
+        bar_rect: egui::Rect,
+        x: f32,
+        time: f32,
+        radius: f32,
+        round_top_bottom: bool,
+    ) {
+        if !self.config.color_change_motion.shape.uses_vertical_axis() {
+            let c = self.sample_color_changing(x, 0.5, time);
+            painter.rect_filled(bar_rect, radius, c);
+            return;
+        }
+
+        let h = bar_rect.height();
+        if h <= 0.0 {
+            return;
+        }
+
+        // Adaptive subdivision: ~6px per segment, between 8 and 64 segments.
+        let segments = ((h / 6.0) as usize).clamp(8, 64);
+
+        for k in 0..segments {
+            let v0 = k as f32 / segments as f32;
+            let v1 = (k + 1) as f32 / segments as f32;
+            let v_mid = (v0 + v1) * 0.5;
+
+            // v = 0 is the bottom of the bar rect, v = 1 is the top.
+            let y_top = bar_rect.bottom() - h * v1;
+            let y_bot = bar_rect.bottom() - h * v0;
+
+            let seg_rect = egui::Rect::from_min_max(
+                egui::pos2(bar_rect.left(), y_top),
+                egui::pos2(bar_rect.right(), y_bot),
+            );
+
+            let rounding = if round_top_bottom {
+                if k == segments - 1 {
+                    egui::Rounding { nw: radius, ne: radius, sw: 0.0, se: 0.0 }
+                } else if k == 0 {
+                    egui::Rounding { nw: 0.0, ne: 0.0, sw: radius, se: radius }
+                } else {
+                    egui::Rounding::ZERO
+                }
+            } else {
+                egui::Rounding::ZERO
+            };
+
+            let c = self.sample_color_changing(x, v_mid, time);
+            painter.rect_filled(seg_rect, rounding, c);
+        }
     }
 
     fn draw_bars(&self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -456,6 +847,17 @@ impl VisualizerApp {
         let is_vertical_stack = self.config.color_mode == ColorMode::StaticMultiple
             && self.config.static_mode == StaticDistributionMode::Vertical;
         let is_gradient = self.config.color_mode == ColorMode::Gradient;
+        let is_color_changing_vertical = self.config.color_mode == ColorMode::ColorChanging
+            && self.config.color_change_motion.shape.uses_vertical_axis();
+
+        // Normalized x for a bar index (shared across directions).
+        let x_norm = |i: usize| -> f32 {
+            if visual_num_bars > 1 {
+                i as f32 / (visual_num_bars - 1) as f32
+            } else {
+                0.5
+            }
+        };
 
         match self.config.visualizer_direction {
             VisualizerDirection::Up => {
@@ -508,6 +910,10 @@ impl VisualizerApp {
                                 egui::Color32::from_rgb(c[0], c[1], c[2]),
                             );
                         }
+                    } else if is_color_changing_vertical {
+                        self.draw_color_changing_bar(
+                            painter, bar_rect, x_norm(i), time, radius, true,
+                        );
                     } else if is_gradient {
                         self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
@@ -566,6 +972,10 @@ impl VisualizerApp {
                                 egui::Color32::from_rgb(c[0], c[1], c[2]),
                             );
                         }
+                    } else if is_color_changing_vertical {
+                        self.draw_color_changing_bar(
+                            painter, bar_rect, x_norm(i), time, radius, true,
+                        );
                     } else if is_gradient {
                         self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
@@ -624,6 +1034,10 @@ impl VisualizerApp {
                                 egui::Color32::from_rgb(c[0], c[1], c[2]),
                             );
                         }
+                    } else if is_color_changing_vertical {
+                        self.draw_color_changing_bar(
+                            painter, bar_rect, x_norm(i), time, radius, false,
+                        );
                     } else if is_gradient {
                         self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
@@ -682,6 +1096,10 @@ impl VisualizerApp {
                                 egui::Color32::from_rgb(c[0], c[1], c[2]),
                             );
                         }
+                    } else if is_color_changing_vertical {
+                        self.draw_color_changing_bar(
+                            painter, bar_rect, x_norm(i), time, radius, false,
+                        );
                     } else if is_gradient {
                         self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
@@ -693,6 +1111,10 @@ impl VisualizerApp {
         }
     }
 
+    // ─────────────────────────────────────────────────────────
+    // Settings UI
+    // ─────────────────────────────────────────────────────────
+
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Performance & Optimization");
         ui.checkbox(&mut self.config.use_vsync, "Enable VSync (Requires Restart)");
@@ -703,340 +1125,4 @@ impl VisualizerApp {
         ui.label(format!("Current FPS: {:.1}", self.current_fps));
 
         ui.separator();
-        ui.heading("Visualizer Direction");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.config.visualizer_direction, VisualizerDirection::Up, "Up");
-            ui.radio_value(&mut self.config.visualizer_direction, VisualizerDirection::Down, "Down");
-            ui.radio_value(&mut self.config.visualizer_direction, VisualizerDirection::Left, "Left");
-            ui.radio_value(&mut self.config.visualizer_direction, VisualizerDirection::Right, "Right");
-        });
-        ui.label("Direction the bars grow from their anchor edge.");
-
-        ui.separator();
-        ui.heading("Frequency Direction");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::LeftToRight, "Left To Right");
-            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::RightToLeft, "Right To Left");
-            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::Mirrored, "Mirrored (Symmetrical)");
-        });
-
-        ui.separator();
-        ui.heading("Layout");
-        ui.add(egui::Slider::new(&mut self.config.bar_width, 1.0..=50.0).text("Bar width"));
-        ui.add(egui::Slider::new(&mut self.config.bar_gap, 0.0..=20.0).text("Bar gap"));
-        ui.add(egui::Slider::new(&mut self.config.sensitivity, 1.0..=100.0).text("Sensitivity"));
-        ui.add(egui::Slider::new(&mut self.config.max_bar_height, 0.0..=1000.0).text("Max Bar Height (0 = Full)"));
-        ui.add(egui::Slider::new(&mut self.config.num_bars, 16..=256).text("Number of Bars"));
-
-        ui.separator();
-        ui.heading("Positioning");
-        ui.add(egui::Slider::new(&mut self.config.x_offset, -1000.0..=1000.0).text("X Offset"));
-        ui.add(egui::Slider::new(&mut self.config.y_offset, -1000.0..=1000.0).text("Y Offset"));
-
-        ui.separator();
-        ui.heading("Color Mode");
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut self.config.color_mode, ColorMode::Dynamic, "Dynamic");
-            ui.radio_value(&mut self.config.color_mode, ColorMode::StaticSingle, "Static Single");
-            ui.radio_value(&mut self.config.color_mode, ColorMode::StaticMultiple, "Static Multi");
-            ui.radio_value(&mut self.config.color_mode, ColorMode::Gradient, "Gradient");
-            ui.radio_value(&mut self.config.color_mode, ColorMode::ColorChanging, "Color Changing");
-        });
-
-        ui.separator();
-
-        match self.config.color_mode {
-            ColorMode::StaticSingle => {
-                ui.horizontal(|ui| {
-                    ui.label("Bar Color:");
-                    ui.color_edit_button_srgb(&mut self.config.bar_color);
-                    if ui.button("Save Preset").clicked() {
-                        if !self.config.color_presets.contains(&self.config.bar_color) {
-                            self.config.color_presets.push(self.config.bar_color);
-                        }
-                    }
-                });
-
-                ui.label("Presets:");
-                ui.horizontal_wrapped(|ui| {
-                    for preset in &self.config.color_presets {
-                        let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
-                        if ui.is_rect_visible(rect) {
-                            let color = egui::Color32::from_rgb(preset[0], preset[1], preset[2]);
-                            ui.painter().rect_filled(rect, 4.0, color);
-                            if response.clicked() {
-                                self.config.bar_color = *preset;
-                            }
-                        }
-                    }
-                });
-            }
-
-            ColorMode::StaticMultiple => {
-                ui.heading("Multiple Static Colors");
-                ui.horizontal_wrapped(|ui| {
-                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Blocks, "Blocks");
-                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Sequential, "Sequential");
-                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Random, "Random");
-                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Vertical, "Vertical");
-                });
-
-                if self.config.static_mode == StaticDistributionMode::Sequential {
-                    ui.add(
-                        egui::Slider::new(&mut self.config.sequential_bars_per_color, 1..=20)
-                            .text("Bars per Color"),
-                    );
-                    ui.label("1 = R, W, B, R…   2 = R, R, W, W, B, B…");
-                }
-
-                ui.add_space(5.0);
-
-                let mut to_remove = None;
-                for (i, color) in self.config.static_colors.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.color_edit_button_srgb(color);
-                        if ui.button("❌").clicked() {
-                            to_remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = to_remove {
-                    self.config.static_colors.remove(i);
-                }
-                if ui.button("➕ Add Color").clicked() {
-                    self.config.static_colors.push([255, 255, 255]);
-                }
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_preset_name);
-                    if ui.button("💾 Save Preset").clicked() {
-                        let name = if self.new_preset_name.trim().is_empty() {
-                            format!("Preset {}", self.config.static_multi_presets.len() + 1)
-                        } else {
-                            self.new_preset_name.clone()
-                        };
-                        self.config.static_multi_presets.push(StaticMultiPreset {
-                            name,
-                            colors: self.config.static_colors.clone(),
-                            mode: self.config.static_mode,
-                            bars_per_color: self.config.sequential_bars_per_color,
-                        });
-                        self.new_preset_name.clear();
-                    }
-                });
-
-                ui.label("Presets:");
-                let mut preset_to_remove = None;
-                for (i, preset) in self.config.static_multi_presets.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.button(&preset.name).clicked() {
-                            self.config.static_colors = preset.colors.clone();
-                            self.config.static_mode = preset.mode;
-                            self.config.sequential_bars_per_color = preset.bars_per_color;
-                        }
-                        if ui.button("❌").clicked() {
-                            preset_to_remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = preset_to_remove {
-                    self.config.static_multi_presets.remove(i);
-                }
-            }
-
-            ColorMode::Gradient => {
-                ui.heading("Gradient Colors");
-                ui.add(egui::Slider::new(&mut self.config.gradient_angle, 0.0..=360.0).text("Angle (°)"));
-                ui.label("0° = horizontal, 90° = vertical, 45° = diagonal.");
-
-                let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click_and_drag());
-                let painter = ui.painter();
-
-                let steps = 100;
-                for i in 0..steps {
-                    let t1 = i as f32 / steps as f32;
-                    let t2 = (i + 1) as f32 / steps as f32;
-                    let c1 = color::sample_gradient(&self.config.gradient_stops, t1);
-                    let x1 = rect.left() + rect.width() * t1;
-                    let x2 = rect.left() + rect.width() * t2;
-                    let r = egui::Rect::from_min_max(egui::pos2(x1, rect.top()), egui::pos2(x2, rect.bottom()));
-                    painter.rect_filled(r, 0.0, egui::Color32::from_rgb(c1[0], c1[1], c1[2]));
-                }
-
-                let mut sort_stops = false;
-                for (i, stop) in self.config.gradient_stops.iter_mut().enumerate() {
-                    let x = rect.left() + rect.width() * stop.position;
-                    let stop_rect = egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(12.0, 30.0));
-                    let stop_response = ui.interact(stop_rect, ui.id().with("gradient_stop").with(i), egui::Sense::click_and_drag());
-
-                    if stop_response.dragged() {
-                        stop.position = (stop.position + stop_response.drag_delta().x / rect.width()).clamp(0.0, 1.0);
-                        sort_stops = true;
-                    }
-
-                    let handle_color = egui::Color32::from_rgb(stop.color[0], stop.color[1], stop.color[2]);
-                    painter.rect_filled(stop_rect, 2.0, handle_color);
-                    painter.rect_stroke(stop_rect, 2.0_f32, egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
-                }
-
-                if sort_stops {
-                    self.config.gradient_stops.sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap());
-                }
-
-                if response.double_clicked() {
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                        let c = color::sample_gradient(&self.config.gradient_stops, t);
-                        self.config.gradient_stops.push(GradientStop { color: c, position: t });
-                        self.config.gradient_stops.sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap());
-                    }
-                }
-                ui.label("Double-click the bar to add a color stop.");
-
-                let mut to_remove = None;
-                let current_len = self.config.gradient_stops.len();
-                for (i, stop) in self.config.gradient_stops.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.color_edit_button_srgb(&mut stop.color);
-                        ui.label(format!("Pos: {:.2}", stop.position));
-                        if current_len > 2 && ui.button("❌").clicked() {
-                            to_remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = to_remove {
-                    self.config.gradient_stops.remove(i);
-                }
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_preset_name);
-                    if ui.button("💾 Save Preset").clicked() {
-                        let name = if self.new_preset_name.trim().is_empty() {
-                            format!("Preset {}", self.config.gradient_presets.len() + 1)
-                        } else {
-                            self.new_preset_name.clone()
-                        };
-                        self.config.gradient_presets.push(GradientPreset {
-                            name,
-                            stops: self.config.gradient_stops.clone(),
-                            angle: self.config.gradient_angle,
-                        });
-                        self.new_preset_name.clear();
-                    }
-                });
-
-                ui.label("Presets:");
-                let mut preset_to_remove = None;
-                for (i, preset) in self.config.gradient_presets.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.button(&preset.name).clicked() {
-                            self.config.gradient_stops = preset.stops.clone();
-                            self.config.gradient_angle = preset.angle;
-                        }
-                        if ui.button("❌").clicked() {
-                            preset_to_remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = preset_to_remove {
-                    self.config.gradient_presets.remove(i);
-                }
-            }
-
-            ColorMode::ColorChanging => {
-                ui.heading("Color Changing");
-                let mut to_remove = None;
-                let current_len = self.config.color_change_colors.len();
-                for (i, color) in self.config.color_change_colors.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.color_edit_button_srgb(color);
-                        if current_len > 2 && ui.button("❌").clicked() {
-                            to_remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = to_remove {
-                    self.config.color_change_colors.remove(i);
-                }
-                if ui.button("➕ Add Color").clicked() {
-                    self.config.color_change_colors.push([255, 255, 255]);
-                }
-
-                ui.add(egui::Slider::new(&mut self.config.color_change_speed, 0.0..=1.0)
-                    .text("Speed")
-                    .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)));
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_preset_name);
-                    if ui.button("💾 Save Preset").clicked() {
-                        let name = if self.new_preset_name.trim().is_empty() {
-                            format!("Preset {}", self.config.color_change_presets.len() + 1)
-                        } else {
-                            self.new_preset_name.clone()
-                        };
-                        self.config.color_change_presets.push(ColorChangePreset {
-                            name,
-                            colors: self.config.color_change_colors.clone(),
-                            speed: self.config.color_change_speed,
-                        });
-                        self.new_preset_name.clear();
-                    }
-                });
-
-                ui.label("Presets:");
-                let mut preset_to_remove = None;
-                for (i, preset) in self.config.color_change_presets.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.button(&preset.name).clicked() {
-                            self.config.color_change_colors = preset.colors.clone();
-                            self.config.color_change_speed = preset.speed;
-                        }
-                        if ui.button("❌").clicked() {
-                            preset_to_remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = preset_to_remove {
-                    self.config.color_change_presets.remove(i);
-                }
-            }
-
-            _ => {}
-        }
-
-        ui.separator();
-        ui.heading("Appearance");
-        ui.add(egui::Slider::new(&mut self.config.bg_opacity, 0..=255).text("Background Opacity"));
-
-        ui.separator();
-        if ui.button("⚠️ Reset to Defaults").clicked() {
-            self.config = AppConfig::default();
-            self.audio_target_bars.store(self.config.num_bars, Ordering::Relaxed);
-            self.audio_update_interval.store(self.config.audio_update_ms, Ordering::Relaxed);
-            self.current_bars = vec![0.0; self.config.num_bars];
-        }
-    }
-}
-
-fn main() -> eframe::Result<()> {
-    let config = AppConfig::load();
-
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_transparent(true)
-            .with_decorations(false)
-            .with_always_on_top()
-            .with_maximized(true),
-        vsync: config.use_vsync,
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Rust Visualizer",
-        options,
-        Box::new(|_cc| Box::new(VisualizerApp::new())),
-    )
-}
+       
