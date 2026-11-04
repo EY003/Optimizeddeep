@@ -21,6 +21,7 @@ toml = "0.8"
 windows = { version = "0.58", features = [
     "Media_Control",
     "Foundation",
+    "Foundation_Collections",
     "Storage_Streams",
     "Win32_System_Com",
 ] }
