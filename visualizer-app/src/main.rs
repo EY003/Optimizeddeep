@@ -1115,7 +1115,7 @@ impl VisualizerApp {
     // Settings UI
     // ─────────────────────────────────────────────────────────
 
-    fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
+        fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Performance & Optimization");
         ui.checkbox(&mut self.config.use_vsync, "Enable VSync (Requires Restart)");
         ui.add(egui::Slider::new(&mut self.config.target_fps, 15.0..=144.0).text("Max Target FPS"));
@@ -1125,4 +1125,492 @@ impl VisualizerApp {
         ui.label(format!("Current FPS: {:.1}", self.current_fps));
 
         ui.separator();
+        ui.heading("Visualizer Direction");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.config.visualizer_direction, VisualizerDirection::Up, "Up");
+            ui.radio_value(&mut self.config.visualizer_direction, VisualizerDirection::Down, "Down");
+            ui.radio_value(&mut self.config.visualizer_direction, VisualizerDirection::Left, "Left");
+            ui.radio_value(&mut self.config.visualizer_direction, VisualizerDirection::Right, "Right");
+        });
+        ui.label("Direction the bars grow from their anchor edge.");
+
+        ui.separator();
+        ui.heading("Frequency Direction");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::LeftToRight, "Left To Right");
+            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::RightToLeft, "Right To Left");
+            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::Mirrored, "Mirrored (Symmetrical)");
+        });
+
+        ui.separator();
+        ui.heading("Layout");
+        ui.add(egui::Slider::new(&mut self.config.bar_width, 1.0..=50.0).text("Bar width"));
+        ui.add(egui::Slider::new(&mut self.config.bar_gap, 0.0..=20.0).text("Bar gap"));
+        ui.add(egui::Slider::new(&mut self.config.sensitivity, 1.0..=100.0).text("Sensitivity"));
+        ui.add(egui::Slider::new(&mut self.config.max_bar_height, 0.0..=1000.0).text("Max Bar Height (0 = Full)"));
+        ui.add(egui::Slider::new(&mut self.config.num_bars, 16..=256).text("Number of Bars"));
+
+        ui.separator();
+        ui.heading("Positioning");
+        ui.add(egui::Slider::new(&mut self.config.x_offset, -1000.0..=1000.0).text("X Offset"));
+        ui.add(egui::Slider::new(&mut self.config.y_offset, -1000.0..=1000.0).text("Y Offset"));
+
+        ui.separator();
+        ui.heading("Color Mode");
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut self.config.color_mode, ColorMode::Dynamic, "Dynamic");
+            ui.radio_value(&mut self.config.color_mode, ColorMode::StaticSingle, "Static Single");
+            ui.radio_value(&mut self.config.color_mode, ColorMode::StaticMultiple, "Static Multi");
+            ui.radio_value(&mut self.config.color_mode, ColorMode::Gradient, "Gradient");
+            ui.radio_value(&mut self.config.color_mode, ColorMode::ColorChanging, "Color Changing");
+        });
+
+        ui.separator();
+
+        match self.config.color_mode {
+            ColorMode::StaticSingle => {
+                ui.horizontal(|ui| {
+                    ui.label("Bar Color:");
+                    ui.color_edit_button_srgb(&mut self.config.bar_color);
+                    if ui.button("Save Preset").clicked() {
+                        if !self.config.color_presets.contains(&self.config.bar_color) {
+                            self.config.color_presets.push(self.config.bar_color);
+                        }
+                    }
+                });
+
+                ui.label("Presets:");
+                ui.horizontal_wrapped(|ui| {
+                    for preset in &self.config.color_presets {
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(24.0, 24.0),
+                            egui::Sense::click(),
+                        );
+                        if ui.is_rect_visible(rect) {
+                            let color =
+                                egui::Color32::from_rgb(preset[0], preset[1], preset[2]);
+                            ui.painter().rect_filled(rect, 4.0, color);
+                            if response.clicked() {
+                                self.config.bar_color = *preset;
+                            }
+                        }
+                    }
+                });
+            }
+
+            ColorMode::StaticMultiple => {
+                ui.heading("Multiple Static Colors");
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Blocks, "Blocks");
+                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Sequential, "Sequential");
+                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Random, "Random");
+                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Vertical, "Vertical");
+                });
+
+                if self.config.static_mode == StaticDistributionMode::Sequential {
+                    ui.add(
+                        egui::Slider::new(&mut self.config.sequential_bars_per_color, 1..=20)
+                            .text("Bars per Color"),
+                    );
+                    ui.label("1 = R, W, B, R…   2 = R, R, W, W, B, B…");
+                }
+
+                ui.add_space(5.0);
+
+                let mut to_remove = None;
+                for (i, color) in self.config.static_colors.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.color_edit_button_srgb(color);
+                        if ui.button("❌").clicked() {
+                            to_remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = to_remove {
+                    self.config.static_colors.remove(i);
+                }
+                if ui.button("➕ Add Color").clicked() {
+                    self.config.static_colors.push([255, 255, 255]);
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.new_preset_name);
+                    if ui.button("💾 Save Preset").clicked() {
+                        let name = if self.new_preset_name.trim().is_empty() {
+                            format!("Preset {}", self.config.static_multi_presets.len() + 1)
+                        } else {
+                            self.new_preset_name.clone()
+                        };
+                        self.config.static_multi_presets.push(StaticMultiPreset {
+                            name,
+                            colors: self.config.static_colors.clone(),
+                            mode: self.config.static_mode,
+                            bars_per_color: self.config.sequential_bars_per_color,
+                        });
+                        self.new_preset_name.clear();
+                    }
+                });
+
+                ui.label("Presets:");
+                let mut preset_to_remove = None;
+                for (i, preset) in self.config.static_multi_presets.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.button(&preset.name).clicked() {
+                            self.config.static_colors = preset.colors.clone();
+                            self.config.static_mode = preset.mode;
+                            self.config.sequential_bars_per_color = preset.bars_per_color;
+                        }
+                        if ui.button("❌").clicked() {
+                            preset_to_remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = preset_to_remove {
+                    self.config.static_multi_presets.remove(i);
+                }
+            }
+
+            ColorMode::Gradient => {
+                ui.heading("Gradient Colors");
+                ui.add(egui::Slider::new(&mut self.config.gradient_angle, 0.0..=360.0).text("Angle (°)"));
+                ui.label("0° = horizontal, 90° = vertical, 45° = diagonal.");
+
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 30.0),
+                    egui::Sense::click_and_drag(),
+                );
+                let painter = ui.painter();
+
+                let steps = 100;
+                for i in 0..steps {
+                    let t1 = i as f32 / steps as f32;
+                    let t2 = (i + 1) as f32 / steps as f32;
+                    let c1 = color::sample_gradient(&self.config.gradient_stops, t1);
+                    let x1 = rect.left() + rect.width() * t1;
+                    let x2 = rect.left() + rect.width() * t2;
+                    let r = egui::Rect::from_min_max(
+                        egui::pos2(x1, rect.top()),
+                        egui::pos2(x2, rect.bottom()),
+                    );
+                    painter.rect_filled(r, 0.0, egui::Color32::from_rgb(c1[0], c1[1], c1[2]));
+                }
+
+                let mut sort_stops = false;
+                for (i, stop) in self.config.gradient_stops.iter_mut().enumerate() {
+                    let x = rect.left() + rect.width() * stop.position;
+                    let stop_rect = egui::Rect::from_center_size(
+                        egui::pos2(x, rect.center().y),
+                        egui::vec2(12.0, 30.0),
+                    );
+                    let stop_response = ui.interact(
+                        stop_rect,
+                        ui.id().with("gradient_stop").with(i),
+                        egui::Sense::click_and_drag(),
+                    );
+
+                    if stop_response.dragged() {
+                        stop.position = (stop.position
+                            + stop_response.drag_delta().x / rect.width())
+                        .clamp(0.0, 1.0);
+                        sort_stops = true;
+                    }
+
+                    let handle_color =
+                        egui::Color32::from_rgb(stop.color[0], stop.color[1], stop.color[2]);
+                    painter.rect_filled(stop_rect, 2.0, handle_color);
+                    painter.rect_stroke(
+                        stop_rect,
+                        2.0_f32,
+                        egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+                    );
+                }
+
+                if sort_stops {
+                    self.config
+                        .gradient_stops
+                        .sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap());
+                }
+
+                if response.double_clicked() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                        let c = color::sample_gradient(&self.config.gradient_stops, t);
+                        self.config
+                            .gradient_stops
+                            .push(GradientStop { color: c, position: t });
+                        self.config
+                            .gradient_stops
+                            .sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap());
+                    }
+                }
+                ui.label("Double-click the bar to add a color stop.");
+
+                let mut to_remove = None;
+                let current_len = self.config.gradient_stops.len();
+                for (i, stop) in self.config.gradient_stops.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.color_edit_button_srgb(&mut stop.color);
+                        ui.label(format!("Pos: {:.2}", stop.position));
+                        if current_len > 2 && ui.button("❌").clicked() {
+                            to_remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = to_remove {
+                    self.config.gradient_stops.remove(i);
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.new_preset_name);
+                    if ui.button("💾 Save Preset").clicked() {
+                        let name = if self.new_preset_name.trim().is_empty() {
+                            format!("Preset {}", self.config.gradient_presets.len() + 1)
+                        } else {
+                            self.new_preset_name.clone()
+                        };
+                        self.config.gradient_presets.push(GradientPreset {
+                            name,
+                            stops: self.config.gradient_stops.clone(),
+                            angle: self.config.gradient_angle,
+                        });
+                        self.new_preset_name.clear();
+                    }
+                });
+
+                ui.label("Presets:");
+                let mut preset_to_remove = None;
+                for (i, preset) in self.config.gradient_presets.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.button(&preset.name).clicked() {
+                            self.config.gradient_stops = preset.stops.clone();
+                            self.config.gradient_angle = preset.angle;
+                        }
+                        if ui.button("❌").clicked() {
+                            preset_to_remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = preset_to_remove {
+                    self.config.gradient_presets.remove(i);
+                }
+            }
+
+            ColorMode::ColorChanging => {
+                ui.heading("Color Changing");
+                let mut to_remove = None;
+                let current_len = self.config.color_change_colors.len();
+                for (i, color) in self.config.color_change_colors.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.color_edit_button_srgb(color);
+                        if current_len > 2 && ui.button("❌").clicked() {
+                            to_remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = to_remove {
+                    self.config.color_change_colors.remove(i);
+                }
+                if ui.button("➕ Add Color").clicked() {
+                    self.config.color_change_colors.push([255, 255, 255]);
+                }
+
+                ui.add(egui::Slider::new(&mut self.config.color_change_speed, 0.0..=1.0)
+                    .text("Speed")
+                    .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)));
+
+                // ── Motion Shape ──────────────────────────────────
+                ui.add_space(10.0);
+                ui.separator();
+                ui.heading("Motion Shape");
+
+                egui::ComboBox::from_label("Shape")
+                    .selected_text(self.config.color_change_motion.shape.display_name())
+                    .show_ui(ui, |ui| {
+                        let all_shapes = [
+                            MotionShape::Uniform,
+                            MotionShape::HorizontalWipe,
+                            MotionShape::VerticalWipe,
+                            MotionShape::DiagonalWipe,
+                            MotionShape::SineWave,
+                            MotionShape::TriangleWave,
+                            MotionShape::SquareWave,
+                            MotionShape::SawtoothWave,
+                            MotionShape::Strobe,
+                            MotionShape::Pulse,
+                            MotionShape::Heartbeat,
+                            MotionShape::Stutter,
+                            MotionShape::Comet,
+                            MotionShape::Chase,
+                            MotionShape::BouncingBall,
+                            MotionShape::Sparkle,
+                            MotionShape::FireSimulation,
+                            MotionShape::Plasma,
+                            MotionShape::RainbowCycle,
+                            MotionShape::Confetti,
+                            MotionShape::Sinelon,
+                        ];
+                        for shape in all_shapes {
+                            ui.selectable_value(
+                                &mut self.config.color_change_motion.shape,
+                                shape,
+                                shape.display_name(),
+                            );
+                        }
+                    });
+
+                ui.horizontal(|ui| {
+                    ui.label("Blend:");
+                    ui.radio_value(
+                        &mut self.config.color_change_motion.blend,
+                        BlendMode::Smooth,
+                        "Smooth",
+                    );
+                    ui.radio_value(
+                        &mut self.config.color_change_motion.blend,
+                        BlendMode::Hard,
+                        "Hard",
+                    );
+                });
+                ui.label("Smooth = gradients / soft fades. Hard = sharp on/off edges.");
+
+                ui.add(egui::Slider::new(
+                    &mut self.config.color_change_motion.speed,
+                    0.0..=2.0,
+                )
+                .text("Motion Speed"));
+
+                // ── Per-shape extra sliders (only when relevant) ──
+                let shape = self.config.color_change_motion.shape;
+                let hard = self.config.color_change_motion.blend == BlendMode::Hard;
+
+                if matches!(
+                    shape,
+                    MotionShape::SineWave
+                        | MotionShape::TriangleWave
+                        | MotionShape::SquareWave
+                        | MotionShape::SawtoothWave
+                ) {
+                    ui.add(egui::Slider::new(
+                        &mut self.config.color_change_motion.wave_frequency,
+                        0.5..=8.0,
+                    )
+                    .text("Wave Frequency"));
+                }
+
+                if matches!(
+                    shape,
+                    MotionShape::Comet
+                        | MotionShape::BouncingBall
+                        | MotionShape::Sinelon
+                ) {
+                    ui.add(egui::Slider::new(
+                        &mut self.config.color_change_motion.trail_length,
+                        0.05..=0.9,
+                    )
+                    .text("Trail Length"));
+                }
+
+                if matches!(
+                    shape,
+                    MotionShape::Stutter | MotionShape::Sparkle | MotionShape::Confetti
+                ) {
+                    ui.add(egui::Slider::new(
+                        &mut self.config.color_change_motion.stutter_intensity,
+                        0.0..=1.0,
+                    )
+                    .text("Stutter / Event Intensity"));
+                }
+
+                if matches!(
+                    shape,
+                    MotionShape::HorizontalWipe
+                        | MotionShape::VerticalWipe
+                        | MotionShape::DiagonalWipe
+                ) && !hard
+                {
+                    ui.add(egui::Slider::new(
+                        &mut self.config.color_change_motion.wipe_softness,
+                        0.01..=0.5,
+                    )
+                    .text("Wipe Softness"));
+                }
+
+                // ── Presets ───────────────────────────────────────
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.new_preset_name);
+                    if ui.button("💾 Save Preset").clicked() {
+                        let name = if self.new_preset_name.trim().is_empty() {
+                            format!("Preset {}", self.config.color_change_presets.len() + 1)
+                        } else {
+                            self.new_preset_name.clone()
+                        };
+                        self.config.color_change_presets.push(ColorChangePreset {
+                            name,
+                            colors: self.config.color_change_colors.clone(),
+                            speed: self.config.color_change_speed,
+                        });
+                        self.new_preset_name.clear();
+                    }
+                });
+
+                ui.label("Presets:");
+                let mut preset_to_remove = None;
+                for (i, preset) in self.config.color_change_presets.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.button(&preset.name).clicked() {
+                            self.config.color_change_colors = preset.colors.clone();
+                            self.config.color_change_speed = preset.speed;
+                        }
+                        if ui.button("❌").clicked() {
+                            preset_to_remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = preset_to_remove {
+                    self.config.color_change_presets.remove(i);
+                }
+            }
+
+            _ => {}
+        }
+
+        ui.separator();
+        ui.heading("Appearance");
+        ui.add(egui::Slider::new(&mut self.config.bg_opacity, 0..=255).text("Background Opacity"));
+
+        ui.separator();
+        if ui.button("⚠️ Reset to Defaults").clicked() {
+            self.config = AppConfig::default();
+            self.audio_target_bars
+                .store(self.config.num_bars, Ordering::Relaxed);
+            self.audio_update_interval
+                .store(self.config.audio_update_ms, Ordering::Relaxed);
+            self.current_bars = vec![0.0; self.config.num_bars];
+        }
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let config = AppConfig::load();
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_transparent(true)
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_maximized(true),
+        vsync: config.use_vsync,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Rust Visualizer",
+        options,
+        Box::new(|_cc| Box::new(VisualizerApp::new())),
+    )
+}
        
