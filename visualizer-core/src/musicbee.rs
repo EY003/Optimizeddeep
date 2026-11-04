@@ -35,9 +35,7 @@ pub fn spawn_smtc_listener(
     std::thread::spawn(move || {
         // ── 1. Initialize COM on this worker thread ───────────
         // SMTC (WinRT) is built on COM and requires an initialized apartment.
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        }
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
         // ── 2. Acquire the session manager, retrying on failure ─
         // On cold boot the SMTC service may not be ready immediately.
