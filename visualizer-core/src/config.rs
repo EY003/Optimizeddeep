@@ -475,14 +475,26 @@ impl AppConfig {
     }
 
     pub fn load() -> Self {
-        let path = Self::get_path();
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(config) = toml::from_str(&content) {
-                return config;
+    let path = Self::get_path();
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(mut config) = toml::from_str::<AppConfig>(&content) {
+            // Migration for config files written before the preset feature existed:
+            // they were saved with empty preset lists, so fill them with the
+            // built-in defaults. Users who saved their own presets are unaffected.
+            if config.static_multi_presets.is_empty() {
+                config.static_multi_presets = default_static_multi_presets();
             }
+            if config.gradient_presets.is_empty() {
+                config.gradient_presets = default_gradient_presets();
+            }
+            if config.color_change_presets.is_empty() {
+                config.color_change_presets = default_color_change_presets();
+            }
+            return config;
         }
-        Self::default()
     }
+    Self::default()
+}
 
     pub fn save(&self) {
         let path = Self::get_path();
