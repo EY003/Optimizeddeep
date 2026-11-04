@@ -170,6 +170,23 @@ impl MotionShape {
             MotionShape::VerticalWipe | MotionShape::DiagonalWipe
         )
     }
+        /// Shapes that vary brightness over time (intensity dips below 1.0 for
+    /// some pixels or at some moments). Only these care about `off_color`.
+    pub fn uses_intensity(self) -> bool {
+        matches!(
+            self,
+            MotionShape::Strobe
+                | MotionShape::Pulse
+                | MotionShape::Heartbeat
+                | MotionShape::Comet
+                | MotionShape::Chase
+                | MotionShape::BouncingBall
+                | MotionShape::Sparkle
+                | MotionShape::Sinelon
+                | MotionShape::FireSimulation
+                | MotionShape::Confetti
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -202,6 +219,10 @@ pub struct MotionSettings {
     pub wave_frequency: f32,
     /// Softness of the wipe boundary as a fraction of the strip (wipe shapes only).
     pub wipe_softness: f32,
+    /// Colour that "off" pixels fade toward for shapes that modulate
+    /// intensity (Pulse, Heartbeat, Comet, Strobe, etc.). Defaults to black.
+    #[serde(default)]
+    pub off_color: [u8; 3],
 }
 
 impl Default for MotionSettings {
@@ -214,6 +235,7 @@ impl Default for MotionSettings {
             stutter_intensity: 0.3,
             wave_frequency: 2.0,
             wipe_softness: 0.1,
+            off_color: [0, 0, 0],
         }
     }
 }
