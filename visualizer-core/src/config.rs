@@ -28,15 +28,13 @@ impl Default for FrequencyDirection {
     }
 }
 
-// ── NEW COLOR MODES ──────────────────────────────────────────
-
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColorMode {
-    Dynamic,       // Cover art
-    StaticSingle,  // One static color
-    StaticMultiple,// Multiple static colors
-    Gradient,      // Smooth gradient
-    ColorChanging, // Cyclic interpolation
+    Dynamic,
+    StaticSingle,
+    StaticMultiple,
+    Gradient,
+    ColorChanging,
 }
 
 impl Default for ColorMode {
@@ -45,15 +43,18 @@ impl Default for ColorMode {
     }
 }
 
+// Renamed and expanded distribution modes
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DistributionDirection {
-    Horizontal, // Colors across the bars
-    Vertical,   // Colors stacked inside each bar
+pub enum StaticDistributionMode {
+    Blocks,     // Evenly divided blocks across the bars
+    Sequential, // Cycles through colors bar by bar (1,2,3,1,2,3...)
+    Random,     // Randomly assigned to each bar
+    Vertical,   // Stacked inside each bar
 }
 
-impl Default for DistributionDirection {
+impl Default for StaticDistributionMode {
     fn default() -> Self {
-        DistributionDirection::Horizontal
+        StaticDistributionMode::Blocks
     }
 }
 
@@ -65,23 +66,24 @@ pub struct GradientStop {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StaticMultiPreset {
+    pub name: String,
     pub colors: Vec<[u8; 3]>,
-    pub direction: DistributionDirection,
+    pub mode: StaticDistributionMode,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GradientPreset {
+    pub name: String,
     pub stops: Vec<GradientStop>,
     pub angle: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ColorChangePreset {
+    pub name: String,
     pub colors: Vec<[u8; 3]>,
     pub speed: f32,
 }
-
-// ── MAIN CONFIG ──────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
@@ -119,7 +121,7 @@ pub struct AppConfig {
     #[serde(default = "default_static_colors")]
     pub static_colors: Vec<[u8; 3]>,
     #[serde(default)]
-    pub static_direction: DistributionDirection,
+    pub static_mode: StaticDistributionMode,
     #[serde(default)]
     pub static_multi_presets: Vec<StaticMultiPreset>,
 
@@ -138,7 +140,6 @@ pub struct AppConfig {
     pub color_change_presets: Vec<ColorChangePreset>,
 }
 
-// Defaults for new fields
 fn default_static_colors() -> Vec<[u8; 3]> {
     vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]]
 }
@@ -190,7 +191,7 @@ impl Default for AppConfig {
 
             color_mode: ColorMode::Dynamic,
             static_colors: default_static_colors(),
-            static_direction: DistributionDirection::Horizontal,
+            static_mode: StaticDistributionMode::Blocks,
             static_multi_presets: vec![],
 
             gradient_stops: default_gradient_stops(),
