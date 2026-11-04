@@ -22,6 +22,18 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
 };
 
+/// MurmurHash3 32-bit finalizer — excellent avalanche & uniformity.
+/// Used by the `Random` static distribution mode.
+fn random_color_index(i: usize, num_colors: usize) -> usize {
+    let mut x = i as u32;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x85EB_CA6B);
+    x ^= x >> 13;
+    x = x.wrapping_mul(0xC2B2_AE35);
+    x ^= x >> 16;
+    (x as usize) % num_colors
+}
+
 struct VisualizerApp {
     config: AppConfig,
     current_bars: Vec<f32>,
@@ -35,7 +47,7 @@ struct VisualizerApp {
     is_passthrough_set: bool,
 
     last_frame_time: Instant,
-    
+
     // Preset naming state
     new_preset_name: String,
 
@@ -205,7 +217,7 @@ impl eframe::App for VisualizerApp {
         if self.show_settings {
             let settings_builder = egui::ViewportBuilder::default()
                 .with_title("Visualizer Settings")
-                .with_inner_size([400.0, 900.0]) // slightly taller for new UI elements
+                .with_inner_size([400.0, 900.0])
                 .with_decorations(true)
                 .with_resizable(true)
                 .with_always_on_top();
@@ -301,33 +313,35 @@ impl VisualizerApp {
 
                 let idx = match self.config.static_mode {
                     StaticDistributionMode::Blocks => {
-                        // Divide the bars evenly into chunks
                         let mut chunk = (i as f32 / total_bars as f32 * num_colors as f32) as usize;
-                        if chunk >= num_colors { chunk = num_colors - 1; }
+                        if chunk >= num_colors {
+                            chunk = num_colors - 1;
+                        }
                         chunk
                     }
                     StaticDistributionMode::Sequential => {
-                        i % num_colors
+                        // Each colour occupies `sequential_bars_per_color` consecutive bars.
+                        let bars_per_color = self.config.sequential_bars_per_color.max(1);
+                        (i / bars_per_color) % num_colors
                     }
-                    StaticDistributionMode::Random => {
-                        // Deterministic pseudo-random based on bar index
-                        let hash = (i as u32).wrapping_mul(2654435761);
-                        (hash as usize) % num_colors
-                    }
-                    StaticDistributionMode::Vertical => {
-                        // This mode is handled separately in draw_bars, fallback to 0
-                        0
-                    }
+                    StaticDistributionMode::Random => random_color_index(i, num_colors),
+                    StaticDistributionMode::Vertical => 0,
                 };
-                
-                let c = self.config.static_colors.get(idx).copied().unwrap_or([255, 255, 255]);
+
+                let c = self
+                    .config
+                    .static_colors
+                    .get(idx)
+                    .copied()
+                    .unwrap_or([255, 255, 255]);
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
             ColorMode::Gradient => {
+                // Fallback single-color sample (only used if a gradient bar can't be
+                // drawn as a mesh, e.g. zero-area rects).
                 let angle_rad = self.config.gradient_angle.to_radians();
                 let dir = egui::vec2(angle_rad.cos(), angle_rad.sin());
 
-                // Project screen corners to find the min/max projection distance
                 let corners = [
                     screen_rect.left_top(),
                     screen_rect.right_top(),
@@ -344,7 +358,7 @@ impl VisualizerApp {
 
                 let center = bar_rect.center();
                 let bar_proj = center.x * dir.x + center.y * dir.y;
-                
+
                 let t = if (max_proj - min_proj).abs() > 0.0001 {
                     ((bar_proj - min_proj) / (max_proj - min_proj)).clamp(0.0, 1.0)
                 } else {
@@ -361,6 +375,58 @@ impl VisualizerApp {
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
         }
+    }
+
+    /// Renders a single bar as a gradient mesh, so the gradient runs *inside* the bar
+    /// rather than sampling one colour for the whole bar. This makes `angle = 90°`
+    /// produce a genuine vertical gradient.
+    fn draw_gradient_bar(
+        &self,
+        painter: &egui::Painter,
+        bar_rect: egui::Rect,
+        screen_rect: egui::Rect,
+    ) {
+        let angle_rad = self.config.gradient_angle.to_radians();
+        let dir = egui::vec2(angle_rad.cos(), angle_rad.sin());
+
+        // Project screen corners so the gradient is coherent across the whole screen.
+        let screen_corners = [
+            screen_rect.left_top(),
+            screen_rect.right_top(),
+            screen_rect.left_bottom(),
+            screen_rect.right_bottom(),
+        ];
+        let mut min_proj = f32::MAX;
+        let mut max_proj = f32::MIN;
+        for c in screen_corners {
+            let p = c.x * dir.x + c.y * dir.y;
+            min_proj = min_proj.min(p);
+            max_proj = max_proj.max(p);
+        }
+        let range = (max_proj - min_proj).max(0.0001);
+
+        // Bar corners: top-left, top-right, bottom-right, bottom-left
+        let corners = [
+            bar_rect.left_top(),
+            bar_rect.right_top(),
+            bar_rect.right_bottom(),
+            bar_rect.left_bottom(),
+        ];
+
+        let mut mesh = egui::Mesh::default();
+        for corner in corners {
+            let t =
+                ((corner.x * dir.x + corner.y * dir.y - min_proj) / range).clamp(0.0, 1.0);
+            let c = color::sample_gradient(&self.config.gradient_stops, t);
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: corner,
+                uv: egui::Pos2::ZERO,
+                color: egui::Color32::from_rgb(c[0], c[1], c[2]),
+            });
+        }
+        mesh.indices.extend_from_slice(&[0u32, 1, 2, 0, 2, 3]);
+
+        painter.add(egui::Shape::mesh(mesh));
     }
 
     fn draw_bars(&self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -387,8 +453,9 @@ impl VisualizerApp {
         let time = ui.input(|i| i.time) as f32;
         let painter = ui.painter();
 
-        let is_vertical_stack = self.config.color_mode == ColorMode::StaticMultiple 
+        let is_vertical_stack = self.config.color_mode == ColorMode::StaticMultiple
             && self.config.static_mode == StaticDistributionMode::Vertical;
+        let is_gradient = self.config.color_mode == ColorMode::Gradient;
 
         match self.config.visualizer_direction {
             VisualizerDirection::Up => {
@@ -399,8 +466,12 @@ impl VisualizerApp {
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut h = self.current_bars[idx] * sensitivity_multiplier * rect_h;
-                    if max_h > 0.0 { h = h.min(max_h); }
-                    if h <= 0.0 { continue; }
+                    if max_h > 0.0 {
+                        h = h.min(max_h);
+                    }
+                    if h <= 0.0 {
+                        continue;
+                    }
 
                     let x = start_x + i as f32 * stride;
                     let bar_rect = egui::Rect::from_min_max(
@@ -412,17 +483,33 @@ impl VisualizerApp {
                         let num_colors = self.config.static_colors.len().max(1);
                         let slice_h = h / num_colors as f32;
                         for c_idx in 0..num_colors {
-                            let c = self.config.static_colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
+                            let c = self
+                                .config
+                                .static_colors
+                                .get(c_idx)
+                                .copied()
+                                .unwrap_or([255, 255, 255]);
                             let y = bottom_y - h + (c_idx as f32 * slice_h);
                             let slice_rect = egui::Rect::from_min_max(
                                 egui::pos2(x, y),
                                 egui::pos2(x + bar_width, y + slice_h),
                             );
                             let mut r = egui::Rounding::ZERO;
-                            if c_idx == num_colors - 1 { r.nw = radius; r.ne = radius; }
-                            else if c_idx == 0 { r.sw = radius; r.se = radius; }
-                            painter.rect_filled(slice_rect, r, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                            if c_idx == num_colors - 1 {
+                                r.nw = radius;
+                                r.ne = radius;
+                            } else if c_idx == 0 {
+                                r.sw = radius;
+                                r.se = radius;
+                            }
+                            painter.rect_filled(
+                                slice_rect,
+                                r,
+                                egui::Color32::from_rgb(c[0], c[1], c[2]),
+                            );
                         }
+                    } else if is_gradient {
+                        self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
                         let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
                         painter.rect_filled(bar_rect, radius, color);
@@ -437,8 +524,12 @@ impl VisualizerApp {
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut h = self.current_bars[idx] * sensitivity_multiplier * rect_h;
-                    if max_h > 0.0 { h = h.min(max_h); }
-                    if h <= 0.0 { continue; }
+                    if max_h > 0.0 {
+                        h = h.min(max_h);
+                    }
+                    if h <= 0.0 {
+                        continue;
+                    }
 
                     let x = start_x + i as f32 * stride;
                     let bar_rect = egui::Rect::from_min_max(
@@ -450,17 +541,33 @@ impl VisualizerApp {
                         let num_colors = self.config.static_colors.len().max(1);
                         let slice_h = h / num_colors as f32;
                         for c_idx in 0..num_colors {
-                            let c = self.config.static_colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
+                            let c = self
+                                .config
+                                .static_colors
+                                .get(c_idx)
+                                .copied()
+                                .unwrap_or([255, 255, 255]);
                             let y = top_y + (c_idx as f32 * slice_h);
                             let slice_rect = egui::Rect::from_min_max(
                                 egui::pos2(x, y),
                                 egui::pos2(x + bar_width, y + slice_h),
                             );
                             let mut r = egui::Rounding::ZERO;
-                            if c_idx == 0 { r.nw = radius; r.ne = radius; }
-                            else if c_idx == num_colors - 1 { r.sw = radius; r.se = radius; }
-                            painter.rect_filled(slice_rect, r, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                            if c_idx == 0 {
+                                r.nw = radius;
+                                r.ne = radius;
+                            } else if c_idx == num_colors - 1 {
+                                r.sw = radius;
+                                r.se = radius;
+                            }
+                            painter.rect_filled(
+                                slice_rect,
+                                r,
+                                egui::Color32::from_rgb(c[0], c[1], c[2]),
+                            );
                         }
+                    } else if is_gradient {
+                        self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
                         let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
                         painter.rect_filled(bar_rect, radius, color);
@@ -475,8 +582,12 @@ impl VisualizerApp {
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut w = self.current_bars[idx] * sensitivity_multiplier * rect_w;
-                    if max_h > 0.0 { w = w.min(max_h); }
-                    if w <= 0.0 { continue; }
+                    if max_h > 0.0 {
+                        w = w.min(max_h);
+                    }
+                    if w <= 0.0 {
+                        continue;
+                    }
 
                     let y = start_y + i as f32 * stride;
                     let bar_rect = egui::Rect::from_min_max(
@@ -488,17 +599,33 @@ impl VisualizerApp {
                         let num_colors = self.config.static_colors.len().max(1);
                         let slice_w = w / num_colors as f32;
                         for c_idx in 0..num_colors {
-                            let c = self.config.static_colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
+                            let c = self
+                                .config
+                                .static_colors
+                                .get(c_idx)
+                                .copied()
+                                .unwrap_or([255, 255, 255]);
                             let x = left_x + (c_idx as f32 * slice_w);
                             let slice_rect = egui::Rect::from_min_max(
                                 egui::pos2(x, y),
                                 egui::pos2(x + slice_w, y + bar_width),
                             );
                             let mut r = egui::Rounding::ZERO;
-                            if c_idx == num_colors - 1 { r.ne = radius; r.se = radius; }
-                            else if c_idx == 0 { r.nw = radius; r.sw = radius; }
-                            painter.rect_filled(slice_rect, r, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                            if c_idx == num_colors - 1 {
+                                r.ne = radius;
+                                r.se = radius;
+                            } else if c_idx == 0 {
+                                r.nw = radius;
+                                r.sw = radius;
+                            }
+                            painter.rect_filled(
+                                slice_rect,
+                                r,
+                                egui::Color32::from_rgb(c[0], c[1], c[2]),
+                            );
                         }
+                    } else if is_gradient {
+                        self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
                         let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
                         painter.rect_filled(bar_rect, radius, color);
@@ -513,8 +640,12 @@ impl VisualizerApp {
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut w = self.current_bars[idx] * sensitivity_multiplier * rect_w;
-                    if max_h > 0.0 { w = w.min(max_h); }
-                    if w <= 0.0 { continue; }
+                    if max_h > 0.0 {
+                        w = w.min(max_h);
+                    }
+                    if w <= 0.0 {
+                        continue;
+                    }
 
                     let y = start_y + i as f32 * stride;
                     let bar_rect = egui::Rect::from_min_max(
@@ -526,17 +657,33 @@ impl VisualizerApp {
                         let num_colors = self.config.static_colors.len().max(1);
                         let slice_w = w / num_colors as f32;
                         for c_idx in 0..num_colors {
-                            let c = self.config.static_colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
+                            let c = self
+                                .config
+                                .static_colors
+                                .get(c_idx)
+                                .copied()
+                                .unwrap_or([255, 255, 255]);
                             let x = right_x - w + (c_idx as f32 * slice_w);
                             let slice_rect = egui::Rect::from_min_max(
                                 egui::pos2(x, y),
                                 egui::pos2(x + slice_w, y + bar_width),
                             );
                             let mut r = egui::Rounding::ZERO;
-                            if c_idx == 0 { r.ne = radius; r.se = radius; }
-                            else if c_idx == num_colors - 1 { r.nw = radius; r.sw = radius; }
-                            painter.rect_filled(slice_rect, r, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                            if c_idx == 0 {
+                                r.ne = radius;
+                                r.se = radius;
+                            } else if c_idx == num_colors - 1 {
+                                r.nw = radius;
+                                r.sw = radius;
+                            }
+                            painter.rect_filled(
+                                slice_rect,
+                                r,
+                                egui::Color32::from_rgb(c[0], c[1], c[2]),
+                            );
                         }
+                    } else if is_gradient {
+                        self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
                         let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
                         painter.rect_filled(bar_rect, radius, color);
@@ -634,14 +781,28 @@ impl VisualizerApp {
                     ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Vertical, "Vertical");
                 });
 
+                if self.config.static_mode == StaticDistributionMode::Sequential {
+                    ui.add(
+                        egui::Slider::new(&mut self.config.sequential_bars_per_color, 1..=20)
+                            .text("Bars per Color"),
+                    );
+                    ui.label("1 = R, W, B, R…   2 = R, R, W, W, B, B…");
+                }
+
+                ui.add_space(5.0);
+
                 let mut to_remove = None;
                 for (i, color) in self.config.static_colors.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.color_edit_button_srgb(color);
-                        if ui.button("❌").clicked() { to_remove = Some(i); }
+                        if ui.button("❌").clicked() {
+                            to_remove = Some(i);
+                        }
                     });
                 }
-                if let Some(i) = to_remove { self.config.static_colors.remove(i); }
+                if let Some(i) = to_remove {
+                    self.config.static_colors.remove(i);
+                }
                 if ui.button("➕ Add Color").clicked() {
                     self.config.static_colors.push([255, 255, 255]);
                 }
@@ -659,6 +820,7 @@ impl VisualizerApp {
                             name,
                             colors: self.config.static_colors.clone(),
                             mode: self.config.static_mode,
+                            bars_per_color: self.config.sequential_bars_per_color,
                         });
                         self.new_preset_name.clear();
                     }
@@ -671,16 +833,22 @@ impl VisualizerApp {
                         if ui.button(&preset.name).clicked() {
                             self.config.static_colors = preset.colors.clone();
                             self.config.static_mode = preset.mode;
+                            self.config.sequential_bars_per_color = preset.bars_per_color;
                         }
-                        if ui.button("❌").clicked() { preset_to_remove = Some(i); }
+                        if ui.button("❌").clicked() {
+                            preset_to_remove = Some(i);
+                        }
                     });
                 }
-                if let Some(i) = preset_to_remove { self.config.static_multi_presets.remove(i); }
+                if let Some(i) = preset_to_remove {
+                    self.config.static_multi_presets.remove(i);
+                }
             }
 
             ColorMode::Gradient => {
                 ui.heading("Gradient Colors");
                 ui.add(egui::Slider::new(&mut self.config.gradient_angle, 0.0..=360.0).text("Angle (°)"));
+                ui.label("0° = horizontal, 90° = vertical, 45° = diagonal.");
 
                 let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click_and_drag());
                 let painter = ui.painter();
@@ -701,12 +869,12 @@ impl VisualizerApp {
                     let x = rect.left() + rect.width() * stop.position;
                     let stop_rect = egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(12.0, 30.0));
                     let stop_response = ui.interact(stop_rect, ui.id().with("gradient_stop").with(i), egui::Sense::click_and_drag());
-                    
+
                     if stop_response.dragged() {
                         stop.position = (stop.position + stop_response.drag_delta().x / rect.width()).clamp(0.0, 1.0);
                         sort_stops = true;
                     }
-                    
+
                     let handle_color = egui::Color32::from_rgb(stop.color[0], stop.color[1], stop.color[2]);
                     painter.rect_filled(stop_rect, 2.0, handle_color);
                     painter.rect_stroke(stop_rect, 2.0_f32, egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
@@ -737,7 +905,9 @@ impl VisualizerApp {
                         }
                     });
                 }
-                if let Some(i) = to_remove { self.config.gradient_stops.remove(i); }
+                if let Some(i) = to_remove {
+                    self.config.gradient_stops.remove(i);
+                }
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -765,10 +935,14 @@ impl VisualizerApp {
                             self.config.gradient_stops = preset.stops.clone();
                             self.config.gradient_angle = preset.angle;
                         }
-                        if ui.button("❌").clicked() { preset_to_remove = Some(i); }
+                        if ui.button("❌").clicked() {
+                            preset_to_remove = Some(i);
+                        }
                     });
                 }
-                if let Some(i) = preset_to_remove { self.config.gradient_presets.remove(i); }
+                if let Some(i) = preset_to_remove {
+                    self.config.gradient_presets.remove(i);
+                }
             }
 
             ColorMode::ColorChanging => {
@@ -783,7 +957,9 @@ impl VisualizerApp {
                         }
                     });
                 }
-                if let Some(i) = to_remove { self.config.color_change_colors.remove(i); }
+                if let Some(i) = to_remove {
+                    self.config.color_change_colors.remove(i);
+                }
                 if ui.button("➕ Add Color").clicked() {
                     self.config.color_change_colors.push([255, 255, 255]);
                 }
@@ -818,10 +994,14 @@ impl VisualizerApp {
                             self.config.color_change_colors = preset.colors.clone();
                             self.config.color_change_speed = preset.speed;
                         }
-                        if ui.button("❌").clicked() { preset_to_remove = Some(i); }
+                        if ui.button("❌").clicked() {
+                            preset_to_remove = Some(i);
+                        }
                     });
                 }
-                if let Some(i) = preset_to_remove { self.config.color_change_presets.remove(i); }
+                if let Some(i) = preset_to_remove {
+                    self.config.color_change_presets.remove(i);
+                }
             }
 
             _ => {}
