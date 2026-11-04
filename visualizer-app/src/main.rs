@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use std::f32::consts::TAU;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use visualizer_core::{
@@ -91,11 +91,14 @@ struct VisualizerApp {
 
     new_preset_name: String,
 
-    // ── NEW: track / cover art state ─────────────────────────
+    // ── Track / cover art state ──────────────────────────────
     track_rx: crossbeam_channel::Receiver<TrackInfo>,
     track_info: Option<TrackInfo>,
     cover_texture: Option<egui::TextureHandle>,
     dynamic_color: [u8; 3],
+
+    /// Live count of SMTC sessions visible to Windows (for diagnostics).
+    smtc_session_count: Arc<AtomicUsize>,
 
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
@@ -113,7 +116,12 @@ impl VisualizerApp {
 
         // Spawn the SMTC listener
         let (track_tx, track_rx) = crossbeam_channel::unbounded();
-        musicbee::spawn_smtc_listener(track_tx, should_quit.clone());
+        let smtc_session_count = Arc::new(AtomicUsize::new(0));
+        musicbee::spawn_smtc_listener(
+            track_tx,
+            should_quit.clone(),
+            smtc_session_count.clone(),
+        );
 
         let tray_menu = Menu::new();
         let settings_item = MenuItem::new("Open Settings", true, None);
@@ -157,6 +165,7 @@ impl VisualizerApp {
             track_info: None,
             cover_texture: None,
             dynamic_color: [180, 200, 180],
+            smtc_session_count,
 
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
@@ -166,8 +175,7 @@ impl VisualizerApp {
     }
 
     /// Drain the SMTC channel, decode artwork, extract colors, and rebuild
-    /// the texture. Called once per frame; cheap when no new track has been
-    /// received.
+    /// the texture.
     fn poll_track_updates(&mut self, ctx: &egui::Context) {
         while let Ok(info) = self.track_rx.try_recv() {
             // Decode artwork + extract dominant color
@@ -189,7 +197,11 @@ impl VisualizerApp {
                 self.cover_texture = None;
             }
 
-            self.track_info = Some(info);
+            if info.title.is_empty() && info.artist.is_empty() {
+                self.track_info = None;
+            } else {
+                self.track_info = Some(info);
+            }
         }
     }
 
@@ -220,7 +232,6 @@ impl VisualizerApp {
 
         let painter = ui.painter();
 
-        // Artist (large)
         let artist_font = egui::FontId::proportional(30.0);
         let artist_pos = egui::pos2(right_x, text_top_y);
         painter.text(
@@ -238,7 +249,6 @@ impl VisualizerApp {
             egui::Color32::WHITE,
         );
 
-        // Title (smaller)
         let title_font = egui::FontId::proportional(21.0);
         let title_pos = egui::pos2(right_x, text_top_y + 40.0);
         painter.text(
@@ -276,7 +286,6 @@ impl eframe::App for VisualizerApp {
             ctx.set_pixels_per_point(1.0);
         }
 
-        // ── Handle new track data ──────────────────────────────
         self.poll_track_updates(ctx);
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
@@ -442,10 +451,6 @@ fn frequency_index(i: usize, base_num_bars: usize, dir: FrequencyDirection) -> u
 }
 
 impl VisualizerApp {
-    // ─────────────────────────────────────────────────────────
-    // Color Changing Motion Engine
-    // ─────────────────────────────────────────────────────────
-
     fn evaluate_motion(
         &self,
         shape: MotionShape,
@@ -710,10 +715,6 @@ impl VisualizerApp {
         egui::Color32::from_rgb(r as u8, g as u8, b as u8)
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Per-bar color resolution
-    // ─────────────────────────────────────────────────────────
-
     fn get_bar_color(
         &self,
         i: usize,
@@ -723,7 +724,6 @@ impl VisualizerApp {
         time: f32,
     ) -> egui::Color32 {
         match self.config.color_mode {
-            // ✨ Dynamic mode now uses the extracted album color.
             ColorMode::Dynamic => egui::Color32::from_rgb(
                 self.dynamic_color[0],
                 self.dynamic_color[1],
@@ -805,10 +805,6 @@ impl VisualizerApp {
             }
         }
     }
-
-    // ─────────────────────────────────────────────────────────
-    // Renderers
-    // ─────────────────────────────────────────────────────────
 
     fn draw_gradient_bar(
         &self,
@@ -1199,10 +1195,6 @@ impl VisualizerApp {
         }
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Settings UI
-    // ─────────────────────────────────────────────────────────
-
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Performance & Optimization");
         ui.checkbox(&mut self.config.use_vsync, "Enable VSync (Requires Restart)");
@@ -1255,6 +1247,19 @@ impl VisualizerApp {
 
         if self.config.color_mode == ColorMode::Dynamic {
             ui.label("Bars tint automatically to the dominant color of the current album art.");
+
+            let count = self.smtc_session_count.load(Ordering::Relaxed);
+            ui.label(format!("SMTC sessions active: {}", count));
+            if count == 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 180, 80),
+                    "⚠ No SMTC sessions found. Is a supported player running?",
+                );
+                ui.label(
+                    "MusicBee needs the 'mb_MediaControl' plugin installed for SMTC support.",
+                );
+            }
+
             if let Some(info) = &self.track_info {
                 ui.label(format!("Now Playing: {} — {}", info.artist, info.title));
             } else {
