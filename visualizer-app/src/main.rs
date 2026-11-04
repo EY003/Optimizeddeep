@@ -8,8 +8,8 @@ use visualizer_core::{
     audio::AudioEngine,
     color,
     config::{
-        AppConfig, ColorChangePreset, ColorMode, DistributionDirection, FrequencyDirection,
-        GradientPreset, GradientStop, StaticMultiPreset, VisualizerDirection,
+        AppConfig, ColorChangePreset, ColorMode, FrequencyDirection, GradientPreset,
+        GradientStop, StaticDistributionMode, StaticMultiPreset, VisualizerDirection,
     },
 };
 
@@ -35,6 +35,9 @@ struct VisualizerApp {
     is_passthrough_set: bool,
 
     last_frame_time: Instant,
+    
+    // Preset naming state
+    new_preset_name: String,
 
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
@@ -86,6 +89,7 @@ impl VisualizerApp {
             current_fps: 0.0,
             is_passthrough_set: false,
             last_frame_time: Instant::now(),
+            new_preset_name: String::new(),
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             settings_menu_id: settings_item.id().clone(),
@@ -100,7 +104,6 @@ impl eframe::App for VisualizerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // FPS counter
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
@@ -113,7 +116,6 @@ impl eframe::App for VisualizerApp {
             ctx.set_pixels_per_point(1.0);
         }
 
-        // Tray & hotkey events
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id {
                 self.show_settings = true;
@@ -141,7 +143,6 @@ impl eframe::App for VisualizerApp {
             return;
         }
 
-        // Audio thread sync
         let current_target = self.audio_target_bars.load(Ordering::Relaxed);
         if current_target != self.config.num_bars {
             self.audio_target_bars
@@ -155,7 +156,6 @@ impl eframe::App for VisualizerApp {
                 .store(self.config.audio_update_ms, Ordering::Relaxed);
         }
 
-        // Drain audio channel
         let mut latest_bars: Option<Vec<f32>> = None;
         while let Ok(bars) = self.audio_rx.try_recv() {
             latest_bars = Some(bars);
@@ -177,7 +177,6 @@ impl eframe::App for VisualizerApp {
             self.is_passthrough_set = true;
         }
 
-        // Overlay
         let rect = ctx.screen_rect();
         egui::Area::new(egui::Id::new("overlay"))
             .fixed_pos(rect.min)
@@ -203,11 +202,10 @@ impl eframe::App for VisualizerApp {
                 }
             });
 
-        // Settings viewport
         if self.show_settings {
             let settings_builder = egui::ViewportBuilder::default()
                 .with_title("Visualizer Settings")
-                .with_inner_size([400.0, 860.0])
+                .with_inner_size([400.0, 900.0]) // slightly taller for new UI elements
                 .with_decorations(true)
                 .with_resizable(true)
                 .with_always_on_top();
@@ -250,7 +248,6 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        // Frame pacing
         let target_duration = Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0));
         let repaint_after = if self.show_settings {
             target_duration.min(Duration::from_millis(16))
@@ -281,7 +278,6 @@ fn frequency_index(i: usize, base_num_bars: usize, dir: FrequencyDirection) -> u
 }
 
 impl VisualizerApp {
-    /// Helper to get the color for a single bar (or the start of a stacked bar)
     fn get_bar_color(
         &self,
         i: usize,
@@ -291,16 +287,39 @@ impl VisualizerApp {
         time: f32,
     ) -> egui::Color32 {
         match self.config.color_mode {
-            ColorMode::Dynamic => egui::Color32::from_rgb(180, 200, 180), // Placeholder for dynamic mode
+            ColorMode::Dynamic => egui::Color32::from_rgb(180, 200, 180),
             ColorMode::StaticSingle => egui::Color32::from_rgb(
                 self.config.bar_color[0],
                 self.config.bar_color[1],
                 self.config.bar_color[2],
             ),
             ColorMode::StaticMultiple => {
-                // Horizontal distribution (across bars)
-                let t = i as f32 / (total_bars.max(1) - 1) as f32;
-                let idx = (t * (self.config.static_colors.len().max(1) - 1) as f32).round() as usize;
+                let num_colors = self.config.static_colors.len().max(1);
+                if self.config.static_colors.is_empty() {
+                    return egui::Color32::WHITE;
+                }
+
+                let idx = match self.config.static_mode {
+                    StaticDistributionMode::Blocks => {
+                        // Divide the bars evenly into chunks
+                        let mut chunk = (i as f32 / total_bars as f32 * num_colors as f32) as usize;
+                        if chunk >= num_colors { chunk = num_colors - 1; }
+                        chunk
+                    }
+                    StaticDistributionMode::Sequential => {
+                        i % num_colors
+                    }
+                    StaticDistributionMode::Random => {
+                        // Deterministic pseudo-random based on bar index
+                        let hash = (i as u32).wrapping_mul(2654435761);
+                        (hash as usize) % num_colors
+                    }
+                    StaticDistributionMode::Vertical => {
+                        // This mode is handled separately in draw_bars, fallback to 0
+                        0
+                    }
+                };
+                
                 let c = self.config.static_colors.get(idx).copied().unwrap_or([255, 255, 255]);
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
@@ -308,22 +327,34 @@ impl VisualizerApp {
                 let angle_rad = self.config.gradient_angle.to_radians();
                 let dir = egui::vec2(angle_rad.cos(), angle_rad.sin());
 
-                // Project the bar's center onto the gradient direction
-                let norm_x = (bar_rect.center().x - screen_rect.left()) / screen_rect.width();
-                let norm_y = (bar_rect.center().y - screen_rect.top()) / screen_rect.height();
-                
-                // Center the coordinates (range -0.5 to 0.5) so the gradient rotates from the center
-                let centered_x = norm_x - 0.5;
-                let centered_y = norm_y - 0.5;
+                // Project screen corners to find the min/max projection distance
+                let corners = [
+                    screen_rect.left_top(),
+                    screen_rect.right_top(),
+                    screen_rect.left_bottom(),
+                    screen_rect.right_bottom(),
+                ];
+                let mut min_proj = f32::MAX;
+                let mut max_proj = f32::MIN;
+                for c in corners {
+                    let p = c.x * dir.x + c.y * dir.y;
+                    min_proj = min_proj.min(p);
+                    max_proj = max_proj.max(p);
+                }
 
-                let projection = centered_x * dir.x + centered_y * dir.y;
-                let t = (projection + 0.5).clamp(0.0, 1.0);
+                let center = bar_rect.center();
+                let bar_proj = center.x * dir.x + center.y * dir.y;
+                
+                let t = if (max_proj - min_proj).abs() > 0.0001 {
+                    ((bar_proj - min_proj) / (max_proj - min_proj)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
 
                 let c = color::sample_gradient(&self.config.gradient_stops, t);
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
             ColorMode::ColorChanging => {
-                // Map 0.0-1.0 slider to a time multiplier
                 let speed_hz = 0.05 + (self.config.color_change_speed * 1.95);
                 let phase = time * speed_hz;
                 let c = color::cyclic_color(&self.config.color_change_colors, phase);
@@ -356,9 +387,8 @@ impl VisualizerApp {
         let time = ui.input(|i| i.time) as f32;
         let painter = ui.painter();
 
-        // Determine if we should draw vertical stacked slices
         let is_vertical_stack = self.config.color_mode == ColorMode::StaticMultiple 
-            && self.config.static_direction == DistributionDirection::Vertical;
+            && self.config.static_mode == StaticDistributionMode::Vertical;
 
         match self.config.visualizer_direction {
             VisualizerDirection::Up => {
@@ -399,7 +429,6 @@ impl VisualizerApp {
                     }
                 }
             }
-
             VisualizerDirection::Down => {
                 let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
                 let top_y = rect.top() + self.config.y_offset;
@@ -438,7 +467,6 @@ impl VisualizerApp {
                     }
                 }
             }
-
             VisualizerDirection::Right => {
                 let left_x = rect.left() + self.config.x_offset;
                 let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
@@ -477,7 +505,6 @@ impl VisualizerApp {
                     }
                 }
             }
-
             VisualizerDirection::Left => {
                 let right_x = rect.right() + self.config.x_offset;
                 let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
@@ -600,14 +627,14 @@ impl VisualizerApp {
 
             ColorMode::StaticMultiple => {
                 ui.heading("Multiple Static Colors");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.config.static_direction, DistributionDirection::Horizontal, "Horizontal (Across Bars)");
-                    ui.radio_value(&mut self.config.static_direction, DistributionDirection::Vertical, "Vertical (Inside Bars)");
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Blocks, "Blocks");
+                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Sequential, "Sequential");
+                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Random, "Random");
+                    ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Vertical, "Vertical");
                 });
 
                 let mut to_remove = None;
-                // Fix: cache length to avoid immutable borrow while iterating mutably
-                let current_len = self.config.static_colors.len();
                 for (i, color) in self.config.static_colors.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.color_edit_button_srgb(color);
@@ -619,36 +646,45 @@ impl VisualizerApp {
                     self.config.static_colors.push([255, 255, 255]);
                 }
 
-                ui.label("Presets:");
-                ui.horizontal_wrapped(|ui| {
-                    let mut presets_to_apply = None;
-                    for (i, preset) in self.config.static_multi_presets.iter().enumerate() {
-                        if ui.button(format!("Load {}", i + 1)).clicked() {
-                            presets_to_apply = Some(preset.clone());
-                        }
-                    }
-                    if let Some(p) = presets_to_apply {
-                        self.config.static_colors = p.colors;
-                        self.config.static_direction = p.direction;
-                    }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.new_preset_name);
                     if ui.button("💾 Save Preset").clicked() {
+                        let name = if self.new_preset_name.trim().is_empty() {
+                            format!("Preset {}", self.config.static_multi_presets.len() + 1)
+                        } else {
+                            self.new_preset_name.clone()
+                        };
                         self.config.static_multi_presets.push(StaticMultiPreset {
+                            name,
                             colors: self.config.static_colors.clone(),
-                            direction: self.config.static_direction,
+                            mode: self.config.static_mode,
                         });
+                        self.new_preset_name.clear();
                     }
                 });
+
+                ui.label("Presets:");
+                let mut preset_to_remove = None;
+                for (i, preset) in self.config.static_multi_presets.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.button(&preset.name).clicked() {
+                            self.config.static_colors = preset.colors.clone();
+                            self.config.static_mode = preset.mode;
+                        }
+                        if ui.button("❌").clicked() { preset_to_remove = Some(i); }
+                    });
+                }
+                if let Some(i) = preset_to_remove { self.config.static_multi_presets.remove(i); }
             }
 
             ColorMode::Gradient => {
                 ui.heading("Gradient Colors");
                 ui.add(egui::Slider::new(&mut self.config.gradient_angle, 0.0..=360.0).text("Angle (°)"));
 
-                // Gradient Bar Preview & Interaction
                 let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click_and_drag());
                 let painter = ui.painter();
 
-                // Draw the gradient background
                 let steps = 100;
                 for i in 0..steps {
                     let t1 = i as f32 / steps as f32;
@@ -660,7 +696,7 @@ impl VisualizerApp {
                     painter.rect_filled(r, 0.0, egui::Color32::from_rgb(c1[0], c1[1], c1[2]));
                 }
 
-                // Draw the handles for stops
+                let mut sort_stops = false;
                 for (i, stop) in self.config.gradient_stops.iter_mut().enumerate() {
                     let x = rect.left() + rect.width() * stop.position;
                     let stop_rect = egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(12.0, 30.0));
@@ -668,14 +704,18 @@ impl VisualizerApp {
                     
                     if stop_response.dragged() {
                         stop.position = (stop.position + stop_response.drag_delta().x / rect.width()).clamp(0.0, 1.0);
+                        sort_stops = true;
                     }
                     
                     let handle_color = egui::Color32::from_rgb(stop.color[0], stop.color[1], stop.color[2]);
                     painter.rect_filled(stop_rect, 2.0, handle_color);
-                    painter.rect_stroke(stop_rect, 2.0_f32, egui::Stroke::new(2.0_f32, egui::Color32::WHITE)); // Fix: explicitly typed as f32
+                    painter.rect_stroke(stop_rect, 2.0_f32, egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
                 }
 
-                // Double-click to add a stop
+                if sort_stops {
+                    self.config.gradient_stops.sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap());
+                }
+
                 if response.double_clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
@@ -686,9 +726,7 @@ impl VisualizerApp {
                 }
                 ui.label("Double-click the bar to add a color stop.");
 
-                // List of stops
                 let mut to_remove = None;
-                // Fix: cache length to avoid immutable borrow while iterating mutably
                 let current_len = self.config.gradient_stops.len();
                 for (i, stop) in self.config.gradient_stops.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
@@ -701,32 +739,41 @@ impl VisualizerApp {
                 }
                 if let Some(i) = to_remove { self.config.gradient_stops.remove(i); }
 
-                // Presets
-                ui.label("Presets:");
-                ui.horizontal_wrapped(|ui| {
-                    let mut presets_to_apply = None;
-                    for (i, preset) in self.config.gradient_presets.iter().enumerate() {
-                        if ui.button(format!("Load {}", i + 1)).clicked() {
-                            presets_to_apply = Some(preset.clone());
-                        }
-                    }
-                    if let Some(p) = presets_to_apply {
-                        self.config.gradient_stops = p.stops;
-                        self.config.gradient_angle = p.angle;
-                    }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.new_preset_name);
                     if ui.button("💾 Save Preset").clicked() {
+                        let name = if self.new_preset_name.trim().is_empty() {
+                            format!("Preset {}", self.config.gradient_presets.len() + 1)
+                        } else {
+                            self.new_preset_name.clone()
+                        };
                         self.config.gradient_presets.push(GradientPreset {
+                            name,
                             stops: self.config.gradient_stops.clone(),
                             angle: self.config.gradient_angle,
                         });
+                        self.new_preset_name.clear();
                     }
                 });
+
+                ui.label("Presets:");
+                let mut preset_to_remove = None;
+                for (i, preset) in self.config.gradient_presets.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.button(&preset.name).clicked() {
+                            self.config.gradient_stops = preset.stops.clone();
+                            self.config.gradient_angle = preset.angle;
+                        }
+                        if ui.button("❌").clicked() { preset_to_remove = Some(i); }
+                    });
+                }
+                if let Some(i) = preset_to_remove { self.config.gradient_presets.remove(i); }
             }
 
             ColorMode::ColorChanging => {
                 ui.heading("Color Changing");
                 let mut to_remove = None;
-                // Fix: cache length to avoid immutable borrow while iterating mutably
                 let current_len = self.config.color_change_colors.len();
                 for (i, color) in self.config.color_change_colors.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
@@ -745,25 +792,36 @@ impl VisualizerApp {
                     .text("Speed")
                     .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)));
 
-                ui.label("Presets:");
-                ui.horizontal_wrapped(|ui| {
-                    let mut presets_to_apply = None;
-                    for (i, preset) in self.config.color_change_presets.iter().enumerate() {
-                        if ui.button(format!("Load {}", i + 1)).clicked() {
-                            presets_to_apply = Some(preset.clone());
-                        }
-                    }
-                    if let Some(p) = presets_to_apply {
-                        self.config.color_change_colors = p.colors;
-                        self.config.color_change_speed = p.speed;
-                    }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.new_preset_name);
                     if ui.button("💾 Save Preset").clicked() {
+                        let name = if self.new_preset_name.trim().is_empty() {
+                            format!("Preset {}", self.config.color_change_presets.len() + 1)
+                        } else {
+                            self.new_preset_name.clone()
+                        };
                         self.config.color_change_presets.push(ColorChangePreset {
+                            name,
                             colors: self.config.color_change_colors.clone(),
                             speed: self.config.color_change_speed,
                         });
+                        self.new_preset_name.clear();
                     }
                 });
+
+                ui.label("Presets:");
+                let mut preset_to_remove = None;
+                for (i, preset) in self.config.color_change_presets.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.button(&preset.name).clicked() {
+                            self.config.color_change_colors = preset.colors.clone();
+                            self.config.color_change_speed = preset.speed;
+                        }
+                        if ui.button("❌").clicked() { preset_to_remove = Some(i); }
+                    });
+                }
+                if let Some(i) = preset_to_remove { self.config.color_change_presets.remove(i); }
             }
 
             _ => {}
@@ -774,7 +832,7 @@ impl VisualizerApp {
         ui.add(egui::Slider::new(&mut self.config.bg_opacity, 0..=255).text("Background Opacity"));
 
         ui.separator();
-        if ui.button("Reset to Defaults").clicked() {
+        if ui.button("⚠️ Reset to Defaults").clicked() {
             self.config = AppConfig::default();
             self.audio_target_bars.store(self.config.num_bars, Ordering::Relaxed);
             self.audio_update_interval.store(self.config.audio_update_ms, Ordering::Relaxed);
