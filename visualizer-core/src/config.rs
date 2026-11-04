@@ -45,10 +45,10 @@ impl Default for ColorMode {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StaticDistributionMode {
-    Blocks,     // Evenly divided blocks across the bars
-    Sequential, // Cycles through colors bar by bar (1,2,3,1,2,3...)
-    Random,     // Randomly assigned to each bar
-    Vertical,   // Stacked inside each bar
+    Blocks,
+    Sequential,
+    Random,
+    Vertical,
 }
 
 impl Default for StaticDistributionMode {
@@ -60,7 +60,7 @@ impl Default for StaticDistributionMode {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GradientStop {
     pub color: [u8; 3],
-    pub position: f32, // 0.0 to 1.0
+    pub position: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -84,6 +84,138 @@ pub struct ColorChangePreset {
     pub name: String,
     pub colors: Vec<[u8; 3]>,
     pub speed: f32,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Color Changing: Motion Shapes
+// ─────────────────────────────────────────────────────────────
+
+/// The motion patterns available in `ColorChanging` mode.
+/// Modeled after the effects found in addressable RGB strip controllers.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MotionShape {
+    // Original behaviour — one colour cycling in time only.
+    Uniform,
+
+    // Directional
+    HorizontalWipe,
+    VerticalWipe,
+    DiagonalWipe,
+
+    // Wave-based
+    SineWave,
+    TriangleWave,
+    SquareWave,
+    SawtoothWave,
+
+    // Stutter & Pulse
+    Strobe,
+    Pulse,
+    Heartbeat,
+    Stutter,
+
+    // Particle & Trail
+    Comet,
+    Chase,
+    BouncingBall,
+    Sparkle,
+
+    // Complex & Organic
+    FireSimulation,
+    Plasma,
+    RainbowCycle,
+    Confetti,
+    Sinelon,
+}
+
+impl Default for MotionShape {
+    fn default() -> Self {
+        MotionShape::Uniform
+    }
+}
+
+impl MotionShape {
+    /// Human-readable name for UI menus.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            MotionShape::Uniform => "Uniform",
+            MotionShape::HorizontalWipe => "Horizontal Wipe",
+            MotionShape::VerticalWipe => "Vertical Wipe",
+            MotionShape::DiagonalWipe => "Diagonal Wipe",
+            MotionShape::SineWave => "Sine Wave",
+            MotionShape::TriangleWave => "Triangle Wave",
+            MotionShape::SquareWave => "Square Wave",
+            MotionShape::SawtoothWave => "Sawtooth Wave",
+            MotionShape::Strobe => "Strobe",
+            MotionShape::Pulse => "Pulse",
+            MotionShape::Heartbeat => "Heartbeat",
+            MotionShape::Stutter => "Stutter",
+            MotionShape::Comet => "Comet",
+            MotionShape::Chase => "Chase",
+            MotionShape::BouncingBall => "Bouncing Ball",
+            MotionShape::Sparkle => "Sparkle",
+            MotionShape::FireSimulation => "Fire Simulation",
+            MotionShape::Plasma => "Plasma",
+            MotionShape::RainbowCycle => "Rainbow Cycle",
+            MotionShape::Confetti => "Confetti",
+            MotionShape::Sinelon => "Sinelon",
+        }
+    }
+
+    /// Only these shapes read the vertical position *inside* a bar, so only
+    /// they require vertical subdivision during rendering.
+    pub fn uses_vertical_axis(self) -> bool {
+        matches!(
+            self,
+            MotionShape::VerticalWipe | MotionShape::DiagonalWipe
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlendMode {
+    /// Soft, gradual transitions / gradients.
+    Smooth,
+    /// Sharp on/off steps, strobes, hard colour boundaries.
+    Hard,
+}
+
+impl Default for BlendMode {
+    fn default() -> Self {
+        BlendMode::Smooth
+    }
+}
+
+/// Motion settings that apply only to `ColorChanging` mode.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MotionSettings {
+    pub shape: MotionShape,
+    pub blend: BlendMode,
+
+    /// Multiplies the base colour-change speed. 0 = frozen, 1 = normal, 2 = double.
+    pub speed: f32,
+    /// Fraction of the strip occupied by a comet / cylon / sinelon trail.
+    pub trail_length: f32,
+    /// Probability factor for stutter / sparkle / confetti events.
+    pub stutter_intensity: f32,
+    /// Number of wave cycles across the visualizer (waves only).
+    pub wave_frequency: f32,
+    /// Softness of the wipe boundary as a fraction of the strip (wipe shapes only).
+    pub wipe_softness: f32,
+}
+
+impl Default for MotionSettings {
+    fn default() -> Self {
+        Self {
+            shape: MotionShape::Uniform,
+            blend: BlendMode::Smooth,
+            speed: 1.0,
+            trail_length: 0.25,
+            stutter_intensity: 0.3,
+            wave_frequency: 2.0,
+            wipe_softness: 0.1,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -144,6 +276,8 @@ pub struct AppConfig {
     pub color_change_speed: f32,
     #[serde(default = "default_color_change_presets")]
     pub color_change_presets: Vec<ColorChangePreset>,
+    #[serde(default)]
+    pub color_change_motion: MotionSettings,
 }
 
 fn default_static_colors() -> Vec<[u8; 3]> {
@@ -462,6 +596,7 @@ impl Default for AppConfig {
             color_change_colors: default_static_colors(),
             color_change_speed: default_speed(),
             color_change_presets: default_color_change_presets(),
+            color_change_motion: MotionSettings::default(),
         }
     }
 }
@@ -475,26 +610,23 @@ impl AppConfig {
     }
 
     pub fn load() -> Self {
-    let path = Self::get_path();
-    if let Ok(content) = std::fs::read_to_string(path) {
-        if let Ok(mut config) = toml::from_str::<AppConfig>(&content) {
-            // Migration for config files written before the preset feature existed:
-            // they were saved with empty preset lists, so fill them with the
-            // built-in defaults. Users who saved their own presets are unaffected.
-            if config.static_multi_presets.is_empty() {
-                config.static_multi_presets = default_static_multi_presets();
+        let path = Self::get_path();
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(mut config) = toml::from_str::<AppConfig>(&content) {
+                if config.static_multi_presets.is_empty() {
+                    config.static_multi_presets = default_static_multi_presets();
+                }
+                if config.gradient_presets.is_empty() {
+                    config.gradient_presets = default_gradient_presets();
+                }
+                if config.color_change_presets.is_empty() {
+                    config.color_change_presets = default_color_change_presets();
+                }
+                return config;
             }
-            if config.gradient_presets.is_empty() {
-                config.gradient_presets = default_gradient_presets();
-            }
-            if config.color_change_presets.is_empty() {
-                config.color_change_presets = default_color_change_presets();
-            }
-            return config;
         }
+        Self::default()
     }
-    Self::default()
-}
 
     pub fn save(&self) {
         let path = Self::get_path();
