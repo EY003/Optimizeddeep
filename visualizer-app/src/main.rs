@@ -12,6 +12,7 @@ use visualizer_core::{
         AppConfig, BlendMode, ColorChangePreset, ColorMode, FrequencyDirection, GradientPreset,
         GradientStop, MotionShape, StaticDistributionMode, StaticMultiPreset, VisualizerDirection,
     },
+    musicbee::{self, TrackInfo},
 };
 
 use global_hotkey::{
@@ -33,18 +34,15 @@ fn hash_u32(mut x: u32) -> u32 {
     x
 }
 
-/// Triangle wave 0 → 1 → 0 over t in [0, 1).
 fn tri01(t: f32) -> f32 {
     1.0 - (2.0 * t.fract() - 1.0).abs()
 }
 
-/// Smoothstep with graceful handling of reversed/zero-width edges.
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     let t = ((x - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Interpolate a wipe boundary into a 0..=1 blend factor.
 fn wipe_blend(pos: f32, boundary: f32, softness: f32, hard: bool) -> f32 {
     if hard {
         if pos < boundary { 0.0 } else { 1.0 }
@@ -53,9 +51,6 @@ fn wipe_blend(pos: f32, boundary: f32, softness: f32, hard: bool) -> f32 {
     }
 }
 
-/// Everything the color-sampling layer needs to turn one (x, y, t) point
-/// into an egui colour. Two palette phases plus a blend factor and an
-/// intensity (brightness) multiplier.
 #[derive(Clone, Copy)]
 struct MotionSample {
     phase_a: f32,
@@ -70,7 +65,6 @@ impl Default for MotionSample {
     }
 }
 
-/// MurmurHash-based random index (used by the `Random` static distribution mode).
 fn random_color_index(i: usize, num_colors: usize) -> usize {
     let mut x = i as u32;
     x ^= x >> 16;
@@ -97,6 +91,12 @@ struct VisualizerApp {
 
     new_preset_name: String,
 
+    // ── NEW: track / cover art state ─────────────────────────
+    track_rx: crossbeam_channel::Receiver<TrackInfo>,
+    track_info: Option<TrackInfo>,
+    cover_texture: Option<egui::TextureHandle>,
+    dynamic_color: [u8; 3],
+
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
     settings_menu_id: tray_icon::menu::MenuId,
@@ -110,6 +110,10 @@ impl VisualizerApp {
         let should_quit = Arc::new(AtomicBool::new(false));
         let audio_target_bars = engine.target_bars.clone();
         let audio_update_interval = engine.update_interval_ms.clone();
+
+        // Spawn the SMTC listener
+        let (track_tx, track_rx) = crossbeam_channel::unbounded();
+        musicbee::spawn_smtc_listener(track_tx, should_quit.clone());
 
         let tray_menu = Menu::new();
         let settings_item = MenuItem::new("Open Settings", true, None);
@@ -148,11 +152,109 @@ impl VisualizerApp {
             is_passthrough_set: false,
             last_frame_time: Instant::now(),
             new_preset_name: String::new(),
+
+            track_rx,
+            track_info: None,
+            cover_texture: None,
+            dynamic_color: [180, 200, 180],
+
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             settings_menu_id: settings_item.id().clone(),
             quit_menu_id: quit_item.id().clone(),
         }
+    }
+
+    /// Drain the SMTC channel, decode artwork, extract colors, and rebuild
+    /// the texture. Called once per frame; cheap when no new track has been
+    /// received.
+    fn poll_track_updates(&mut self, ctx: &egui::Context) {
+        while let Ok(info) = self.track_rx.try_recv() {
+            // Decode artwork + extract dominant color
+            if let Some(bytes) = &info.cover_art {
+                if let Some((colors, img)) = color::extract_colors_from_bytes(bytes) {
+                    self.dynamic_color = colors.dominant;
+
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    self.cover_texture = Some(ctx.load_texture(
+                        "cover_art",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            } else {
+                self.cover_texture = None;
+            }
+
+            self.track_info = Some(info);
+        }
+    }
+
+    /// Draws album art + artist/title text in the top-right corner.
+    fn draw_track_info(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let Some(info) = &self.track_info else { return };
+
+        let margin = 40.0;
+        let art_size = 190.0;
+        let text_gap = 14.0;
+        let right_x = rect.right() - margin;
+
+        let text_top_y = if let Some(tex) = &self.cover_texture {
+            let art_rect = egui::Rect::from_min_size(
+                egui::pos2(right_x - art_size, rect.top() + margin),
+                egui::vec2(art_size, art_size),
+            );
+            ui.painter().image(
+                tex.id(),
+                art_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            art_rect.bottom() + text_gap
+        } else {
+            rect.top() + margin
+        };
+
+        let painter = ui.painter();
+
+        // Artist (large)
+        let artist_font = egui::FontId::proportional(30.0);
+        let artist_pos = egui::pos2(right_x, text_top_y);
+        painter.text(
+            artist_pos + egui::vec2(2.0, 2.0),
+            egui::Align2::RIGHT_TOP,
+            &info.artist,
+            artist_font.clone(),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+        );
+        painter.text(
+            artist_pos,
+            egui::Align2::RIGHT_TOP,
+            &info.artist,
+            artist_font,
+            egui::Color32::WHITE,
+        );
+
+        // Title (smaller)
+        let title_font = egui::FontId::proportional(21.0);
+        let title_pos = egui::pos2(right_x, text_top_y + 40.0);
+        painter.text(
+            title_pos + egui::vec2(2.0, 2.0),
+            egui::Align2::RIGHT_TOP,
+            &info.title,
+            title_font.clone(),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+        );
+        painter.text(
+            title_pos,
+            egui::Align2::RIGHT_TOP,
+            &info.title,
+            title_font,
+            egui::Color32::from_rgb(220, 220, 220),
+        );
     }
 }
 
@@ -173,6 +275,9 @@ impl eframe::App for VisualizerApp {
         if ctx.pixels_per_point() != 1.0 {
             ctx.set_pixels_per_point(1.0);
         }
+
+        // ── Handle new track data ──────────────────────────────
+        self.poll_track_updates(ctx);
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id {
@@ -248,6 +353,7 @@ impl eframe::App for VisualizerApp {
                 }
 
                 self.draw_bars(ui, rect);
+                self.draw_track_info(ui, rect);
 
                 if self.config.show_fps {
                     ui.painter().text(
@@ -340,9 +446,6 @@ impl VisualizerApp {
     // Color Changing Motion Engine
     // ─────────────────────────────────────────────────────────
 
-    /// Evaluates a motion shape at a given point `(x, y)` in normalized
-    /// coordinates (both in [0, 1]) and a "base time" `base_t` that already
-    /// has the speed factor folded in.
     fn evaluate_motion(
         &self,
         shape: MotionShape,
@@ -356,14 +459,11 @@ impl VisualizerApp {
         let freq = m.wave_frequency;
 
         match shape {
-            // ── Uniform ─────────────────────────────────────
             MotionShape::Uniform => MotionSample {
                 phase_a: base_t,
                 intensity: 1.0,
                 ..Default::default()
             },
-
-            // ── Directional Wipes ───────────────────────────
             MotionShape::HorizontalWipe => {
                 let boundary = tri01(base_t * 0.5);
                 let t = wipe_blend(x, boundary, m.wipe_softness, hard);
@@ -395,8 +495,6 @@ impl VisualizerApp {
                     intensity: 1.0,
                 }
             }
-
-            // ── Wave-based ──────────────────────────────────
             MotionShape::SineWave => {
                 let w = (x * freq * TAU + base_t * TAU).sin() * 0.5 + 0.5;
                 MotionSample {
@@ -429,8 +527,6 @@ impl VisualizerApp {
                     ..Default::default()
                 }
             }
-
-            // ── Stutter & Pulse ─────────────────────────────
             MotionShape::Strobe => {
                 let on = ((base_t * 4.0).fract() < 0.5) as u8 as f32;
                 let k = if hard {
@@ -455,15 +551,10 @@ impl VisualizerApp {
             MotionShape::Heartbeat => {
                 let beat = base_t.fract();
                 let k = if hard {
-                    if beat < 0.10 {
-                        1.0
-                    } else if beat < 0.18 {
-                        0.0
-                    } else if beat < 0.26 {
-                        0.7
-                    } else {
-                        0.0
-                    }
+                    if beat < 0.10 { 1.0 }
+                    else if beat < 0.18 { 0.0 }
+                    else if beat < 0.26 { 0.7 }
+                    else { 0.0 }
                 } else {
                     let a = (-((beat - 0.08) / 0.04).powi(2)).exp();
                     let b = (-((beat - 0.22) / 0.04).powi(2)).exp() * 0.7;
@@ -487,8 +578,6 @@ impl VisualizerApp {
                     ..Default::default()
                 }
             }
-
-            // ── Particle & Trail ────────────────────────────
             MotionShape::Comet => {
                 let head = base_t.fract();
                 let raw = (x - head).abs();
@@ -547,8 +636,6 @@ impl VisualizerApp {
                     ..Default::default()
                 }
             }
-
-            // ── Complex & Organic ───────────────────────────
             MotionShape::FireSimulation => {
                 let n = (base_t * 1.0 + x * 5.0).sin()
                     + (base_t * 1.3 + x * 11.0).sin() * 0.5
@@ -589,7 +676,6 @@ impl VisualizerApp {
         }
     }
 
-        /// Turn a motion sample into an `egui::Color32` by looking up the palette.
     fn sample_color_changing(&self, x: f32, y: f32, time: f32) -> egui::Color32 {
         if self.config.color_change_colors.is_empty() {
             return egui::Color32::WHITE;
@@ -612,13 +698,10 @@ impl VisualizerApp {
         let t = s.blend_t.clamp(0.0, 1.0);
         let k = s.intensity.clamp(0.0, 1.0);
 
-        // Palette colour at this point (after the a↔b blend).
         let pr = ca[0] as f32 * (1.0 - t) + cb[0] as f32 * t;
         let pg = ca[1] as f32 * (1.0 - t) + cb[1] as f32 * t;
         let pb = ca[2] as f32 * (1.0 - t) + cb[2] as f32 * t;
 
-        // Fade between off_color and the palette colour using intensity.
-        // With off_color = black this is identical to the previous behaviour.
         let off = self.config.color_change_motion.off_color;
         let r = off[0] as f32 + (pr - off[0] as f32) * k;
         let g = off[1] as f32 + (pg - off[1] as f32) * k;
@@ -628,7 +711,7 @@ impl VisualizerApp {
     }
 
     // ─────────────────────────────────────────────────────────
-    // Legacy per-bar color resolution (unchanged except ColorChanging)
+    // Per-bar color resolution
     // ─────────────────────────────────────────────────────────
 
     fn get_bar_color(
@@ -640,7 +723,12 @@ impl VisualizerApp {
         time: f32,
     ) -> egui::Color32 {
         match self.config.color_mode {
-            ColorMode::Dynamic => egui::Color32::from_rgb(180, 200, 180),
+            // ✨ Dynamic mode now uses the extracted album color.
+            ColorMode::Dynamic => egui::Color32::from_rgb(
+                self.dynamic_color[0],
+                self.dynamic_color[1],
+                self.dynamic_color[2],
+            ),
             ColorMode::StaticSingle => egui::Color32::from_rgb(
                 self.config.bar_color[0],
                 self.config.bar_color[1],
@@ -722,7 +810,6 @@ impl VisualizerApp {
     // Renderers
     // ─────────────────────────────────────────────────────────
 
-    /// Renders a single bar as a gradient mesh (Gradient mode).
     fn draw_gradient_bar(
         &self,
         painter: &egui::Painter,
@@ -770,10 +857,6 @@ impl VisualizerApp {
         painter.add(egui::Shape::mesh(mesh));
     }
 
-    /// Renders a ColorChanging bar. If the active motion shape reads the
-    /// vertical position (VerticalWipe / DiagonalWipe), the bar is subdivided
-    /// vertically so motion becomes visible *inside* the bar. Otherwise it's
-    /// a plain single-coloured rect.
     fn draw_color_changing_bar(
         &self,
         painter: &egui::Painter,
@@ -794,7 +877,6 @@ impl VisualizerApp {
             return;
         }
 
-        // Adaptive subdivision: ~6px per segment, between 8 and 64 segments.
         let segments = ((h / 6.0) as usize).clamp(8, 64);
 
         for k in 0..segments {
@@ -802,7 +884,6 @@ impl VisualizerApp {
             let v1 = (k + 1) as f32 / segments as f32;
             let v_mid = (v0 + v1) * 0.5;
 
-            // v = 0 is the bottom of the bar rect, v = 1 is the top.
             let y_top = bar_rect.bottom() - h * v1;
             let y_bot = bar_rect.bottom() - h * v0;
 
@@ -858,7 +939,6 @@ impl VisualizerApp {
         let is_color_changing_vertical = self.config.color_mode == ColorMode::ColorChanging
             && self.config.color_change_motion.shape.uses_vertical_axis();
 
-        // Normalized x for a bar index (shared across directions).
         let x_norm = |i: usize| -> f32 {
             if visual_num_bars > 1 {
                 i as f32 / (visual_num_bars - 1) as f32
@@ -1123,7 +1203,7 @@ impl VisualizerApp {
     // Settings UI
     // ─────────────────────────────────────────────────────────
 
-        fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
+    fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Performance & Optimization");
         ui.checkbox(&mut self.config.use_vsync, "Enable VSync (Requires Restart)");
         ui.add(egui::Slider::new(&mut self.config.target_fps, 15.0..=144.0).text("Max Target FPS"));
@@ -1166,12 +1246,37 @@ impl VisualizerApp {
         ui.separator();
         ui.heading("Color Mode");
         ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut self.config.color_mode, ColorMode::Dynamic, "Dynamic");
+            ui.radio_value(&mut self.config.color_mode, ColorMode::Dynamic, "Dynamic (Album Art)");
             ui.radio_value(&mut self.config.color_mode, ColorMode::StaticSingle, "Static Single");
             ui.radio_value(&mut self.config.color_mode, ColorMode::StaticMultiple, "Static Multi");
             ui.radio_value(&mut self.config.color_mode, ColorMode::Gradient, "Gradient");
             ui.radio_value(&mut self.config.color_mode, ColorMode::ColorChanging, "Color Changing");
         });
+
+        if self.config.color_mode == ColorMode::Dynamic {
+            ui.label("Bars tint automatically to the dominant color of the current album art.");
+            if let Some(info) = &self.track_info {
+                ui.label(format!("Now Playing: {} — {}", info.artist, info.title));
+            } else {
+                ui.label("No track detected via SMTC.");
+            }
+            ui.horizontal(|ui| {
+                ui.label("Current color:");
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(24.0, 24.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    4.0,
+                    egui::Color32::from_rgb(
+                        self.dynamic_color[0],
+                        self.dynamic_color[1],
+                        self.dynamic_color[2],
+                    ),
+                );
+            });
+        }
 
         ui.separator();
 
@@ -1428,7 +1533,6 @@ impl VisualizerApp {
                     .text("Speed")
                     .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)));
 
-                // ── Motion Shape ──────────────────────────────────
                 ui.add_space(10.0);
                 ui.separator();
                 ui.heading("Motion Shape");
@@ -1489,7 +1593,6 @@ impl VisualizerApp {
                 )
                 .text("Motion Speed"));
 
-                // ── Per-shape extra sliders (only when relevant) ──
                 let shape = self.config.color_change_motion.shape;
                 let hard = self.config.color_change_motion.blend == BlendMode::Hard;
 
@@ -1544,8 +1647,7 @@ impl VisualizerApp {
                     )
                     .text("Wipe Softness"));
                 }
-                // Off-colour picker — only shown for shapes that actually
-                // fade toward the off colour (intensity-modulating shapes).
+
                 if shape.uses_intensity() {
                     ui.horizontal(|ui| {
                         ui.label("Off color:");
@@ -1567,7 +1669,7 @@ impl VisualizerApp {
                          (defaults to black — the original behaviour).",
                     );
                 }
-                // ── Presets ───────────────────────────────────────
+
                 ui.add_space(10.0);
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1643,4 +1745,3 @@ fn main() -> eframe::Result<()> {
         Box::new(|_cc| Box::new(VisualizerApp::new())),
     )
 }
-       
