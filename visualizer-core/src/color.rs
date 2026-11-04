@@ -6,16 +6,17 @@ pub struct TrackColors {
     pub text_color: [u8; 3],
 }
 
-pub fn extract_colors(img: &DynamicImage) -> TrackColors {
-    let rgb = img.to_rgba8();
+/// Extract colors from a decoded image. Returns `None` if the palette
+/// extraction fails (e.g. on a 0×0 image) instead of panicking.
+pub fn extract_colors(img: &DynamicImage) -> Option<TrackColors> {
+    // Downscale for speed — we only need enough pixels to sense the palette.
+    let small = img.thumbnail(128, 128);
+    let rgb = small.to_rgba8();
     let (w, h) = (rgb.width(), rgb.height());
     let raw_pixels = rgb.into_raw();
 
-    let image_data = ImageData::new(w, h, &raw_pixels)
-        .expect("Failed to create ImageData from pixels");
-
-    let palette: Palette<f64> = Palette::extract(&image_data)
-        .expect("Failed to extract color palette");
+    let image_data = ImageData::new(w, h, &raw_pixels).ok()?;
+    let palette: Palette<f64> = Palette::extract(&image_data).ok()?;
 
     let dominant = palette
         .find_swatches(1)
@@ -25,21 +26,24 @@ pub fn extract_colors(img: &DynamicImage) -> TrackColors {
             [rgb.r, rgb.g, rgb.b]
         })
         .unwrap_or([255, 255, 255]);
-        
+
     let luminance = 0.299 * dominant[0] as f32
         + 0.587 * dominant[1] as f32
         + 0.114 * dominant[2] as f32;
     let text_color = if luminance > 128.0 { [0, 0, 0] } else { [255, 255, 255] };
 
-    TrackColors {
-        dominant,
-        text_color,
-    }
+    Some(TrackColors { dominant, text_color })
 }
 
-// ── NEW COLOR HELPERS ──────────────────────────────────────────
+/// Convenience helper: decode raw bytes and extract colors in one call.
+pub fn extract_colors_from_bytes(bytes: &[u8]) -> Option<(TrackColors, DynamicImage)> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let colors = extract_colors(&img)?;
+    Some((colors, img))
+}
 
-/// Linear interpolation between two RGB colors.
+// ── Color helpers (unchanged) ────────────────────────────────
+
 pub fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0);
     [
@@ -49,7 +53,6 @@ pub fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     ]
 }
 
-/// Sample a multi-stop gradient at a specific position (0.0 to 1.0).
 pub fn sample_gradient(stops: &[crate::config::GradientStop], t: f32) -> [u8; 3] {
     if stops.is_empty() { return [255, 255, 255]; }
     if stops.len() == 1 { return stops[0].color; }
@@ -67,7 +70,6 @@ pub fn sample_gradient(stops: &[crate::config::GradientStop], t: f32) -> [u8; 3]
     stops.last().unwrap().color
 }
 
-/// Cyclically interpolate through a list of colors based on a phase (0.0 to 1.0).
 pub fn cyclic_color(colors: &[[u8; 3]], phase: f32) -> [u8; 3] {
     if colors.is_empty() { return [255, 255, 255]; }
     if colors.len() == 1 { return colors[0]; }
