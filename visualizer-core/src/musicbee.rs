@@ -23,7 +23,7 @@ pub struct TrackInfo {
     pub cover_art: Option<Vec<u8>>,
 }
 
-fn log_smtc(msg: &str) {
+pub fn log_smtc(msg: &str) {
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("smtc_debug.log") {
         let _ = writeln!(file, "[{}] {}", now, msg);
