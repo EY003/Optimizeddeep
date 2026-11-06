@@ -24,17 +24,27 @@ pub struct TrackInfo {
 }
 
 pub fn log_smtc(msg: &str) {
-    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("smtc_debug.log") {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("smtc_debug.log")
+    {
         let _ = writeln!(file, "[{}] {}", now, msg);
     }
 }
 
 /// Spawns a background thread that polls Windows' System Media Transport
 /// Controls (SMTC) for the current track and cover art.
+///
+/// `should_quit` is set to `true` by the main app when it wants the thread
+/// to stop. The thread runs while `should_quit` is `false`.
 pub fn spawn_smtc_listener(
     tx: Sender<TrackInfo>,
-    running: Arc<AtomicBool>,
+    should_quit: Arc<AtomicBool>,
     session_count: Arc<AtomicUsize>,
 ) {
     std::thread::spawn(move || {
@@ -45,8 +55,14 @@ pub fn spawn_smtc_listener(
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
 
-        // ── 2. Acquire the session manager (no premature exit check) ─
+        // ── 2. Acquire the session manager, retrying on failure ─
         let manager = loop {
+            // Check quit before each retry attempt.
+            if should_quit.load(Ordering::Relaxed) {
+                log_smtc("SMTC: quitting before manager acquired.");
+                return;
+            }
+
             match GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
                 .and_then(|op| op.get())
             {
@@ -55,13 +71,11 @@ pub fn spawn_smtc_listener(
                     break m;
                 }
                 Err(e) => {
-                    log_smtc(&format!("SMTC: failed to get session manager: {:?} (retrying)", e));
+                    log_smtc(&format!(
+                        "SMTC: failed to get session manager: {:?} (retrying)",
+                        e
+                    ));
                     std::thread::sleep(Duration::from_millis(1000));
-                    // Still check if we should quit while retrying, to avoid a zombie thread.
-                    if running.load(Ordering::Relaxed) {
-                        log_smtc("SMTC: quitting while retrying manager acquisition.");
-                        return;
-                    }
                 }
             }
         };
@@ -70,8 +84,8 @@ pub fn spawn_smtc_listener(
         let mut last_artist = String::new();
         let mut last_album = String::new();
 
-        // ── 3. Poll loop ──────────────────────────────────────
-        while running.load(Ordering::Relaxed) {
+        // ── 3. Poll loop — runs while should_quit is FALSE ────
+        while !should_quit.load(Ordering::Relaxed) {
             match manager.GetSessions() {
                 Ok(sessions) => {
                     let count = match sessions.Size() {
@@ -152,7 +166,6 @@ pub fn spawn_smtc_listener(
     });
 }
 
-// ... (the rest of the functions `pick_best_session`, `is_playing`, `read_thumbnail` remain unchanged)
 /// Prefer a session whose playback status is `Playing`; otherwise fall back
 /// to the first session that has any usable properties.
 fn pick_best_session(
