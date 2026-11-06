@@ -30,16 +30,19 @@ impl Default for FrequencyDirection {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColorMode {
+    /// Legacy variant — always migrated to `StaticSingle` + `Dynamic`
+    /// source during `AppConfig::load`. Never shown in the UI.
     Dynamic,
     StaticSingle,
     StaticMultiple,
     Gradient,
-    ColorChanging,
+    #[serde(alias = "ColorChanging")]
+    Animated,
 }
 
 impl Default for ColorMode {
     fn default() -> Self {
-        ColorMode::Dynamic
+        ColorMode::StaticSingle
     }
 }
 
@@ -57,7 +60,7 @@ impl Default for StaticDistributionMode {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GradientStop {
     pub color: [u8; 3],
     pub position: f32,
@@ -87,40 +90,170 @@ pub struct ColorChangePreset {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Color Changing: Motion Shapes
+// Palette selection — used by every dynamic colour source
 // ─────────────────────────────────────────────────────────────
 
-/// The motion patterns available in `ColorChanging` mode.
-/// Modeled after the effects found in addressable RGB strip controllers.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PalettePriority {
+    /// Raw most-frequent colours (current behaviour).
+    MostCommon,
+    /// Prefer colours with high luminance — useful for dark covers.
+    MostCommonLight,
+    /// Prefer saturated / bright colours that "pop" against the cover.
+    Vivid,
+}
+
+impl Default for PalettePriority {
+    fn default() -> Self {
+        PalettePriority::MostCommon
+    }
+}
+
+impl PalettePriority {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            PalettePriority::MostCommon => "Most Common",
+            PalettePriority::MostCommonLight => "Most Common Light",
+            PalettePriority::Vivid => "Vivid / High Contrast",
+        }
+    }
+    pub fn all() -> [PalettePriority; 3] {
+        [
+            PalettePriority::MostCommon,
+            PalettePriority::MostCommonLight,
+            PalettePriority::Vivid,
+        ]
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Colour sources — static or dynamic, per mode
+// ─────────────────────────────────────────────────────────────
+
+/// Colour source for modes whose colours are a plain list (StaticSingle,
+/// StaticMultiple, Animated).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum ColorSource {
+    Static(Vec<[u8; 3]>),
+    Dynamic {
+        #[serde(default = "default_palette_size")]
+        palette_size: u8,
+        #[serde(default)]
+        variants_per_color: u8,
+        #[serde(default)]
+        priority: PalettePriority,
+    },
+}
+
+impl Default for ColorSource {
+    fn default() -> Self {
+        ColorSource::Static(default_static_colors())
+    }
+}
+
+impl ColorSource {
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, ColorSource::Dynamic { .. })
+    }
+    pub fn static_colors(&self) -> Option<&[[u8; 3]]> {
+        match self {
+            ColorSource::Static(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+    pub fn static_colors_mut(&mut self) -> Option<&mut Vec<[u8; 3]>> {
+        match self {
+            ColorSource::Static(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub fn dynamic_settings(&self) -> Option<(u8, u8, PalettePriority)> {
+        match self {
+            ColorSource::Dynamic {
+                palette_size,
+                variants_per_color,
+                priority,
+            } => Some((*palette_size, *variants_per_color, *priority)),
+            _ => None,
+        }
+    }
+}
+
+/// Colour source for Gradient mode — static carries stops (colour + position),
+/// dynamic carries palette settings (positions are auto-assigned).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum GradientSource {
+    Static(Vec<GradientStop>),
+    Dynamic {
+        #[serde(default = "default_palette_size")]
+        palette_size: u8,
+        #[serde(default)]
+        variants_per_color: u8,
+        #[serde(default)]
+        priority: PalettePriority,
+    },
+}
+
+impl Default for GradientSource {
+    fn default() -> Self {
+        GradientSource::Static(default_gradient_stops())
+    }
+}
+
+impl GradientSource {
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, GradientSource::Dynamic { .. })
+    }
+    pub fn static_stops(&self) -> Option<&[GradientStop]> {
+        match self {
+            GradientSource::Static(s) => Some(s.as_slice()),
+            _ => None,
+        }
+    }
+    pub fn static_stops_mut(&mut self) -> Option<&mut Vec<GradientStop>> {
+        match self {
+            GradientSource::Static(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn dynamic_settings(&self) -> Option<(u8, u8, PalettePriority)> {
+        match self {
+            GradientSource::Dynamic {
+                palette_size,
+                variants_per_color,
+                priority,
+            } => Some((*palette_size, *variants_per_color, *priority)),
+            _ => None,
+        }
+    }
+}
+
+fn default_palette_size() -> u8 {
+    1
+}
+
+// ─────────────────────────────────────────────────────────────
+// Color Changing: Motion Shapes  (unchanged)
+// ─────────────────────────────────────────────────────────────
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MotionShape {
-    // Original behaviour — one colour cycling in time only.
     Uniform,
-
-    // Directional
     HorizontalWipe,
     VerticalWipe,
     DiagonalWipe,
-
-    // Wave-based
     SineWave,
     TriangleWave,
     SquareWave,
     SawtoothWave,
-
-    // Stutter & Pulse
     Strobe,
     Pulse,
     Heartbeat,
     Stutter,
-
-    // Particle & Trail
     Comet,
     Chase,
     BouncingBall,
     Sparkle,
-
-    // Complex & Organic
     FireSimulation,
     Plasma,
     RainbowCycle,
@@ -135,7 +268,6 @@ impl Default for MotionShape {
 }
 
 impl MotionShape {
-    /// Human-readable name for UI menus.
     pub fn display_name(self) -> &'static str {
         match self {
             MotionShape::Uniform => "Uniform",
@@ -162,16 +294,12 @@ impl MotionShape {
         }
     }
 
-    /// Only these shapes read the vertical position *inside* a bar, so only
-    /// they require vertical subdivision during rendering.
     pub fn uses_vertical_axis(self) -> bool {
         matches!(
             self,
             MotionShape::VerticalWipe | MotionShape::DiagonalWipe
         )
     }
-    /// Shapes that vary brightness over time (intensity dips below 1.0 for
-    /// some pixels or at some moments). Only these care about `off_color`.
     pub fn uses_intensity(self) -> bool {
         matches!(
             self,
@@ -191,9 +319,7 @@ impl MotionShape {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlendMode {
-    /// Soft, gradual transitions / gradients.
     Smooth,
-    /// Sharp on/off steps, strobes, hard colour boundaries.
     Hard,
 }
 
@@ -203,24 +329,15 @@ impl Default for BlendMode {
     }
 }
 
-/// Motion settings that apply only to `ColorChanging` mode.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MotionSettings {
     pub shape: MotionShape,
     pub blend: BlendMode,
-
-    /// Multiplies the base colour-change speed. 0 = frozen, 1 = normal, 2 = double.
     pub speed: f32,
-    /// Fraction of the strip occupied by a comet / cylon / sinelon trail.
     pub trail_length: f32,
-    /// Probability factor for stutter / sparkle / confetti events.
     pub stutter_intensity: f32,
-    /// Number of wave cycles across the visualizer (waves only).
     pub wave_frequency: f32,
-    /// Softness of the wipe boundary as a fraction of the strip (wipe shapes only).
     pub wipe_softness: f32,
-    /// Colour that "off" pixels fade toward for shapes that modulate
-    /// intensity (Pulse, Heartbeat, Comet, Strobe, etc.). Defaults to black.
     #[serde(default)]
     pub off_color: [u8; 3],
 }
@@ -241,14 +358,12 @@ impl Default for MotionSettings {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Track Info (cover art + song text) configuration
+// Track Info (unchanged)
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrackTextColorMode {
-    /// Use the user-chosen `static_color`.
     Static,
-    /// Track the current visualizer color in real time.
     Visualizer,
 }
 
@@ -271,51 +386,38 @@ impl Default for TrackTextAlign {
     }
 }
 
-/// Everything the overlay uses for the cover art + "artist / title" text.
-/// All settings are global (same for every track).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TrackInfoConfig {
-    // ── Cover art ──
     pub show_cover_art: bool,
     pub cover_size: f32,
     pub cover_x_offset: f32,
     pub cover_y_offset: f32,
 
-    // ── Visibility ──
     pub show_title: bool,
     pub show_artist: bool,
 
-    // ── Font sizes (per-line, independent) ──
     pub title_font_size: f32,
     pub artist_font_size: f32,
 
-    // ── Font selection (shared) ──
-    /// `None` = egui's built-in proportional font.
-    /// `Some(path)` = a `.ttf`/`.otf` file (system font or custom).
-    /// Old configs used `custom_font_path`; the alias keeps them loading.
     #[serde(default, alias = "custom_font_path")]
     pub font_path: Option<String>,
 
-    // ── Text color ──
     pub color_mode: TrackTextColorMode,
     pub static_color: [u8; 3],
     pub opacity: u8,
 
-    // ── Typography / positioning ──
     pub letter_spacing: f32,
     pub line_height: f32,
     pub alignment: TrackTextAlign,
     pub text_x_offset: f32,
     pub text_y_offset: f32,
 
-    // ── Shadow ──
     pub shadow_enabled: bool,
     pub shadow_offset_x: f32,
     pub shadow_offset_y: f32,
     pub shadow_blur: f32,
     pub shadow_color: [u8; 3],
 
-    // ── Outline ──
     pub outline_enabled: bool,
     pub outline_thickness: f32,
     pub outline_color: [u8; 3],
@@ -376,7 +478,6 @@ pub struct AppConfig {
     pub text_border: bool,
     pub font_path: Option<String>,
 
-    pub bar_color: [u8; 3],
     pub bg_opacity: u8,
     pub color_presets: Vec<[u8; 3]>,
     pub x_offset: f32,
@@ -397,9 +498,13 @@ pub struct AppConfig {
     #[serde(default)]
     pub color_mode: ColorMode,
 
+    // ── Static Single ──
+    #[serde(default = "default_static_single_source")]
+    pub static_single_source: ColorSource,
+
     // ── Static Multiple ──
-    #[serde(default = "default_static_colors")]
-    pub static_colors: Vec<[u8; 3]>,
+    #[serde(default = "default_static_multi_source")]
+    pub static_multi_source: ColorSource,
     #[serde(default)]
     pub static_mode: StaticDistributionMode,
     #[serde(default = "default_sequential_bars_per_color")]
@@ -408,16 +513,16 @@ pub struct AppConfig {
     pub static_multi_presets: Vec<StaticMultiPreset>,
 
     // ── Gradient ──
-    #[serde(default = "default_gradient_stops")]
-    pub gradient_stops: Vec<GradientStop>,
+    #[serde(default = "default_gradient_source")]
+    pub gradient_source: GradientSource,
     #[serde(default)]
     pub gradient_angle: f32,
     #[serde(default = "default_gradient_presets")]
     pub gradient_presets: Vec<GradientPreset>,
 
-    // ── Color Changing ──
-    #[serde(default = "default_static_colors")]
-    pub color_change_colors: Vec<[u8; 3]>,
+    // ── Animated ──
+    #[serde(default = "default_animated_source")]
+    pub animated_source: ColorSource,
     #[serde(default = "default_speed")]
     pub color_change_speed: f32,
     #[serde(default = "default_color_change_presets")]
@@ -428,6 +533,16 @@ pub struct AppConfig {
     // ── Cover Art / Song Info Text ──
     #[serde(default)]
     pub track_info: TrackInfoConfig,
+
+    // ── Legacy fields (migrated on load; never re-serialised) ──
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bar_color: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_colors: Option<Vec<[u8; 3]>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradient_stops: Option<Vec<GradientStop>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_change_colors: Option<Vec<[u8; 3]>>,
 }
 
 fn default_static_colors() -> Vec<[u8; 3]> {
@@ -446,8 +561,26 @@ fn default_sequential_bars_per_color() -> usize {
     1
 }
 
+fn default_static_single_source() -> ColorSource {
+    // Matches the old "Dynamic" out-of-the-box behaviour.
+    ColorSource::Dynamic {
+        palette_size: 1,
+        variants_per_color: 0,
+        priority: PalettePriority::MostCommon,
+    }
+}
+fn default_static_multi_source() -> ColorSource {
+    ColorSource::Static(default_static_colors())
+}
+fn default_animated_source() -> ColorSource {
+    ColorSource::Static(default_static_colors())
+}
+fn default_gradient_source() -> GradientSource {
+    GradientSource::Static(default_gradient_stops())
+}
+
 // ─────────────────────────────────────────────────────────────
-// Default premade presets
+// Default presets (unchanged)
 // ─────────────────────────────────────────────────────────────
 
 fn default_static_multi_presets() -> Vec<StaticMultiPreset> {
@@ -707,7 +840,6 @@ impl Default for AppConfig {
             text_border: false,
             font_path: None,
 
-            bar_color: [0, 255, 255],
             bg_opacity: 0,
             color_presets: vec![
                 [255, 255, 255],
@@ -733,22 +865,29 @@ impl Default for AppConfig {
             visualizer_direction: VisualizerDirection::default(),
             frequency_direction: FrequencyDirection::default(),
 
-            color_mode: ColorMode::Dynamic,
-            static_colors: default_static_colors(),
+            color_mode: ColorMode::StaticSingle,
+
+            static_single_source: default_static_single_source(),
+            static_multi_source: default_static_multi_source(),
             static_mode: StaticDistributionMode::Blocks,
             sequential_bars_per_color: default_sequential_bars_per_color(),
             static_multi_presets: default_static_multi_presets(),
 
-            gradient_stops: default_gradient_stops(),
+            gradient_source: default_gradient_source(),
             gradient_angle: 0.0,
             gradient_presets: default_gradient_presets(),
 
-            color_change_colors: default_static_colors(),
+            animated_source: default_animated_source(),
             color_change_speed: default_speed(),
             color_change_presets: default_color_change_presets(),
             color_change_motion: MotionSettings::default(),
 
             track_info: TrackInfoConfig::default(),
+
+            bar_color: None,
+            static_colors: None,
+            gradient_stops: None,
+            color_change_colors: None,
         }
     }
 }
@@ -765,6 +904,29 @@ impl AppConfig {
         let path = Self::get_path();
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(mut config) = toml::from_str::<AppConfig>(&content) {
+                // ── Legacy field migration ──
+                if let Some(c) = config.bar_color.take() {
+                    config.static_single_source = ColorSource::Static(vec![c]);
+                }
+                if let Some(c) = config.static_colors.take() {
+                    config.static_multi_source = ColorSource::Static(c);
+                }
+                if let Some(s) = config.gradient_stops.take() {
+                    config.gradient_source = GradientSource::Static(s);
+                }
+                if let Some(c) = config.color_change_colors.take() {
+                    config.animated_source = ColorSource::Static(c);
+                }
+                // ── Legacy Dynamic mode → StaticSingle + Dynamic source ──
+                if config.color_mode == ColorMode::Dynamic {
+                    config.color_mode = ColorMode::StaticSingle;
+                    config.static_single_source = ColorSource::Dynamic {
+                        palette_size: 1,
+                        variants_per_color: 0,
+                        priority: PalettePriority::MostCommon,
+                    };
+                }
+
                 if config.static_multi_presets.is_empty() {
                     config.static_multi_presets = default_static_multi_presets();
                 }
