@@ -2237,7 +2237,7 @@ impl VisualizerApp {
                         .config
                         .gradient_source
                         .static_stops()
-                        .cloned()
+                        .map(|s| s.to_vec())
                         .unwrap_or_default();
 
                     let steps = 100;
