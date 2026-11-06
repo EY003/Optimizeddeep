@@ -1509,11 +1509,29 @@ impl VisualizerApp {
         // ── Cover Art ──
         ui.heading("Cover Art");
         ui.checkbox(&mut cfg.show_cover_art, "Show Cover Art");
-        if cfg.show_cover_art {
+                if cfg.show_cover_art {
             ui.add(egui::Slider::new(&mut cfg.cover_size, 40.0..=600.0).text("Size (px)"));
-            ui.add(egui::Slider::new(&mut cfg.cover_x_offset, -5000.0..=5000.0).text("X Offset"));
-            ui.add(egui::Slider::new(&mut cfg.cover_y_offset, -5000.0..=5000.0).text("Y Offset"));
-            ui.label("Positive offsets move the cover right / down.");
+            ui.horizontal(|ui| {
+                ui.label("X Offset:");
+                ui.add(
+                    egui::DragValue::new(&mut cfg.cover_x_offset)
+                        .speed(1.0)
+                        .max_decimals(0)
+                        .clamp_range(-5000.0..=200.0)
+                        .suffix(" px"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Y Offset:");
+                ui.add(
+                    egui::DragValue::new(&mut cfg.cover_y_offset)
+                        .speed(1.0)
+                        .max_decimals(0)
+                        .clamp_range(-200.0..=5000.0)
+                        .suffix(" px"),
+                );
+            });
+            ui.label("Drag to adjust, or click the number to type an exact value.");
         }
 
         // ── Song Info Text ──
@@ -1602,8 +1620,26 @@ impl VisualizerApp {
         ui.add(egui::Slider::new(&mut cfg.letter_spacing, -5.0..=20.0).text("Letter Spacing (px)"));
         ui.add(egui::Slider::new(&mut cfg.line_height, 0.5..=3.0).text("Line Height (x artist font)"));
 
-        ui.add(egui::Slider::new(&mut cfg.text_x_offset, -5000.0..=5000.0).text("Text X Offset"));
-        ui.add(egui::Slider::new(&mut cfg.text_y_offset, -5000.0..=5000.0).text("Text Y Offset"));
+                ui.horizontal(|ui| {
+            ui.label("Text X Offset:");
+            ui.add(
+                egui::DragValue::new(&mut cfg.text_x_offset)
+                    .speed(1.0)
+                    .max_decimals(0)
+                    .clamp_range(-5000.0..=200.0)
+                    .suffix(" px"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Text Y Offset:");
+            ui.add(
+                egui::DragValue::new(&mut cfg.text_y_offset)
+                    .speed(1.0)
+                    .max_decimals(0)
+                    .clamp_range(-200.0..=5000.0)
+                    .suffix(" px"),
+            );
+        });
 
         // ── Shadow (kept inline, part of the Song Info Text block) ──
         ui.add_space(6.0);
