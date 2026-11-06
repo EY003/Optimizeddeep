@@ -1,6 +1,8 @@
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::Sender;
 
@@ -21,12 +23,15 @@ pub struct TrackInfo {
     pub cover_art: Option<Vec<u8>>,
 }
 
+fn log_smtc(msg: &str) {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("smtc_debug.log") {
+        let _ = writeln!(file, "[{}] {}", now, msg);
+    }
+}
+
 /// Spawns a background thread that polls Windows' System Media Transport
 /// Controls (SMTC) for the current track and cover art.
-///
-/// SMTC is the same API used by the Windows volume overlay, so this works with
-/// any SMTC-aware player (MusicBee with the mb_MediaControl plugin, Spotify,
-/// browsers, VLC, Groove, etc.).
 pub fn spawn_smtc_listener(
     tx: Sender<TrackInfo>,
     running: Arc<AtomicBool>,
@@ -34,33 +39,29 @@ pub fn spawn_smtc_listener(
 ) {
     std::thread::spawn(move || {
         // ── 1. Initialize COM on this worker thread ───────────
-        // SMTC (WinRT) is built on COM and requires an initialized apartment.
-        // This call is genuinely unsafe in the `windows` crate — SAFETY: we
-        // pass null for the reserved pointer and only request multithreaded
-        // mode, which is documented as valid for any thread that stays alive
-        // for the duration of the process.
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
 
         // ── 2. Acquire the session manager, retrying on failure ─
-        // On cold boot the SMTC service may not be ready immediately.
         let manager = loop {
             if !running.load(Ordering::Relaxed) {
+                log_smtc("SMTC: thread exiting before manager acquired.");
                 return;
             }
             match GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
                 .and_then(|op| op.get())
             {
-                Ok(m) => break m,
+                Ok(m) => {
+                    log_smtc("SMTC: session manager acquired successfully.");
+                    break m;
+                }
                 Err(e) => {
-                    eprintln!("SMTC: failed to get session manager: {:?} (retrying)", e);
+                    log_smtc(&format!("SMTC: failed to get session manager: {:?} (retrying)", e));
                     std::thread::sleep(Duration::from_millis(1000));
                 }
             }
         };
-
-        eprintln!("SMTC: session manager acquired");
 
         let mut last_title = String::new();
         let mut last_artist = String::new();
@@ -70,7 +71,13 @@ pub fn spawn_smtc_listener(
         while running.load(Ordering::Relaxed) {
             match manager.GetSessions() {
                 Ok(sessions) => {
-                    let count = sessions.Size().unwrap_or(0) as usize;
+                    let count = match sessions.Size() {
+                        Ok(c) => c as usize,
+                        Err(e) => {
+                            log_smtc(&format!("SMTC: sessions.Size() failed: {:?}", e));
+                            0
+                        }
+                    };
                     session_count.store(count, Ordering::Relaxed);
 
                     let session = pick_best_session(&sessions);
@@ -97,7 +104,7 @@ pub fn spawn_smtc_listener(
                                 last_artist = artist.clone();
                                 last_album = album.clone();
 
-                                eprintln!(
+                                log_smtc(&format!(
                                     "SMTC: now playing → {} — {} (cover: {})",
                                     artist,
                                     title,
@@ -105,7 +112,7 @@ pub fn spawn_smtc_listener(
                                         .as_ref()
                                         .map(|b| format!("{} bytes", b.len()))
                                         .unwrap_or_else(|| "none".into())
-                                );
+                                ));
 
                                 let _ = tx.send(TrackInfo {
                                     title,
@@ -117,6 +124,7 @@ pub fn spawn_smtc_listener(
                         }
                     } else if !last_title.is_empty() {
                         // Nothing is playing anymore — clear the UI.
+                        log_smtc("SMTC: no playing session found. Clearing track info.");
                         last_title.clear();
                         last_artist.clear();
                         last_album.clear();
@@ -129,7 +137,7 @@ pub fn spawn_smtc_listener(
                     }
                 }
                 Err(e) => {
-                    eprintln!("SMTC: GetSessions failed: {:?}", e);
+                    log_smtc(&format!("SMTC: GetSessions failed: {:?}", e));
                     session_count.store(0, Ordering::Relaxed);
                 }
             }
@@ -187,7 +195,6 @@ fn read_thumbnail(
     let reader = DataReader::CreateDataReader(&stream).ok()?;
     reader.LoadAsync(size).ok()?.get().ok()?;
     let mut bytes = vec![0u8; size as usize];
-    // `DataReader::ReadBytes` is a safe method in `windows` 0.58.
     reader.ReadBytes(&mut bytes).ok()?;
     Some(bytes)
 }
