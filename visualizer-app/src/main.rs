@@ -9,10 +9,9 @@ use visualizer_core::{
     audio::AudioEngine,
     color,
     config::{
-        AppConfig, BlendMode, ColorChangePreset, ColorMode, FontStyle, FrequencyDirection,
+        AppConfig, BlendMode, ColorChangePreset, ColorMode, FrequencyDirection,
         GradientPreset, GradientStop, MotionShape, StaticDistributionMode, StaticMultiPreset,
-        TrackFontFamily, TrackInfoConfig, TrackTextAlign, TrackTextColorMode,
-        VisualizerDirection,
+        TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VisualizerDirection,
     },
     musicbee::{self, TrackInfo},
 };
@@ -78,17 +77,41 @@ fn random_color_index(i: usize, num_colors: usize) -> usize {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Custom track-text font plumbing
+// Track-text font plumbing
 // ─────────────────────────────────────────────────────────────
 
-/// Family name used for the user-supplied custom font. Kept distinct from
-/// egui's built-in `Proportional` so selecting "Default" never accidentally
-/// uses the custom font.
+/// Family name used for the user-supplied track font. Kept distinct from
+/// egui's built-in `Proportional` so the visualizer's own UI never inherits it.
 const CUSTOM_FONT_FAMILY: &str = "custom_track";
 const CUSTOM_FONT_KEY: &str = "track_custom";
 
 fn custom_font_family() -> egui::FontFamily {
     egui::FontFamily::Name(CUSTOM_FONT_FAMILY.into())
+}
+
+/// Enumerate `.ttf` / `.otf` files in the Windows font directory.
+/// Returns `(display_name, full_path)` pairs, sorted case-insensitively.
+fn list_system_fonts() -> Vec<(String, String)> {
+    let fonts_dir = std::path::Path::new("C:\\Windows\\Fonts");
+    let mut result = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(fonts_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                let ext = ext.to_string_lossy().to_lowercase();
+                if ext == "ttf" || ext == "otf" {
+                    if let Some(name) = path.file_name() {
+                        result.push((
+                            name.to_string_lossy().to_string(),
+                            path.to_string_lossy().to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    result.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    result
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -117,9 +140,13 @@ struct VisualizerApp {
     cover_texture: Option<egui::TextureHandle>,
     dynamic_color: [u8; 3],
 
-    /// Last `custom_font_path` we successfully (or unsuccessfully) tried to
-    /// load. Sentinel `Some("__init__")` forces one reload on the first frame.
+    /// Last `font_path` we successfully (or unsuccessfully) tried to load.
+    /// Sentinel `Some("__init__")` forces one reload on the first frame.
     loaded_font_path: Option<String>,
+
+    /// `(display_name, full_path)` of every `.ttf` / `.otf` in
+    /// `C:\Windows\Fonts`, cached at startup for the font picker.
+    system_fonts: Vec<(String, String)>,
 
     /// Live count of SMTC sessions visible to Windows (for diagnostics).
     smtc_session_count: Arc<AtomicUsize>,
@@ -178,6 +205,8 @@ impl VisualizerApp {
         let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
         hotkey_manager.register(hotkey).unwrap();
 
+        let system_fonts = list_system_fonts();
+
         Self {
             current_bars: vec![0.0; config.num_bars],
             audio_rx: engine.data_rx,
@@ -196,6 +225,7 @@ impl VisualizerApp {
             cover_texture: None,
             dynamic_color: [180, 200, 180],
             loaded_font_path: Some("__init__".to_string()),
+            system_fonts,
             smtc_session_count,
 
             _tray_icon: tray_icon,
@@ -236,11 +266,11 @@ impl VisualizerApp {
         }
     }
 
-    /// Rebuild egui's font atlas. Registers the custom font (if any) under
+    /// Rebuild egui's font atlas. Registers the chosen font (if any) under
     /// `CUSTOM_FONT_FAMILY`, with egui's default Proportional as fallback so
     /// the `Custom` family never ends up empty.
     fn reload_custom_font(&mut self, ctx: &egui::Context) {
-        let target = self.config.track_info.custom_font_path.clone();
+        let target = self.config.track_info.font_path.clone();
         let mut fonts = egui::FontDefinitions::default();
 
         let mut custom_family_names: Vec<String> = Vec::new();
@@ -253,7 +283,7 @@ impl VisualizerApp {
                     custom_family_names.push(CUSTOM_FONT_KEY.to_owned());
                 }
                 Err(e) => {
-                    eprintln!("Failed to load custom font '{}': {}", path, e);
+                    eprintln!("Failed to load font '{}': {}", path, e);
                 }
             }
         }
@@ -299,7 +329,7 @@ impl VisualizerApp {
     // ── Track-info rendering helpers ────────────────────────
 
     /// Draws a single piece of text with all shared styling: shadow, outline,
-    /// bold simulation, letter spacing, colour, opacity.
+    /// letter spacing, colour, opacity.
     fn draw_styled_text(
         &self,
         ctx: &egui::Context,
@@ -315,7 +345,6 @@ impl VisualizerApp {
             return;
         }
 
-        let bold = matches!(cfg.font_style, FontStyle::Bold | FontStyle::BoldItalic);
         let ls = cfg.letter_spacing;
 
         // ── Shadow ──
@@ -342,11 +371,11 @@ impl VisualizerApp {
             );
             for (dx, dy) in offsets {
                 let sp = pos + egui::vec2(cfg.shadow_offset_x + dx, cfg.shadow_offset_y + dy);
-                draw_text_layered(ctx, painter, text, sp, font_id, align, s_color, ls, bold);
+                draw_spaced(ctx, painter, text, sp, font_id, align, s_color, ls);
             }
         }
 
-        // ── Outline (8-direction offset technique) ──
+        // ── Outline (12-direction offset technique) ──
         if cfg.outline_enabled && cfg.outline_thickness > 0.1 {
             let o_color = egui::Color32::from_rgba_unmultiplied(
                 cfg.outline_color[0],
@@ -359,12 +388,12 @@ impl VisualizerApp {
             for i in 0..n {
                 let a = i as f32 / n as f32 * TAU;
                 let op = pos + egui::vec2(a.cos() * t, a.sin() * t);
-                draw_text_layered(ctx, painter, text, op, font_id, align, o_color, ls, bold);
+                draw_spaced(ctx, painter, text, op, font_id, align, o_color, ls);
             }
         }
 
         // ── Main text ──
-        draw_text_layered(ctx, painter, text, pos, font_id, align, color, ls, bold);
+        draw_spaced(ctx, painter, text, pos, font_id, align, color, ls);
     }
 
     /// Draws album art + artist/title text using the user's `TrackInfoConfig`.
@@ -393,10 +422,10 @@ impl VisualizerApp {
         );
 
         // ── Font family ──
-        let family = match cfg.font_family {
-            TrackFontFamily::Proportional => egui::FontFamily::Proportional,
-            TrackFontFamily::Monospace => egui::FontFamily::Monospace,
-            TrackFontFamily::Custom => custom_font_family(),
+        let family = if cfg.font_path.is_some() {
+            custom_font_family()
+        } else {
+            egui::FontFamily::Proportional
         };
 
         let artist_font = egui::FontId::new(cfg.artist_font_size, family.clone());
@@ -409,9 +438,8 @@ impl VisualizerApp {
         };
 
         // ── Cover art ──
-        let mut text_anchor_y = rect.top() + margin + cfg.text_y_offset;
-
-        if cfg.show_cover_art {
+        let cover_visible = cfg.show_cover_art && self.cover_texture.is_some();
+        if cover_visible {
             if let Some(tex) = &self.cover_texture {
                 let art_x = rect.right() - margin - art_size + cfg.cover_x_offset;
                 let art_y = rect.top() + margin + cfg.cover_y_offset;
@@ -425,71 +453,54 @@ impl VisualizerApp {
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
-                text_anchor_y = art_rect.bottom() + text_gap + cfg.text_y_offset;
             }
         }
 
+        // ── Text anchor — uses *virtual* cover height, NOT the shifted rect,
+        //    so dragging the cover never drags the text with it. ──
+        let mut text_y = rect.top() + margin + cfg.text_y_offset;
+        if cover_visible {
+            text_y += art_size + text_gap;
+        }
         let text_x = rect.right() - margin + cfg.text_x_offset;
 
-        // ── Artist (top line) ──
-        let artist_pos = egui::pos2(text_x, text_anchor_y);
-        self.draw_styled_text(
-            ctx,
-            painter,
-            &info.artist,
-            artist_pos,
-            &artist_font,
-            align,
-            text_color,
-            cfg,
-        );
+        // ── Artist (first line, if enabled) ──
+        let mut current_y = text_y;
+        if cfg.show_artist && !info.artist.is_empty() {
+            let artist_pos = egui::pos2(text_x, current_y);
+            self.draw_styled_text(
+                ctx,
+                painter,
+                &info.artist,
+                artist_pos,
+                &artist_font,
+                align,
+                text_color,
+                cfg,
+            );
+            current_y += cfg.artist_font_size * cfg.line_height;
+        }
 
-        // ── Title (second line, spaced by line_height × artist font) ──
-        let title_y = text_anchor_y + cfg.artist_font_size * cfg.line_height;
-        let title_pos = egui::pos2(text_x, title_y);
-        self.draw_styled_text(
-            ctx,
-            painter,
-            &info.title,
-            title_pos,
-            &title_font,
-            align,
-            text_color,
-            cfg,
-        );
+        // ── Title (second line, if enabled) ──
+        if cfg.show_title && !info.title.is_empty() {
+            let title_pos = egui::pos2(text_x, current_y);
+            self.draw_styled_text(
+                ctx,
+                painter,
+                &info.title,
+                title_pos,
+                &title_font,
+                align,
+                text_color,
+                cfg,
+            );
+        }
     }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Free helpers for drawing text with letter spacing + bold
+// Free helpers for drawing text with letter spacing
 // ─────────────────────────────────────────────────────────────
-
-fn draw_text_layered(
-    ctx: &egui::Context,
-    painter: &egui::Painter,
-    text: &str,
-    pos: egui::Pos2,
-    font_id: &egui::FontId,
-    align: egui::Align2,
-    color: egui::Color32,
-    letter_spacing: f32,
-    bold: bool,
-) {
-    draw_spaced(ctx, painter, text, pos, font_id, align, color, letter_spacing);
-    if bold {
-        // Simulated bold: nudge right by ~1px and redraw. Works on any font.
-        draw_spaced(
-            ctx,
-            painter,
-            text,
-            pos + egui::vec2(0.8, 0.0),
-            font_id,
-            align,
-            color,
-            letter_spacing,
-        );
-    }
-}
 
 fn draw_spaced(
     ctx: &egui::Context,
@@ -505,7 +516,7 @@ fn draw_spaced(
         return;
     }
 
-    // Fast path: no letter spacing — one call per glyph run.
+    // Fast path: no letter spacing — one call for the whole string.
     if letter_spacing.abs() < 0.01 {
         painter.text(pos, align, text, font_id.clone(), color);
         return;
@@ -570,7 +581,7 @@ impl eframe::App for VisualizerApp {
         self.poll_track_updates(ctx);
 
         // Reload custom font whenever the configured path changes.
-        if self.config.track_info.custom_font_path != self.loaded_font_path {
+        if self.config.track_info.font_path != self.loaded_font_path {
             self.reload_custom_font(ctx);
         }
 
@@ -1490,61 +1501,77 @@ impl VisualizerApp {
     // ─────────────────────────────────────────────────────────
 
     fn draw_track_info_settings(&mut self, ui: &mut egui::Ui) {
+        // Snapshot the font list first so the mutable borrow of self.config
+        // below doesn't collide with reading self.system_fonts.
+        let system_fonts = self.system_fonts.clone();
         let cfg = &mut self.config.track_info;
 
         // ── Cover Art ──
-        ui.heading("🖼️ Cover Art");
+        ui.heading("Cover Art");
         ui.checkbox(&mut cfg.show_cover_art, "Show Cover Art");
         if cfg.show_cover_art {
             ui.add(egui::Slider::new(&mut cfg.cover_size, 40.0..=600.0).text("Size (px)"));
-            ui.add(egui::Slider::new(&mut cfg.cover_x_offset, -1500.0..=1500.0).text("X Offset"));
-            ui.add(egui::Slider::new(&mut cfg.cover_y_offset, -1500.0..=1500.0).text("Y Offset"));
-            ui.label("Positive offsets move the cover right / down (screen coordinates).");
+            ui.add(egui::Slider::new(&mut cfg.cover_x_offset, -5000.0..=5000.0).text("X Offset"));
+            ui.add(egui::Slider::new(&mut cfg.cover_y_offset, -5000.0..=5000.0).text("Y Offset"));
+            ui.label("Positive offsets move the cover right / down.");
         }
 
         // ── Song Info Text ──
         ui.separator();
-        ui.heading("📝 Song Info Text");
+        ui.heading("Song Info Text");
 
-        ui.label("Font sizes (per-line, independent):");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut cfg.show_title, "Show Title");
+            ui.checkbox(&mut cfg.show_artist, "Show Artist");
+        });
+
         ui.add(egui::Slider::new(&mut cfg.title_font_size, 6.0..=120.0).text("Title Font Size"));
         ui.add(egui::Slider::new(&mut cfg.artist_font_size, 6.0..=120.0).text("Artist Font Size"));
 
-        ui.add_space(6.0);
-        ui.label("Font family (shared):");
+        // Font picker: dropdown of every system font, plus a manual override.
         ui.horizontal(|ui| {
-            ui.radio_value(&mut cfg.font_family, TrackFontFamily::Proportional, "Default");
-            ui.radio_value(&mut cfg.font_family, TrackFontFamily::Monospace, "Monospace");
-            ui.radio_value(&mut cfg.font_family, TrackFontFamily::Custom, "Custom…");
+            ui.label("Font:");
+            let selected_label = match &cfg.font_path {
+                None => "Default (proportional)".to_string(),
+                Some(p) => std::path::Path::new(p)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.clone()),
+            };
+            egui::ComboBox::from_id_salt("track_font_select")
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(cfg.font_path.is_none(), "Default (proportional)")
+                        .clicked()
+                    {
+                        cfg.font_path = None;
+                    }
+                    for (name, path) in &system_fonts {
+                        let selected = cfg.font_path.as_deref() == Some(path.as_str());
+                        if ui.selectable_label(selected, name).clicked() {
+                            cfg.font_path = Some(path.clone());
+                        }
+                    }
+                });
         });
 
-        if cfg.font_family == TrackFontFamily::Custom {
-            ui.label("Custom font file (.ttf / .otf):");
-            let mut path_str = cfg.custom_font_path.clone().unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label("Custom path:");
+            let mut path_str = cfg.font_path.clone().unwrap_or_default();
             if ui.text_edit_singleline(&mut path_str).changed() {
-                cfg.custom_font_path = if path_str.trim().is_empty() {
+                cfg.font_path = if path_str.trim().is_empty() {
                     None
                 } else {
                     Some(path_str)
                 };
             }
-            ui.label("Tip: system fonts live in C:\\Windows\\Fonts\\");
-            ui.label("(Changes take effect on the next frame.)");
-        }
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Style:");
-            ui.radio_value(&mut cfg.font_style, FontStyle::Regular, "Regular");
-            ui.radio_value(&mut cfg.font_style, FontStyle::Bold, "Bold");
-            ui.radio_value(&mut cfg.font_style, FontStyle::Italic, "Italic");
-            ui.radio_value(&mut cfg.font_style, FontStyle::BoldItalic, "Bold+Italic");
         });
-        ui.label("Bold is simulated by double-drawing. Italic currently has no visual effect \
-                  (it requires loading an italic variant file as a Custom font).");
+        ui.label("System fonts live in C:\\Windows\\Fonts\\.");
 
-        // Text colour
+        // Text color
         ui.add_space(6.0);
-        ui.label("Text color (shared):");
+        ui.label("Text color:");
         ui.horizontal(|ui| {
             ui.radio_value(&mut cfg.color_mode, TrackTextColorMode::Static, "Static");
             ui.radio_value(
@@ -1573,33 +1600,31 @@ impl VisualizerApp {
         });
 
         ui.add(egui::Slider::new(&mut cfg.letter_spacing, -5.0..=20.0).text("Letter Spacing (px)"));
-        ui.add(egui::Slider::new(&mut cfg.line_height, 0.5..=3.0).text("Line Height (× artist font)"));
+        ui.add(egui::Slider::new(&mut cfg.line_height, 0.5..=3.0).text("Line Height (x artist font)"));
 
+        ui.add(egui::Slider::new(&mut cfg.text_x_offset, -5000.0..=5000.0).text("Text X Offset"));
+        ui.add(egui::Slider::new(&mut cfg.text_y_offset, -5000.0..=5000.0).text("Text Y Offset"));
+
+        // ── Shadow (kept inline, part of the Song Info Text block) ──
         ui.add_space(6.0);
-        ui.label("Text position offsets:");
-        ui.add(egui::Slider::new(&mut cfg.text_x_offset, -1500.0..=1500.0).text("Text X Offset"));
-        ui.add(egui::Slider::new(&mut cfg.text_y_offset, -1500.0..=1500.0).text("Text Y Offset"));
-
-        // Shadow
-        ui.separator();
-        ui.heading("Text Shadow");
+        ui.strong("Shadow");
         ui.checkbox(&mut cfg.shadow_enabled, "Enable Shadow");
         if cfg.shadow_enabled {
             ui.add(egui::Slider::new(&mut cfg.shadow_offset_x, -30.0..=30.0).text("Shadow X Offset"));
             ui.add(egui::Slider::new(&mut cfg.shadow_offset_y, -30.0..=30.0).text("Shadow Y Offset"));
-            ui.add(egui::Slider::new(&mut cfg.shadow_blur, 0.0..=20.0).text("Shadow Blur"));
+            ui.add(egui::Slider::new(&mut cfg.shadow_blur, 0.0..=10.0).text("Shadow Blur"));
             ui.horizontal(|ui| {
                 ui.label("Shadow Color:");
                 ui.color_edit_button_srgb(&mut cfg.shadow_color);
             });
         }
 
-        // Outline
-        ui.separator();
-        ui.heading("Text Outline");
+        // ── Outline (kept inline, part of the Song Info Text block) ──
+        ui.add_space(6.0);
+        ui.strong("Outline");
         ui.checkbox(&mut cfg.outline_enabled, "Enable Outline");
         if cfg.outline_enabled {
-            ui.add(egui::Slider::new(&mut cfg.outline_thickness, 0.1..=10.0).text("Outline Thickness"));
+            ui.add(egui::Slider::new(&mut cfg.outline_thickness, 0.1..=6.0).text("Outline Thickness"));
             ui.horizontal(|ui| {
                 ui.label("Outline Color:");
                 ui.color_edit_button_srgb(&mut cfg.outline_color);
@@ -1665,7 +1690,7 @@ impl VisualizerApp {
             if count == 0 {
                 ui.colored_label(
                     egui::Color32::from_rgb(255, 180, 80),
-                    "⚠ No SMTC sessions found. Is a supported player running?",
+                    "No SMTC sessions found. Is a supported player running?",
                 );
                 ui.label(
                     "MusicBee needs the 'mb_MediaControl' plugin installed for SMTC support.",
@@ -2140,7 +2165,7 @@ impl VisualizerApp {
         self.draw_track_info_settings(ui);
 
         ui.separator();
-        if ui.button("⚠️ Reset to Defaults").clicked() {
+        if ui.button("Reset to Defaults").clicked() {
             self.config = AppConfig::default();
             self.audio_target_bars
                 .store(self.config.num_bars, Ordering::Relaxed);
