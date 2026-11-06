@@ -479,9 +479,20 @@ pub struct AppConfig {
     pub font_path: Option<String>,
 
     pub bg_opacity: u8,
+    /// RGB colour drawn behind the bars when `bg_opacity > 0`.
+    #[serde(default)]
+    pub bg_color: [u8; 3],
     pub color_presets: Vec<[u8; 3]>,
     pub x_offset: f32,
     pub y_offset: f32,
+
+    // ── Bar outlines ──
+    #[serde(default)]
+    pub bar_outline_enabled: bool,
+    #[serde(default = "default_bar_outline_thickness")]
+    pub bar_outline_thickness: f32,
+    #[serde(default = "default_bar_outline_color")]
+    pub bar_outline_color: [u8; 3],
 
     pub max_bar_height: f32,
     pub target_fps: f32,
@@ -559,6 +570,13 @@ fn default_speed() -> f32 {
 }
 fn default_sequential_bars_per_color() -> usize {
     1
+}
+
+fn default_bar_outline_thickness() -> f32 {
+    1.0
+}
+fn default_bar_outline_color() -> [u8; 3] {
+    [0, 0, 0]
 }
 
 fn default_static_single_source() -> ColorSource {
@@ -841,6 +859,7 @@ impl Default for AppConfig {
             font_path: None,
 
             bg_opacity: 0,
+            bg_color: [0, 0, 0],
             color_presets: vec![
                 [255, 255, 255],
                 [0, 255, 255],
@@ -855,6 +874,10 @@ impl Default for AppConfig {
             ],
             x_offset: 0.0,
             y_offset: 0.0,
+
+            bar_outline_enabled: false,
+            bar_outline_thickness: 1.0,
+            bar_outline_color: [0, 0, 0],
 
             max_bar_height: 0.0,
             target_fps: 60.0,
