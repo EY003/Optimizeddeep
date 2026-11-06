@@ -115,7 +115,7 @@ impl VisualizerApp {
         let should_quit = Arc::new(AtomicBool::new(false));
         
         // Log to confirm the app starts and the flag is false.
-        log_smtc("APP: Initializing VisualizerApp. should_quit = false.");
+        musicbee::log_smtc("APP: Initializing VisualizerApp. should_quit = false.");
 
         let audio_target_bars = engine.target_bars.clone();
         let audio_update_interval = engine.update_interval_ms.clone();
