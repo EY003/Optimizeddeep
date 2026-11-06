@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
+use image::DynamicImage;
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -9,9 +10,10 @@ use visualizer_core::{
     audio::AudioEngine,
     color,
     config::{
-        AppConfig, BlendMode, ColorChangePreset, ColorMode, FrequencyDirection,
-        GradientPreset, GradientStop, MotionShape, StaticDistributionMode, StaticMultiPreset,
-        TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VisualizerDirection,
+        AppConfig, BlendMode, ColorChangePreset, ColorMode, ColorSource, FrequencyDirection,
+        GradientPreset, GradientSource, GradientStop, MotionShape, PalettePriority,
+        StaticDistributionMode, StaticMultiPreset, TrackInfoConfig, TrackTextAlign,
+        TrackTextColorMode, VisualizerDirection,
     },
     musicbee::{self, TrackInfo},
 };
@@ -80,8 +82,6 @@ fn random_color_index(i: usize, num_colors: usize) -> usize {
 // Track-text font plumbing
 // ─────────────────────────────────────────────────────────────
 
-/// Family name used for the user-supplied track font. Kept distinct from
-/// egui's built-in `Proportional` so the visualizer's own UI never inherits it.
 const CUSTOM_FONT_FAMILY: &str = "custom_track";
 const CUSTOM_FONT_KEY: &str = "track_custom";
 
@@ -89,8 +89,6 @@ fn custom_font_family() -> egui::FontFamily {
     egui::FontFamily::Name(CUSTOM_FONT_FAMILY.into())
 }
 
-/// Enumerate `.ttf` / `.otf` files in the Windows font directory.
-/// Returns `(display_name, full_path)` pairs, sorted case-insensitively.
 fn list_system_fonts() -> Vec<(String, String)> {
     let fonts_dir = std::path::Path::new("C:\\Windows\\Fonts");
     let mut result = Vec::new();
@@ -112,6 +110,81 @@ fn list_system_fonts() -> Vec<(String, String)> {
     }
     result.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     result
+}
+
+// ─────────────────────────────────────────────────────────────
+// Palette caching + resolved palettes
+// ─────────────────────────────────────────────────────────────
+
+struct PaletteCacheEntry {
+    track_id: u64,
+    palette_size: u8,
+    variants: u8,
+    priority: PalettePriority,
+    colors: Vec<[u8; 3]>,
+}
+
+#[derive(Default)]
+struct PaletteCache {
+    entry: Option<PaletteCacheEntry>,
+}
+
+impl PaletteCache {
+    fn get(&self, track_id: u64, size: u8, variants: u8, priority: PalettePriority) -> Option<&[[u8; 3]]> {
+        self.entry
+            .as_ref()
+            .filter(|e| {
+                e.track_id == track_id
+                    && e.palette_size == size
+                    && e.variants == variants
+                    && e.priority == priority
+            })
+            .map(|e| e.colors.as_slice())
+    }
+    fn store(&mut self, track_id: u64, size: u8, variants: u8, priority: PalettePriority, colors: Vec<[u8; 3]>) {
+        self.entry = Some(PaletteCacheEntry {
+            track_id,
+            palette_size: size,
+            variants,
+            priority,
+            colors,
+        });
+    }
+}
+
+#[derive(Default, Clone)]
+struct ActivePalettes {
+    static_single_colors: Vec<[u8; 3]>,
+    static_multi_colors: Vec<[u8; 3]>,
+    gradient_colors: Vec<[u8; 3]>,
+    gradient_stops: Vec<GradientStop>,
+    animated_colors: Vec<[u8; 3]>,
+}
+
+fn stops_from_colors(colors: &[[u8; 3]]) -> Vec<GradientStop> {
+    match colors.len() {
+        0 => vec![GradientStop { color: [255, 255, 255], position: 0.0 }],
+        1 => vec![GradientStop { color: colors[0], position: 0.0 }],
+        n => colors
+            .iter()
+            .enumerate()
+            .map(|(i, c)| GradientStop {
+                color: *c,
+                position: i as f32 / (n - 1) as f32,
+            })
+            .collect(),
+    }
+}
+
+fn compute_track_id(bytes: Option<&[u8]>, artist: &str, title: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Some(b) = bytes {
+        b.hash(&mut h);
+    }
+    artist.hash(&mut h);
+    title.hash(&mut h);
+    h.finish()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -138,17 +211,19 @@ struct VisualizerApp {
     track_rx: crossbeam_channel::Receiver<TrackInfo>,
     track_info: Option<TrackInfo>,
     cover_texture: Option<egui::TextureHandle>,
+    cover_image: Option<DynamicImage>,
     dynamic_color: [u8; 3],
+    track_id: u64,
 
-    /// Last `font_path` we successfully (or unsuccessfully) tried to load.
-    /// Sentinel `Some("__init__")` forces one reload on the first frame.
+    // ── Resolved palettes + caches ───────────────────────────
+    active_palettes: ActivePalettes,
+    static_single_cache: PaletteCache,
+    static_multi_cache: PaletteCache,
+    gradient_cache: PaletteCache,
+    animated_cache: PaletteCache,
+
     loaded_font_path: Option<String>,
-
-    /// `(display_name, full_path)` of every `.ttf` / `.otf` in
-    /// `C:\Windows\Fonts`, cached at startup for the font picker.
     system_fonts: Vec<(String, String)>,
-
-    /// Live count of SMTC sessions visible to Windows (for diagnostics).
     smtc_session_count: Arc<AtomicUsize>,
 
     _tray_icon: TrayIcon,
@@ -162,30 +237,20 @@ impl VisualizerApp {
         let config = AppConfig::load();
         let engine = AudioEngine::new(config.num_bars, config.audio_update_ms);
 
-        // Explicitly set to false before spawning the thread.
         let should_quit = Arc::new(AtomicBool::new(false));
-
-        // Log to confirm the app starts and the flag is false.
         musicbee::log_smtc("APP: Initializing VisualizerApp. should_quit = false.");
 
         let audio_target_bars = engine.target_bars.clone();
         let audio_update_interval = engine.update_interval_ms.clone();
 
-        // Spawn the SMTC listener
         let (track_tx, track_rx) = crossbeam_channel::unbounded();
         let smtc_session_count = Arc::new(AtomicUsize::new(0));
-        musicbee::spawn_smtc_listener(
-            track_tx,
-            should_quit.clone(),
-            smtc_session_count.clone(),
-        );
+        musicbee::spawn_smtc_listener(track_tx, should_quit.clone(), smtc_session_count.clone());
 
         let tray_menu = Menu::new();
         let settings_item = MenuItem::new("Open Settings", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
-        tray_menu
-            .append_items(&[&settings_item, &quit_item])
-            .unwrap();
+        tray_menu.append_items(&[&settings_item, &quit_item]).unwrap();
 
         let mut icon_rgba = vec![0; 16 * 16 * 4];
         for i in 0..(16 * 16) {
@@ -223,7 +288,16 @@ impl VisualizerApp {
             track_rx,
             track_info: None,
             cover_texture: None,
+            cover_image: None,
             dynamic_color: [180, 200, 180],
+            track_id: 0,
+
+            active_palettes: ActivePalettes::default(),
+            static_single_cache: PaletteCache::default(),
+            static_multi_cache: PaletteCache::default(),
+            gradient_cache: PaletteCache::default(),
+            animated_cache: PaletteCache::default(),
+
             loaded_font_path: Some("__init__".to_string()),
             system_fonts,
             smtc_session_count,
@@ -235,14 +309,12 @@ impl VisualizerApp {
         }
     }
 
-    /// Drain the SMTC channel, decode artwork, extract colors, and rebuild
-    /// the texture.
     fn poll_track_updates(&mut self, ctx: &egui::Context) {
         while let Ok(info) = self.track_rx.try_recv() {
-            // Decode artwork + extract dominant color
             if let Some(bytes) = &info.cover_art {
                 if let Some((colors, img)) = color::extract_colors_from_bytes(bytes) {
                     self.dynamic_color = colors.dominant;
+                    self.track_id = compute_track_id(Some(bytes), &info.artist, &info.title);
 
                     let rgba = img.to_rgba8();
                     let size = [rgba.width() as usize, rgba.height() as usize];
@@ -253,9 +325,13 @@ impl VisualizerApp {
                         color_image,
                         egui::TextureOptions::LINEAR,
                     ));
+
+                    self.cover_image = Some(img);
                 }
             } else {
                 self.cover_texture = None;
+                self.cover_image = None;
+                self.track_id = compute_track_id(None, &info.artist, &info.title);
             }
 
             if info.title.is_empty() && info.artist.is_empty() {
@@ -266,9 +342,6 @@ impl VisualizerApp {
         }
     }
 
-    /// Rebuild egui's font atlas. Registers the chosen font (if any) under
-    /// `CUSTOM_FONT_FAMILY`, with egui's default Proportional as fallback so
-    /// the `Custom` family never ends up empty.
     fn reload_custom_font(&mut self, ctx: &egui::Context) {
         let target = self.config.track_info.font_path.clone();
         let mut fonts = egui::FontDefinitions::default();
@@ -289,11 +362,7 @@ impl VisualizerApp {
         }
 
         if custom_family_names.is_empty() {
-            // Fall back to egui's default proportional list so the family
-            // always resolves to *something*.
-            if let Some(defaults) =
-                fonts.families.get(&egui::FontFamily::Proportional).cloned()
-            {
+            if let Some(defaults) = fonts.families.get(&egui::FontFamily::Proportional).cloned() {
                 custom_family_names = defaults;
             }
         }
@@ -306,20 +375,152 @@ impl VisualizerApp {
         self.loaded_font_path = target;
     }
 
-    /// Resolve the representative "visualizer colour" for the current mode,
-    /// so the track text can track it in real time.
+    // ── Palette resolution ──────────────────────────────────
+
+    fn update_palettes(&mut self) {
+        match self.config.color_mode {
+            ColorMode::Dynamic | ColorMode::StaticSingle => self.update_static_single_palette(),
+            ColorMode::StaticMultiple => self.update_static_multi_palette(),
+            ColorMode::Gradient => self.update_gradient_palette(),
+            ColorMode::Animated => self.update_animated_palette(),
+        }
+    }
+
+    fn update_static_single_palette(&mut self) {
+        let source = self.config.static_single_source.clone();
+        let colors = match source {
+            ColorSource::Static(colors) => {
+                vec![colors.first().copied().unwrap_or([255, 255, 255])]
+            }
+            ColorSource::Dynamic { priority, .. } => {
+                let tid = self.track_id;
+                if let Some(c) = self
+                    .static_single_cache
+                    .get(tid, 1, 0, priority)
+                    .map(|s| s.to_vec())
+                {
+                    c
+                } else {
+                    let extracted = self
+                        .cover_image
+                        .as_ref()
+                        .map(|img| color::extract_palette(img, 1, 0, priority))
+                        .unwrap_or_else(|| vec![[255, 255, 255]]);
+                    self.static_single_cache.store(tid, 1, 0, priority, extracted.clone());
+                    extracted
+                }
+            }
+        };
+        self.active_palettes.static_single_colors = colors;
+    }
+
+    fn update_static_multi_palette(&mut self) {
+        let source = self.config.static_multi_source.clone();
+        let colors = match source {
+            ColorSource::Static(colors) => {
+                if colors.is_empty() { vec![[255, 255, 255]] } else { colors }
+            }
+            ColorSource::Dynamic { palette_size, variants_per_color, priority } => {
+                let tid = self.track_id;
+                if let Some(c) = self
+                    .static_multi_cache
+                    .get(tid, palette_size, variants_per_color, priority)
+                    .map(|s| s.to_vec())
+                {
+                    c
+                } else {
+                    let extracted = self
+                        .cover_image
+                        .as_ref()
+                        .map(|img| color::extract_palette(img, palette_size, variants_per_color, priority))
+                        .unwrap_or_else(|| vec![[255, 255, 255]]);
+                    self.static_multi_cache
+                        .store(tid, palette_size, variants_per_color, priority, extracted.clone());
+                    extracted
+                }
+            }
+        };
+        self.active_palettes.static_multi_colors = colors;
+    }
+
+    fn update_gradient_palette(&mut self) {
+        let source = self.config.gradient_source.clone();
+        let colors = match source {
+            GradientSource::Static(stops) => stops.iter().map(|s| s.color).collect::<Vec<_>>(),
+            GradientSource::Dynamic { palette_size, variants_per_color, priority } => {
+                let tid = self.track_id;
+                if let Some(c) = self
+                    .gradient_cache
+                    .get(tid, palette_size, variants_per_color, priority)
+                    .map(|s| s.to_vec())
+                {
+                    c
+                } else {
+                    let extracted = self
+                        .cover_image
+                        .as_ref()
+                        .map(|img| color::extract_palette(img, palette_size, variants_per_color, priority))
+                        .unwrap_or_else(|| vec![[255, 255, 255]]);
+                    self.gradient_cache
+                        .store(tid, palette_size, variants_per_color, priority, extracted.clone());
+                    extracted
+                }
+            }
+        };
+        self.active_palettes.gradient_stops = match &self.config.gradient_source {
+            GradientSource::Static(stops) => stops.clone(),
+            GradientSource::Dynamic { .. } => stops_from_colors(&colors),
+        };
+        self.active_palettes.gradient_colors = colors;
+    }
+
+    fn update_animated_palette(&mut self) {
+        let source = self.config.animated_source.clone();
+        let colors = match source {
+            ColorSource::Static(colors) => {
+                if colors.is_empty() { vec![[255, 255, 255]] } else { colors }
+            }
+            ColorSource::Dynamic { palette_size, variants_per_color, priority } => {
+                let tid = self.track_id;
+                if let Some(c) = self
+                    .animated_cache
+                    .get(tid, palette_size, variants_per_color, priority)
+                    .map(|s| s.to_vec())
+                {
+                    c
+                } else {
+                    let extracted = self
+                        .cover_image
+                        .as_ref()
+                        .map(|img| color::extract_palette(img, palette_size, variants_per_color, priority))
+                        .unwrap_or_else(|| vec![[255, 255, 255]]);
+                    self.animated_cache
+                        .store(tid, palette_size, variants_per_color, priority, extracted.clone());
+                    extracted
+                }
+            }
+        };
+        self.active_palettes.animated_colors = colors;
+    }
+
     fn get_visualizer_text_color(&self, time: f32) -> [u8; 3] {
         match self.config.color_mode {
-            ColorMode::Dynamic => self.dynamic_color,
-            ColorMode::StaticSingle => self.config.bar_color,
-            ColorMode::StaticMultiple => self
-                .config
-                .static_colors
+            ColorMode::Dynamic | ColorMode::StaticSingle => self
+                .active_palettes
+                .static_single_colors
                 .first()
                 .copied()
                 .unwrap_or([255, 255, 255]),
-            ColorMode::Gradient => color::sample_gradient(&self.config.gradient_stops, 0.5),
-            ColorMode::ColorChanging => {
+            ColorMode::StaticMultiple => self
+                .active_palettes
+                .static_multi_colors
+                .first()
+                .copied()
+                .unwrap_or([255, 255, 255]),
+            ColorMode::Gradient => {
+                color::sample_gradient(&self.active_palettes.gradient_stops, 0.5)
+            }
+            ColorMode::Animated => {
                 let c = self.sample_color_changing(0.5, 0.5, time);
                 [c.r(), c.g(), c.b()]
             }
@@ -328,8 +529,6 @@ impl VisualizerApp {
 
     // ── Track-info rendering helpers ────────────────────────
 
-    /// Draws a single piece of text with all shared styling: shadow, outline,
-    /// letter spacing, colour, opacity.
     fn draw_styled_text(
         &self,
         ctx: &egui::Context,
@@ -347,7 +546,6 @@ impl VisualizerApp {
 
         let ls = cfg.letter_spacing;
 
-        // ── Shadow ──
         if cfg.shadow_enabled {
             let base_alpha = (cfg.opacity as f32 * 0.6).max(1.0);
             let offsets: Vec<(f32, f32)> = if cfg.shadow_blur < 1.0 {
@@ -375,7 +573,6 @@ impl VisualizerApp {
             }
         }
 
-        // ── Outline (12-direction offset technique) ──
         if cfg.outline_enabled && cfg.outline_thickness > 0.1 {
             let o_color = egui::Color32::from_rgba_unmultiplied(
                 cfg.outline_color[0],
@@ -392,11 +589,9 @@ impl VisualizerApp {
             }
         }
 
-        // ── Main text ──
         draw_spaced(ctx, painter, text, pos, font_id, align, color, ls);
     }
 
-    /// Draws album art + artist/title text using the user's `TrackInfoConfig`.
     fn draw_track_info(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let Some(info) = &self.track_info else { return };
 
@@ -409,7 +604,6 @@ impl VisualizerApp {
         let art_size = cfg.cover_size;
         let text_gap = 14.0;
 
-        // ── Resolve colour ──
         let base_rgb = match cfg.color_mode {
             TrackTextColorMode::Static => cfg.static_color,
             TrackTextColorMode::Visualizer => self.get_visualizer_text_color(time),
@@ -421,7 +615,6 @@ impl VisualizerApp {
             cfg.opacity,
         );
 
-        // ── Font family ──
         let family = if cfg.font_path.is_some() {
             custom_font_family()
         } else {
@@ -437,7 +630,6 @@ impl VisualizerApp {
             TrackTextAlign::Right => egui::Align2::RIGHT_TOP,
         };
 
-        // ── Cover art ──
         let cover_visible = cfg.show_cover_art && self.cover_texture.is_some();
         if cover_visible {
             if let Some(tex) = &self.cover_texture {
@@ -456,15 +648,12 @@ impl VisualizerApp {
             }
         }
 
-        // ── Text anchor — uses *virtual* cover height, NOT the shifted rect,
-        //    so dragging the cover never drags the text with it. ──
         let mut text_y = rect.top() + margin + cfg.text_y_offset;
         if cover_visible {
             text_y += art_size + text_gap;
         }
         let text_x = rect.right() - margin + cfg.text_x_offset;
 
-        // ── Artist (first line, if enabled) ──
         let mut current_y = text_y;
         if cfg.show_artist && !info.artist.is_empty() {
             let artist_pos = egui::pos2(text_x, current_y);
@@ -481,7 +670,6 @@ impl VisualizerApp {
             current_y += cfg.artist_font_size * cfg.line_height;
         }
 
-        // ── Title (second line, if enabled) ──
         if cfg.show_title && !info.title.is_empty() {
             let title_pos = egui::pos2(text_x, current_y);
             self.draw_styled_text(
@@ -499,7 +687,7 @@ impl VisualizerApp {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Free helpers for drawing text with letter spacing
+// Free helpers
 // ─────────────────────────────────────────────────────────────
 
 fn draw_spaced(
@@ -516,7 +704,6 @@ fn draw_spaced(
         return;
     }
 
-    // Fast path: no letter spacing — one call for the whole string.
     if letter_spacing.abs() < 0.01 {
         painter.text(pos, align, text, font_id.clone(), color);
         return;
@@ -532,9 +719,7 @@ fn draw_spaced(
         widths.iter().sum::<f32>() + letter_spacing * (chars.len().saturating_sub(1)) as f32;
 
     let start_x = match align {
-        egui::Align2::LEFT_TOP
-        | egui::Align2::LEFT_CENTER
-        | egui::Align2::LEFT_BOTTOM => pos.x,
+        egui::Align2::LEFT_TOP | egui::Align2::LEFT_CENTER | egui::Align2::LEFT_BOTTOM => pos.x,
         egui::Align2::RIGHT_TOP
         | egui::Align2::RIGHT_CENTER
         | egui::Align2::RIGHT_BOTTOM => pos.x - total_width,
@@ -579,8 +764,8 @@ impl eframe::App for VisualizerApp {
         }
 
         self.poll_track_updates(ctx);
+        self.update_palettes();
 
-        // Reload custom font whenever the configured path changes.
         if self.config.track_info.font_path != self.loaded_font_path {
             self.reload_custom_font(ctx);
         }
@@ -614,15 +799,13 @@ impl eframe::App for VisualizerApp {
 
         let current_target = self.audio_target_bars.load(Ordering::Relaxed);
         if current_target != self.config.num_bars {
-            self.audio_target_bars
-                .store(self.config.num_bars, Ordering::Relaxed);
+            self.audio_target_bars.store(self.config.num_bars, Ordering::Relaxed);
             self.current_bars.resize(self.config.num_bars, 0.0);
         }
 
         let current_interval = self.audio_update_interval.load(Ordering::Relaxed);
         if current_interval != self.config.audio_update_ms {
-            self.audio_update_interval
-                .store(self.config.audio_update_ms, Ordering::Relaxed);
+            self.audio_update_interval.store(self.config.audio_update_ms, Ordering::Relaxed);
         }
 
         let mut latest_bars: Option<Vec<f32>> = None;
@@ -983,7 +1166,8 @@ impl VisualizerApp {
     }
 
     fn sample_color_changing(&self, x: f32, y: f32, time: f32) -> egui::Color32 {
-        if self.config.color_change_colors.is_empty() {
+        let colors = &self.active_palettes.animated_colors;
+        if colors.is_empty() {
             return egui::Color32::WHITE;
         }
 
@@ -999,8 +1183,8 @@ impl VisualizerApp {
             base_t,
         );
 
-        let ca = color::cyclic_color(&self.config.color_change_colors, s.phase_a);
-        let cb = color::cyclic_color(&self.config.color_change_colors, s.phase_b);
+        let ca = color::cyclic_color(colors, s.phase_a);
+        let cb = color::cyclic_color(colors, s.phase_b);
         let t = s.blend_t.clamp(0.0, 1.0);
         let k = s.intensity.clamp(0.0, 1.0);
 
@@ -1025,19 +1209,19 @@ impl VisualizerApp {
         time: f32,
     ) -> egui::Color32 {
         match self.config.color_mode {
-            ColorMode::Dynamic => egui::Color32::from_rgb(
-                self.dynamic_color[0],
-                self.dynamic_color[1],
-                self.dynamic_color[2],
-            ),
-            ColorMode::StaticSingle => egui::Color32::from_rgb(
-                self.config.bar_color[0],
-                self.config.bar_color[1],
-                self.config.bar_color[2],
-            ),
+            ColorMode::Dynamic | ColorMode::StaticSingle => {
+                let c = self
+                    .active_palettes
+                    .static_single_colors
+                    .first()
+                    .copied()
+                    .unwrap_or([255, 255, 255]);
+                egui::Color32::from_rgb(c[0], c[1], c[2])
+            }
             ColorMode::StaticMultiple => {
-                let num_colors = self.config.static_colors.len().max(1);
-                if self.config.static_colors.is_empty() {
+                let colors = &self.active_palettes.static_multi_colors;
+                let num_colors = colors.len().max(1);
+                if colors.is_empty() {
                     return egui::Color32::WHITE;
                 }
 
@@ -1058,12 +1242,7 @@ impl VisualizerApp {
                     StaticDistributionMode::Vertical => 0,
                 };
 
-                let c = self
-                    .config
-                    .static_colors
-                    .get(idx)
-                    .copied()
-                    .unwrap_or([255, 255, 255]);
+                let c = colors.get(idx).copied().unwrap_or([255, 255, 255]);
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
             ColorMode::Gradient => {
@@ -1093,10 +1272,10 @@ impl VisualizerApp {
                     0.0
                 };
 
-                let c = color::sample_gradient(&self.config.gradient_stops, t);
+                let c = color::sample_gradient(&self.active_palettes.gradient_stops, t);
                 egui::Color32::from_rgb(c[0], c[1], c[2])
             }
-            ColorMode::ColorChanging => {
+            ColorMode::Animated => {
                 let x = if total_bars > 1 {
                     i as f32 / (total_bars - 1) as f32
                 } else {
@@ -1142,7 +1321,7 @@ impl VisualizerApp {
         for corner in corners {
             let t =
                 ((corner.x * dir.x + corner.y * dir.y - min_proj) / range).clamp(0.0, 1.0);
-            let c = color::sample_gradient(&self.config.gradient_stops, t);
+            let c = color::sample_gradient(&self.active_palettes.gradient_stops, t);
             mesh.vertices.push(egui::epaint::Vertex {
                 pos: corner,
                 uv: egui::Pos2::ZERO,
@@ -1233,7 +1412,7 @@ impl VisualizerApp {
         let is_vertical_stack = self.config.color_mode == ColorMode::StaticMultiple
             && self.config.static_mode == StaticDistributionMode::Vertical;
         let is_gradient = self.config.color_mode == ColorMode::Gradient;
-        let is_color_changing_vertical = self.config.color_mode == ColorMode::ColorChanging
+        let is_animated_vertical = self.config.color_mode == ColorMode::Animated
             && self.config.color_change_motion.shape.uses_vertical_axis();
 
         let x_norm = |i: usize| -> f32 {
@@ -1267,15 +1446,14 @@ impl VisualizerApp {
                     );
 
                     if is_vertical_stack {
-                        let num_colors = self.config.static_colors.len().max(1);
+                        let colors = &self.active_palettes.static_multi_colors;
+                        let num_colors = colors.len().max(1);
+                        if colors.is_empty() {
+                            continue;
+                        }
                         let slice_h = h / num_colors as f32;
                         for c_idx in 0..num_colors {
-                            let c = self
-                                .config
-                                .static_colors
-                                .get(c_idx)
-                                .copied()
-                                .unwrap_or([255, 255, 255]);
+                            let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
                             let y = bottom_y - h + (c_idx as f32 * slice_h);
                             let slice_rect = egui::Rect::from_min_max(
                                 egui::pos2(x, y),
@@ -1295,10 +1473,8 @@ impl VisualizerApp {
                                 egui::Color32::from_rgb(c[0], c[1], c[2]),
                             );
                         }
-                    } else if is_color_changing_vertical {
-                        self.draw_color_changing_bar(
-                            painter, bar_rect, x_norm(i), time, radius, true,
-                        );
+                    } else if is_animated_vertical {
+                        self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, true);
                     } else if is_gradient {
                         self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
@@ -1329,15 +1505,14 @@ impl VisualizerApp {
                     );
 
                     if is_vertical_stack {
-                        let num_colors = self.config.static_colors.len().max(1);
+                        let colors = &self.active_palettes.static_multi_colors;
+                        let num_colors = colors.len().max(1);
+                        if colors.is_empty() {
+                            continue;
+                        }
                         let slice_h = h / num_colors as f32;
                         for c_idx in 0..num_colors {
-                            let c = self
-                                .config
-                                .static_colors
-                                .get(c_idx)
-                                .copied()
-                                .unwrap_or([255, 255, 255]);
+                            let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
                             let y = top_y + (c_idx as f32 * slice_h);
                             let slice_rect = egui::Rect::from_min_max(
                                 egui::pos2(x, y),
@@ -1357,10 +1532,8 @@ impl VisualizerApp {
                                 egui::Color32::from_rgb(c[0], c[1], c[2]),
                             );
                         }
-                    } else if is_color_changing_vertical {
-                        self.draw_color_changing_bar(
-                            painter, bar_rect, x_norm(i), time, radius, true,
-                        );
+                    } else if is_animated_vertical {
+                        self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, true);
                     } else if is_gradient {
                         self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
@@ -1391,15 +1564,14 @@ impl VisualizerApp {
                     );
 
                     if is_vertical_stack {
-                        let num_colors = self.config.static_colors.len().max(1);
+                        let colors = &self.active_palettes.static_multi_colors;
+                        let num_colors = colors.len().max(1);
+                        if colors.is_empty() {
+                            continue;
+                        }
                         let slice_w = w / num_colors as f32;
                         for c_idx in 0..num_colors {
-                            let c = self
-                                .config
-                                .static_colors
-                                .get(c_idx)
-                                .copied()
-                                .unwrap_or([255, 255, 255]);
+                            let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
                             let x = left_x + (c_idx as f32 * slice_w);
                             let slice_rect = egui::Rect::from_min_max(
                                 egui::pos2(x, y),
@@ -1419,10 +1591,8 @@ impl VisualizerApp {
                                 egui::Color32::from_rgb(c[0], c[1], c[2]),
                             );
                         }
-                    } else if is_color_changing_vertical {
-                        self.draw_color_changing_bar(
-                            painter, bar_rect, x_norm(i), time, radius, false,
-                        );
+                    } else if is_animated_vertical {
+                        self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, false);
                     } else if is_gradient {
                         self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
@@ -1453,15 +1623,14 @@ impl VisualizerApp {
                     );
 
                     if is_vertical_stack {
-                        let num_colors = self.config.static_colors.len().max(1);
+                        let colors = &self.active_palettes.static_multi_colors;
+                        let num_colors = colors.len().max(1);
+                        if colors.is_empty() {
+                            continue;
+                        }
                         let slice_w = w / num_colors as f32;
                         for c_idx in 0..num_colors {
-                            let c = self
-                                .config
-                                .static_colors
-                                .get(c_idx)
-                                .copied()
-                                .unwrap_or([255, 255, 255]);
+                            let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
                             let x = right_x - w + (c_idx as f32 * slice_w);
                             let slice_rect = egui::Rect::from_min_max(
                                 egui::pos2(x, y),
@@ -1481,10 +1650,8 @@ impl VisualizerApp {
                                 egui::Color32::from_rgb(c[0], c[1], c[2]),
                             );
                         }
-                    } else if is_color_changing_vertical {
-                        self.draw_color_changing_bar(
-                            painter, bar_rect, x_norm(i), time, radius, false,
-                        );
+                    } else if is_animated_vertical {
+                        self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, false);
                     } else if is_gradient {
                         self.draw_gradient_bar(painter, bar_rect, rect);
                     } else {
@@ -1501,15 +1668,12 @@ impl VisualizerApp {
     // ─────────────────────────────────────────────────────────
 
     fn draw_track_info_settings(&mut self, ui: &mut egui::Ui) {
-        // Snapshot the font list first so the mutable borrow of self.config
-        // below doesn't collide with reading self.system_fonts.
         let system_fonts = self.system_fonts.clone();
         let cfg = &mut self.config.track_info;
 
-        // ── Cover Art ──
         ui.heading("Cover Art");
         ui.checkbox(&mut cfg.show_cover_art, "Show Cover Art");
-                if cfg.show_cover_art {
+        if cfg.show_cover_art {
             ui.add(egui::Slider::new(&mut cfg.cover_size, 40.0..=600.0).text("Size (px)"));
             ui.horizontal(|ui| {
                 ui.label("X Offset:");
@@ -1534,7 +1698,6 @@ impl VisualizerApp {
             ui.label("Drag to adjust, or click the number to type an exact value.");
         }
 
-        // ── Song Info Text ──
         ui.separator();
         ui.heading("Song Info Text");
 
@@ -1546,7 +1709,6 @@ impl VisualizerApp {
         ui.add(egui::Slider::new(&mut cfg.title_font_size, 6.0..=120.0).text("Title Font Size"));
         ui.add(egui::Slider::new(&mut cfg.artist_font_size, 6.0..=120.0).text("Artist Font Size"));
 
-        // Font picker: dropdown of every system font, plus a manual override.
         ui.horizontal(|ui| {
             ui.label("Font:");
             let selected_label = match &cfg.font_path {
@@ -1587,7 +1749,6 @@ impl VisualizerApp {
         });
         ui.label("System fonts live in C:\\Windows\\Fonts\\.");
 
-        // Text color
         ui.add_space(6.0);
         ui.label("Text color:");
         ui.horizontal(|ui| {
@@ -1609,7 +1770,6 @@ impl VisualizerApp {
 
         ui.add(egui::Slider::new(&mut cfg.opacity, 0..=255).text("Text Opacity"));
 
-        // Alignment / spacing
         ui.horizontal(|ui| {
             ui.label("Alignment:");
             ui.radio_value(&mut cfg.alignment, TrackTextAlign::Left, "Left");
@@ -1620,7 +1780,7 @@ impl VisualizerApp {
         ui.add(egui::Slider::new(&mut cfg.letter_spacing, -5.0..=20.0).text("Letter Spacing (px)"));
         ui.add(egui::Slider::new(&mut cfg.line_height, 0.5..=3.0).text("Line Height (x artist font)"));
 
-                ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
             ui.label("Text X Offset:");
             ui.add(
                 egui::DragValue::new(&mut cfg.text_x_offset)
@@ -1641,7 +1801,6 @@ impl VisualizerApp {
             );
         });
 
-        // ── Shadow (kept inline, part of the Song Info Text block) ──
         ui.add_space(6.0);
         ui.strong("Shadow");
         ui.checkbox(&mut cfg.shadow_enabled, "Enable Shadow");
@@ -1655,7 +1814,6 @@ impl VisualizerApp {
             });
         }
 
-        // ── Outline (kept inline, part of the Song Info Text block) ──
         ui.add_space(6.0);
         ui.strong("Outline");
         ui.checkbox(&mut cfg.outline_enabled, "Enable Outline");
@@ -1666,6 +1824,52 @@ impl VisualizerApp {
                 ui.color_edit_button_srgb(&mut cfg.outline_color);
             });
         }
+    }
+
+    fn draw_dynamic_palette_settings(
+        ui: &mut egui::Ui,
+        id_suffix: &str,
+        palette_size: &mut u8,
+        variants: &mut u8,
+        priority: &mut PalettePriority,
+        show_size: bool,
+        show_variants: bool,
+    ) {
+        ui.push_id(id_suffix, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Priority:");
+                egui::ComboBox::from_id_source("priority")
+                    .selected_text(priority.display_name())
+                    .show_ui(ui, |ui| {
+                        for p in PalettePriority::all() {
+                            ui.selectable_value(priority, p, p.display_name());
+                        }
+                    });
+            });
+            if show_size {
+                ui.add(egui::Slider::new(palette_size, 1..=3).text("Colors from Cover"));
+            }
+            if show_variants {
+                ui.add(egui::Slider::new(variants, 0..=5).text("Shade Variants per Color"));
+            }
+        });
+    }
+
+    fn draw_palette_preview(ui: &mut egui::Ui, colors: &[[u8; 3]]) {
+        ui.label("Current palette:");
+        ui.horizontal_wrapped(|ui| {
+            for c in colors {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(24.0, 24.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    4.0,
+                    egui::Color32::from_rgb(c[0], c[1], c[2]),
+                );
+            }
+        });
     }
 
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -1711,91 +1915,123 @@ impl VisualizerApp {
         ui.separator();
         ui.heading("Color Mode");
         ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut self.config.color_mode, ColorMode::Dynamic, "Dynamic (Album Art)");
             ui.radio_value(&mut self.config.color_mode, ColorMode::StaticSingle, "Static Single");
             ui.radio_value(&mut self.config.color_mode, ColorMode::StaticMultiple, "Static Multi");
             ui.radio_value(&mut self.config.color_mode, ColorMode::Gradient, "Gradient");
-            ui.radio_value(&mut self.config.color_mode, ColorMode::ColorChanging, "Color Changing");
+            ui.radio_value(&mut self.config.color_mode, ColorMode::Animated, "Animated");
         });
-
-        if self.config.color_mode == ColorMode::Dynamic {
-            ui.label("Bars tint automatically to the dominant color of the current album art.");
-
-            let count = self.smtc_session_count.load(Ordering::Relaxed);
-            ui.label(format!("SMTC sessions active: {}", count));
-            if count == 0 {
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 180, 80),
-                    "No SMTC sessions found. Is a supported player running?",
-                );
-                ui.label(
-                    "MusicBee needs the 'mb_MediaControl' plugin installed for SMTC support.",
-                );
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 180, 80),
-                    "Note: If this visualizer is running as Administrator, it cannot see media players running as normal users.",
-                );
-                ui.label("Check 'smtc_debug.log' in the app folder for diagnostic details.");
-            }
-
-            if let Some(info) = &self.track_info {
-                ui.label(format!("Now Playing: {} — {}", info.artist, info.title));
-            } else {
-                ui.label("No track detected via SMTC.");
-            }
-            ui.horizontal(|ui| {
-                ui.label("Current color:");
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(24.0, 24.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter().rect_filled(
-                    rect,
-                    4.0,
-                    egui::Color32::from_rgb(
-                        self.dynamic_color[0],
-                        self.dynamic_color[1],
-                        self.dynamic_color[2],
-                    ),
-                );
-            });
-        }
 
         ui.separator();
 
         match self.config.color_mode {
-            ColorMode::StaticSingle => {
+            ColorMode::Dynamic | ColorMode::StaticSingle => {
+                // ── Static Single ──
+                let is_dynamic = self.config.static_single_source.is_dynamic();
                 ui.horizontal(|ui| {
-                    ui.label("Bar Color:");
-                    ui.color_edit_button_srgb(&mut self.config.bar_color);
-                    if ui.button("Save Preset").clicked() {
-                        if !self.config.color_presets.contains(&self.config.bar_color) {
-                            self.config.color_presets.push(self.config.bar_color);
-                        }
+                    if ui.selectable_label(!is_dynamic, "Static").clicked() && is_dynamic {
+                        let colors = self.active_palettes.static_single_colors.clone();
+                        self.config.static_single_source = ColorSource::Static(
+                            if colors.is_empty() { vec![[255, 255, 255]] } else { colors },
+                        );
+                    }
+                    if ui
+                        .selectable_label(is_dynamic, "Dynamic (Album Art)")
+                        .clicked()
+                        && !is_dynamic
+                    {
+                        self.config.static_single_source = ColorSource::Dynamic {
+                            palette_size: 1,
+                            variants_per_color: 0,
+                            priority: PalettePriority::MostCommon,
+                        };
                     }
                 });
 
-                ui.label("Presets:");
-                ui.horizontal_wrapped(|ui| {
-                    for preset in &self.config.color_presets {
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(24.0, 24.0),
-                            egui::Sense::click(),
+                if is_dynamic {
+                    if let ColorSource::Dynamic { priority, .. } =
+                        &mut self.config.static_single_source
+                    {
+                        Self::draw_dynamic_palette_settings(
+                            ui,
+                            "ss",
+                            &mut 1u8,
+                            &mut 0u8,
+                            priority,
+                            false,
+                            false,
                         );
-                        if ui.is_rect_visible(rect) {
-                            let color =
-                                egui::Color32::from_rgb(preset[0], preset[1], preset[2]);
-                            ui.painter().rect_filled(rect, 4.0, color);
-                            if response.clicked() {
-                                self.config.bar_color = *preset;
+                    }
+                    Self::draw_palette_preview(ui, &self.active_palettes.static_single_colors);
+                    ui.label(
+                        "Single color picked from the album art using the selected priority.",
+                    );
+                } else {
+                    if let Some(colors) = self.config.static_single_source.static_colors_mut() {
+                        if colors.is_empty() {
+                            colors.push([255, 255, 255]);
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Bar Color:");
+                            ui.color_edit_button_srgb(&mut colors[0]);
+                        });
+                    }
+
+                    ui.label("Presets:");
+                    let mut chosen: Option<[u8; 3]> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for preset in &self.config.color_presets {
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(24.0, 24.0),
+                                egui::Sense::click(),
+                            );
+                            if ui.is_rect_visible(rect) {
+                                let color =
+                                    egui::Color32::from_rgb(preset[0], preset[1], preset[2]);
+                                ui.painter().rect_filled(rect, 4.0, color);
+                                if response.clicked() {
+                                    chosen = Some(*preset);
+                                }
+                            }
+                        }
+                    });
+                    if let Some(c) = chosen {
+                        self.config.static_single_source = ColorSource::Static(vec![c]);
+                    }
+                    if ui.button("Save Current Color as Preset").clicked() {
+                        if let Some(colors) = self.config.static_single_source.static_colors() {
+                            if let Some(c) = colors.first().copied() {
+                                if !self.config.color_presets.contains(&c) {
+                                    self.config.color_presets.push(c);
+                                }
                             }
                         }
                     }
-                });
+                }
             }
 
             ColorMode::StaticMultiple => {
-                ui.heading("Multiple Static Colors");
+                ui.heading("Multiple Colors");
+                let is_dynamic = self.config.static_multi_source.is_dynamic();
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(!is_dynamic, "Static").clicked() && is_dynamic {
+                        let colors = self.active_palettes.static_multi_colors.clone();
+                        self.config.static_multi_source = ColorSource::Static(
+                            if colors.is_empty() { vec![[255, 255, 255]] } else { colors },
+                        );
+                    }
+                    if ui
+                        .selectable_label(is_dynamic, "Dynamic (Album Art)")
+                        .clicked()
+                        && !is_dynamic
+                    {
+                        self.config.static_multi_source = ColorSource::Dynamic {
+                            palette_size: 3,
+                            variants_per_color: 0,
+                            priority: PalettePriority::MostCommon,
+                        };
+                    }
+                });
+
                 ui.horizontal_wrapped(|ui| {
                     ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Blocks, "Blocks");
                     ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Sequential, "Sequential");
@@ -1813,203 +2049,462 @@ impl VisualizerApp {
 
                 ui.add_space(5.0);
 
-                let mut to_remove = None;
-                for (i, color) in self.config.static_colors.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.color_edit_button_srgb(color);
-                        if ui.button("❌").clicked() {
-                            to_remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = to_remove {
-                    self.config.static_colors.remove(i);
-                }
-                if ui.button("➕ Add Color").clicked() {
-                    self.config.static_colors.push([255, 255, 255]);
-                }
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_preset_name);
-                    if ui.button("💾 Save Preset").clicked() {
-                        let name = if self.new_preset_name.trim().is_empty() {
-                            format!("Preset {}", self.config.static_multi_presets.len() + 1)
-                        } else {
-                            self.new_preset_name.clone()
-                        };
-                        self.config.static_multi_presets.push(StaticMultiPreset {
-                            name,
-                            colors: self.config.static_colors.clone(),
-                            mode: self.config.static_mode,
-                            bars_per_color: self.config.sequential_bars_per_color,
-                        });
-                        self.new_preset_name.clear();
+                if is_dynamic {
+                    if let ColorSource::Dynamic {
+                        palette_size,
+                        variants_per_color,
+                        priority,
+                    } = &mut self.config.static_multi_source
+                    {
+                        Self::draw_dynamic_palette_settings(
+                            ui,
+                            "sm",
+                            palette_size,
+                            variants_per_color,
+                            priority,
+                            true,
+                            true,
+                        );
                     }
-                });
-
-                ui.label("Presets:");
-                let mut preset_to_remove = None;
-                for (i, preset) in self.config.static_multi_presets.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.button(&preset.name).clicked() {
-                            self.config.static_colors = preset.colors.clone();
-                            self.config.static_mode = preset.mode;
-                            self.config.sequential_bars_per_color = preset.bars_per_color;
+                    Self::draw_palette_preview(ui, &self.active_palettes.static_multi_colors);
+                    ui.label(
+                        "Colors and variants are auto-assigned. Switch to Static to edit \
+                         individual colors.",
+                    );
+                } else {
+                    let mut to_remove = None;
+                    let num_colors = self
+                        .config
+                        .static_multi_source
+                        .static_colors()
+                        .map(|c| c.len())
+                        .unwrap_or(0);
+                    if let Some(colors) = self.config.static_multi_source.static_colors_mut() {
+                        for (i, color) in colors.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.color_edit_button_srgb(color);
+                                if num_colors > 1 && ui.button("❌").clicked() {
+                                    to_remove = Some(i);
+                                }
+                            });
                         }
-                        if ui.button("❌").clicked() {
-                            preset_to_remove = Some(i);
+                    }
+                    if let Some(i) = to_remove {
+                        if let Some(colors) = self.config.static_multi_source.static_colors_mut() {
+                            colors.remove(i);
+                        }
+                    }
+                    if ui.button("➕ Add Color").clicked() {
+                        if let Some(colors) = self.config.static_multi_source.static_colors_mut() {
+                            colors.push([255, 255, 255]);
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.new_preset_name);
+                        if ui.button("💾 Save Preset").clicked() {
+                            let name = if self.new_preset_name.trim().is_empty() {
+                                format!(
+                                    "Preset {}",
+                                    self.config.static_multi_presets.len() + 1
+                                )
+                            } else {
+                                self.new_preset_name.clone()
+                            };
+                            let colors = self
+                                .config
+                                .static_multi_source
+                                .static_colors()
+                                .map(|c| c.to_vec())
+                                .unwrap_or_default();
+                            self.config.static_multi_presets.push(StaticMultiPreset {
+                                name,
+                                colors,
+                                mode: self.config.static_mode,
+                                bars_per_color: self.config.sequential_bars_per_color,
+                            });
+                            self.new_preset_name.clear();
                         }
                     });
-                }
-                if let Some(i) = preset_to_remove {
-                    self.config.static_multi_presets.remove(i);
+
+                    ui.label("Presets:");
+                    let mut preset_to_remove = None;
+                    let mut preset_to_apply: Option<Vec<[u8; 3]>> = None;
+                    let mut preset_mode: Option<StaticDistributionMode> = None;
+                    let mut preset_bars: Option<usize> = None;
+                    for (i, preset) in self.config.static_multi_presets.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.button(&preset.name).clicked() {
+                                preset_to_apply = Some(preset.colors.clone());
+                                preset_mode = Some(preset.mode);
+                                preset_bars = Some(preset.bars_per_color);
+                            }
+                            if ui.button("❌").clicked() {
+                                preset_to_remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(colors) = preset_to_apply {
+                        self.config.static_multi_source = ColorSource::Static(colors);
+                        if let Some(m) = preset_mode {
+                            self.config.static_mode = m;
+                        }
+                        if let Some(b) = preset_bars {
+                            self.config.sequential_bars_per_color = b;
+                        }
+                    }
+                    if let Some(i) = preset_to_remove {
+                        self.config.static_multi_presets.remove(i);
+                    }
                 }
             }
 
             ColorMode::Gradient => {
                 ui.heading("Gradient Colors");
-                ui.add(egui::Slider::new(&mut self.config.gradient_angle, 0.0..=360.0).text("Angle (°)"));
-                ui.label("0° = horizontal, 90° = vertical, 45° = diagonal.");
-
-                let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 30.0),
-                    egui::Sense::click_and_drag(),
-                );
-                let painter = ui.painter();
-
-                let steps = 100;
-                for i in 0..steps {
-                    let t1 = i as f32 / steps as f32;
-                    let t2 = (i + 1) as f32 / steps as f32;
-                    let c1 = color::sample_gradient(&self.config.gradient_stops, t1);
-                    let x1 = rect.left() + rect.width() * t1;
-                    let x2 = rect.left() + rect.width() * t2;
-                    let r = egui::Rect::from_min_max(
-                        egui::pos2(x1, rect.top()),
-                        egui::pos2(x2, rect.bottom()),
-                    );
-                    painter.rect_filled(r, 0.0, egui::Color32::from_rgb(c1[0], c1[1], c1[2]));
-                }
-
-                let mut sort_stops = false;
-                for (i, stop) in self.config.gradient_stops.iter_mut().enumerate() {
-                    let x = rect.left() + rect.width() * stop.position;
-                    let stop_rect = egui::Rect::from_center_size(
-                        egui::pos2(x, rect.center().y),
-                        egui::vec2(12.0, 30.0),
-                    );
-                    let stop_response = ui.interact(
-                        stop_rect,
-                        ui.id().with("gradient_stop").with(i),
-                        egui::Sense::click_and_drag(),
-                    );
-
-                    if stop_response.dragged() {
-                        stop.position = (stop.position
-                            + stop_response.drag_delta().x / rect.width())
-                        .clamp(0.0, 1.0);
-                        sort_stops = true;
-                    }
-
-                    let handle_color =
-                        egui::Color32::from_rgb(stop.color[0], stop.color[1], stop.color[2]);
-                    painter.rect_filled(stop_rect, 2.0, handle_color);
-                    painter.rect_stroke(
-                        stop_rect,
-                        2.0_f32,
-                        egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
-                    );
-                }
-
-                if sort_stops {
-                    self.config
-                        .gradient_stops
-                        .sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap());
-                }
-
-                if response.double_clicked() {
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                        let c = color::sample_gradient(&self.config.gradient_stops, t);
-                        self.config
-                            .gradient_stops
-                            .push(GradientStop { color: c, position: t });
-                        self.config
-                            .gradient_stops
-                            .sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap());
-                    }
-                }
-                ui.label("Double-click the bar to add a color stop.");
-
-                let mut to_remove = None;
-                let current_len = self.config.gradient_stops.len();
-                for (i, stop) in self.config.gradient_stops.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.color_edit_button_srgb(&mut stop.color);
-                        ui.label(format!("Pos: {:.2}", stop.position));
-                        if current_len > 2 && ui.button("❌").clicked() {
-                            to_remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = to_remove {
-                    self.config.gradient_stops.remove(i);
-                }
-
-                ui.add_space(10.0);
+                let is_dynamic = self.config.gradient_source.is_dynamic();
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_preset_name);
-                    if ui.button("💾 Save Preset").clicked() {
-                        let name = if self.new_preset_name.trim().is_empty() {
-                            format!("Preset {}", self.config.gradient_presets.len() + 1)
-                        } else {
-                            self.new_preset_name.clone()
+                    if ui.selectable_label(!is_dynamic, "Static").clicked() && is_dynamic {
+                        let stops = self.active_palettes.gradient_stops.clone();
+                        self.config.gradient_source = GradientSource::Static(
+                            if stops.len() >= 2 {
+                                stops
+                            } else if stops.len() == 1 {
+                                vec![
+                                    stops[0].clone(),
+                                    GradientStop { color: stops[0].color, position: 1.0 },
+                                ]
+                            } else {
+                                vec![
+                                    GradientStop { color: [255, 0, 0], position: 0.0 },
+                                    GradientStop { color: [0, 0, 255], position: 1.0 },
+                                ]
+                            },
+                        );
+                    }
+                    if ui
+                        .selectable_label(is_dynamic, "Dynamic (Album Art)")
+                        .clicked()
+                        && !is_dynamic
+                    {
+                        self.config.gradient_source = GradientSource::Dynamic {
+                            palette_size: 2,
+                            variants_per_color: 0,
+                            priority: PalettePriority::MostCommon,
                         };
-                        self.config.gradient_presets.push(GradientPreset {
-                            name,
-                            stops: self.config.gradient_stops.clone(),
-                            angle: self.config.gradient_angle,
-                        });
-                        self.new_preset_name.clear();
                     }
                 });
 
-                ui.label("Presets:");
-                let mut preset_to_remove = None;
-                for (i, preset) in self.config.gradient_presets.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.button(&preset.name).clicked() {
-                            self.config.gradient_stops = preset.stops.clone();
-                            self.config.gradient_angle = preset.angle;
+                ui.add(egui::Slider::new(&mut self.config.gradient_angle, 0.0..=360.0).text("Angle (°)"));
+                ui.label("0° = horizontal, 90° = vertical, 45° = diagonal.");
+
+                if is_dynamic {
+                    if let GradientSource::Dynamic {
+                        palette_size,
+                        variants_per_color,
+                        priority,
+                    } = &mut self.config.gradient_source
+                    {
+                        Self::draw_dynamic_palette_settings(
+                            ui,
+                            "g",
+                            palette_size,
+                            variants_per_color,
+                            priority,
+                            true,
+                            true,
+                        );
+                    }
+                    let preview: Vec<[u8; 3]> = self
+                        .active_palettes
+                        .gradient_stops
+                        .iter()
+                        .map(|s| s.color)
+                        .collect();
+                    Self::draw_palette_preview(ui, &preview);
+                    ui.label(
+                        "Palette colors are evenly distributed as gradient stops. \
+                         Switch to Static to edit stop positions.",
+                    );
+                } else {
+                    // Preview bar
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let painter = ui.painter();
+                    let preview_stops = self
+                        .config
+                        .gradient_source
+                        .static_stops()
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let steps = 100;
+                    for i in 0..steps {
+                        let t1 = i as f32 / steps as f32;
+                        let t2 = (i + 1) as f32 / steps as f32;
+                        let c1 = color::sample_gradient(&preview_stops, t1);
+                        let x1 = rect.left() + rect.width() * t1;
+                        let x2 = rect.left() + rect.width() * t2;
+                        let r = egui::Rect::from_min_max(
+                            egui::pos2(x1, rect.top()),
+                            egui::pos2(x2, rect.bottom()),
+                        );
+                        painter.rect_filled(r, 0.0, egui::Color32::from_rgb(c1[0], c1[1], c1[2]));
+                    }
+
+                    let mut sort_stops = false;
+                    if let Some(stops) = self.config.gradient_source.static_stops_mut() {
+                        for (i, stop) in stops.iter_mut().enumerate() {
+                            let x = rect.left() + rect.width() * stop.position;
+                            let stop_rect = egui::Rect::from_center_size(
+                                egui::pos2(x, rect.center().y),
+                                egui::vec2(12.0, 30.0),
+                            );
+                            let stop_response = ui.interact(
+                                stop_rect,
+                                ui.id().with("gradient_stop").with(i),
+                                egui::Sense::click_and_drag(),
+                            );
+
+                            if stop_response.dragged() {
+                                stop.position = (stop.position
+                                    + stop_response.drag_delta().x / rect.width())
+                                .clamp(0.0, 1.0);
+                                sort_stops = true;
+                            }
+
+                            let handle_color =
+                                egui::Color32::from_rgb(stop.color[0], stop.color[1], stop.color[2]);
+                            painter.rect_filled(stop_rect, 2.0, handle_color);
+                            painter.rect_stroke(
+                                stop_rect,
+                                2.0_f32,
+                                egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+                            );
                         }
-                        if ui.button("❌").clicked() {
-                            preset_to_remove = Some(i);
+                    }
+
+                    if sort_stops {
+                        if let Some(stops) = self.config.gradient_source.static_stops_mut() {
+                            stops.sort_by(|a, b| {
+                                a.position.partial_cmp(&b.position).unwrap()
+                            });
+                        }
+                    }
+
+                    if response.double_clicked() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                            let c = color::sample_gradient(&preview_stops, t);
+                            if let Some(stops) =
+                                self.config.gradient_source.static_stops_mut()
+                            {
+                                stops.push(GradientStop { color: c, position: t });
+                                stops.sort_by(|a, b| {
+                                    a.position.partial_cmp(&b.position).unwrap()
+                                });
+                            }
+                        }
+                    }
+                    ui.label("Double-click the bar to add a color stop.");
+
+                    let mut to_remove = None;
+                    let current_len = self
+                        .config
+                        .gradient_source
+                        .static_stops()
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    if let Some(stops) = self.config.gradient_source.static_stops_mut() {
+                        for (i, stop) in stops.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.color_edit_button_srgb(&mut stop.color);
+                                ui.label(format!("Pos: {:.2}", stop.position));
+                                if current_len > 2 && ui.button("❌").clicked() {
+                                    to_remove = Some(i);
+                                }
+                            });
+                        }
+                    }
+                    if let Some(i) = to_remove {
+                        if let Some(stops) = self.config.gradient_source.static_stops_mut() {
+                            stops.remove(i);
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.new_preset_name);
+                        if ui.button("💾 Save Preset").clicked() {
+                            let name = if self.new_preset_name.trim().is_empty() {
+                                format!("Preset {}", self.config.gradient_presets.len() + 1)
+                            } else {
+                                self.new_preset_name.clone()
+                            };
+                            let stops = self
+                                .config
+                                .gradient_source
+                                .static_stops()
+                                .map(|s| s.to_vec())
+                                .unwrap_or_default();
+                            self.config.gradient_presets.push(GradientPreset {
+                                name,
+                                stops,
+                                angle: self.config.gradient_angle,
+                            });
+                            self.new_preset_name.clear();
                         }
                     });
-                }
-                if let Some(i) = preset_to_remove {
-                    self.config.gradient_presets.remove(i);
+
+                    ui.label("Presets:");
+                    let mut preset_to_remove = None;
+                    let mut preset_to_apply: Option<(Vec<GradientStop>, f32)> = None;
+                    for (i, preset) in self.config.gradient_presets.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.button(&preset.name).clicked() {
+                                preset_to_apply =
+                                    Some((preset.stops.clone(), preset.angle));
+                            }
+                            if ui.button("❌").clicked() {
+                                preset_to_remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some((stops, angle)) = preset_to_apply {
+                        self.config.gradient_source = GradientSource::Static(stops);
+                        self.config.gradient_angle = angle;
+                    }
+                    if let Some(i) = preset_to_remove {
+                        self.config.gradient_presets.remove(i);
+                    }
                 }
             }
 
-            ColorMode::ColorChanging => {
-                ui.heading("Color Changing");
-                let mut to_remove = None;
-                let current_len = self.config.color_change_colors.len();
-                for (i, color) in self.config.color_change_colors.iter_mut().enumerate() {
+            ColorMode::Animated => {
+                ui.heading("Animated");
+                let is_dynamic = self.config.animated_source.is_dynamic();
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(!is_dynamic, "Static").clicked() && is_dynamic {
+                        let colors = self.active_palettes.animated_colors.clone();
+                        self.config.animated_source = ColorSource::Static(
+                            if colors.is_empty() { vec![[255, 255, 255]] } else { colors },
+                        );
+                    }
+                    if ui
+                        .selectable_label(is_dynamic, "Dynamic (Album Art)")
+                        .clicked()
+                        && !is_dynamic
+                    {
+                        self.config.animated_source = ColorSource::Dynamic {
+                            palette_size: 3,
+                            variants_per_color: 0,
+                            priority: PalettePriority::MostCommon,
+                        };
+                    }
+                });
+
+                if is_dynamic {
+                    if let ColorSource::Dynamic {
+                        palette_size,
+                        variants_per_color,
+                        priority,
+                    } = &mut self.config.animated_source
+                    {
+                        Self::draw_dynamic_palette_settings(
+                            ui,
+                            "anim",
+                            palette_size,
+                            variants_per_color,
+                            priority,
+                            true,
+                            true,
+                        );
+                    }
+                    Self::draw_palette_preview(ui, &self.active_palettes.animated_colors);
+                    ui.label(
+                        "Palette colors cycle across the animated patterns. \
+                         Switch to Static to edit colors manually.",
+                    );
+                } else {
+                    let mut to_remove = None;
+                    let current_len = self
+                        .config
+                        .animated_source
+                        .static_colors()
+                        .map(|c| c.len())
+                        .unwrap_or(0);
+                    if let Some(colors) = self.config.animated_source.static_colors_mut() {
+                        for (i, color) in colors.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.color_edit_button_srgb(color);
+                                if current_len > 1 && ui.button("❌").clicked() {
+                                    to_remove = Some(i);
+                                }
+                            });
+                        }
+                    }
+                    if let Some(i) = to_remove {
+                        if let Some(colors) = self.config.animated_source.static_colors_mut() {
+                            colors.remove(i);
+                        }
+                    }
+                    if ui.button("➕ Add Color").clicked() {
+                        if let Some(colors) = self.config.animated_source.static_colors_mut() {
+                            colors.push([255, 255, 255]);
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
                     ui.horizontal(|ui| {
-                        ui.color_edit_button_srgb(color);
-                        if current_len > 2 && ui.button("❌").clicked() {
-                            to_remove = Some(i);
+                        ui.text_edit_singleline(&mut self.new_preset_name);
+                        if ui.button("💾 Save Preset").clicked() {
+                            let name = if self.new_preset_name.trim().is_empty() {
+                                format!(
+                                    "Preset {}",
+                                    self.config.color_change_presets.len() + 1
+                                )
+                            } else {
+                                self.new_preset_name.clone()
+                            };
+                            let colors = self
+                                .config
+                                .animated_source
+                                .static_colors()
+                                .map(|c| c.to_vec())
+                                .unwrap_or_default();
+                            self.config.color_change_presets.push(ColorChangePreset {
+                                name,
+                                colors,
+                                speed: self.config.color_change_speed,
+                            });
+                            self.new_preset_name.clear();
                         }
                     });
-                }
-                if let Some(i) = to_remove {
-                    self.config.color_change_colors.remove(i);
-                }
-                if ui.button("➕ Add Color").clicked() {
-                    self.config.color_change_colors.push([255, 255, 255]);
+
+                    ui.label("Presets:");
+                    let mut preset_to_remove = None;
+                    let mut preset_to_apply: Option<(Vec<[u8; 3]>, f32)> = None;
+                    for (i, preset) in self.config.color_change_presets.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.button(&preset.name).clicked() {
+                                preset_to_apply =
+                                    Some((preset.colors.clone(), preset.speed));
+                            }
+                            if ui.button("❌").clicked() {
+                                preset_to_remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some((colors, speed)) = preset_to_apply {
+                        self.config.animated_source = ColorSource::Static(colors);
+                        self.config.color_change_speed = speed;
+                    }
+                    if let Some(i) = preset_to_remove {
+                        self.config.color_change_presets.remove(i);
+                    }
                 }
 
                 ui.add(egui::Slider::new(&mut self.config.color_change_speed, 0.0..=1.0)
@@ -2152,45 +2647,7 @@ impl VisualizerApp {
                          (defaults to black — the original behaviour).",
                     );
                 }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_preset_name);
-                    if ui.button("💾 Save Preset").clicked() {
-                        let name = if self.new_preset_name.trim().is_empty() {
-                            format!("Preset {}", self.config.color_change_presets.len() + 1)
-                        } else {
-                            self.new_preset_name.clone()
-                        };
-                        self.config.color_change_presets.push(ColorChangePreset {
-                            name,
-                            colors: self.config.color_change_colors.clone(),
-                            speed: self.config.color_change_speed,
-                        });
-                        self.new_preset_name.clear();
-                    }
-                });
-
-                ui.label("Presets:");
-                let mut preset_to_remove = None;
-                for (i, preset) in self.config.color_change_presets.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.button(&preset.name).clicked() {
-                            self.config.color_change_colors = preset.colors.clone();
-                            self.config.color_change_speed = preset.speed;
-                        }
-                        if ui.button("❌").clicked() {
-                            preset_to_remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = preset_to_remove {
-                    self.config.color_change_presets.remove(i);
-                }
             }
-
-            _ => {}
         }
 
         ui.separator();
@@ -2208,7 +2665,6 @@ impl VisualizerApp {
             self.audio_update_interval
                 .store(self.config.audio_update_ms, Ordering::Relaxed);
             self.current_bars = vec![0.0; self.config.num_bars];
-            // Force the font cache to drop any stale custom font.
             self.loaded_font_path = Some("__reset__".to_string());
         }
     }
