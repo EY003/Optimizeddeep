@@ -38,17 +38,15 @@ pub fn spawn_smtc_listener(
     session_count: Arc<AtomicUsize>,
 ) {
     std::thread::spawn(move || {
+        log_smtc("SMTC: worker thread started.");
+
         // ── 1. Initialize COM on this worker thread ───────────
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
 
-        // ── 2. Acquire the session manager, retrying on failure ─
+        // ── 2. Acquire the session manager (no premature exit check) ─
         let manager = loop {
-            if !running.load(Ordering::Relaxed) {
-                log_smtc("SMTC: thread exiting before manager acquired.");
-                return;
-            }
             match GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
                 .and_then(|op| op.get())
             {
@@ -59,6 +57,11 @@ pub fn spawn_smtc_listener(
                 Err(e) => {
                     log_smtc(&format!("SMTC: failed to get session manager: {:?} (retrying)", e));
                     std::thread::sleep(Duration::from_millis(1000));
+                    // Still check if we should quit while retrying, to avoid a zombie thread.
+                    if running.load(Ordering::Relaxed) {
+                        log_smtc("SMTC: quitting while retrying manager acquisition.");
+                        return;
+                    }
                 }
             }
         };
@@ -144,9 +147,12 @@ pub fn spawn_smtc_listener(
 
             std::thread::sleep(Duration::from_millis(500));
         }
+
+        log_smtc("SMTC: polling loop exited. Thread shutting down.");
     });
 }
 
+// ... (the rest of the functions `pick_best_session`, `is_playing`, `read_thumbnail` remain unchanged)
 /// Prefer a session whose playback status is `Playing`; otherwise fall back
 /// to the first session that has any usable properties.
 fn pick_best_session(
