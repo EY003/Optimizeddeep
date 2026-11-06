@@ -836,8 +836,13 @@ impl eframe::App for VisualizerApp {
                 ui.set_min_size(rect.size());
 
                 if self.config.bg_opacity > 0 {
-                    let bg_color =
-                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, self.config.bg_opacity);
+                    let c = self.config.bg_color;
+                    let bg_color = egui::Color32::from_rgba_unmultiplied(
+                        c[0],
+                        c[1],
+                        c[2],
+                        self.config.bg_opacity,
+                    );
                     ui.painter().rect_filled(rect, 0.0, bg_color);
                 }
 
@@ -1385,6 +1390,23 @@ impl VisualizerApp {
         }
     }
 
+    /// Draw the configured outline around a single bar's bounding rectangle.
+    /// Uses `bar_radius` for corner rounding so it matches the fill shape.
+    fn draw_bar_outline(&self, painter: &egui::Painter, bar_rect: egui::Rect) {
+        if !self.config.bar_outline_enabled || self.config.bar_outline_thickness <= 0.0 {
+            return;
+        }
+        let c = self.config.bar_outline_color;
+        painter.rect_stroke(
+            bar_rect,
+            self.config.bar_radius,
+            egui::Stroke::new(
+                self.config.bar_outline_thickness,
+                egui::Color32::from_rgb(c[0], c[1], c[2]),
+            ),
+        );
+    }
+
     fn draw_bars(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 {
@@ -1481,6 +1503,7 @@ impl VisualizerApp {
                         let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
                         painter.rect_filled(bar_rect, radius, color);
                     }
+                    self.draw_bar_outline(painter, bar_rect);
                 }
             }
             VisualizerDirection::Down => {
@@ -1540,6 +1563,7 @@ impl VisualizerApp {
                         let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
                         painter.rect_filled(bar_rect, radius, color);
                     }
+                    self.draw_bar_outline(painter, bar_rect);
                 }
             }
             VisualizerDirection::Right => {
@@ -1599,6 +1623,7 @@ impl VisualizerApp {
                         let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
                         painter.rect_filled(bar_rect, radius, color);
                     }
+                    self.draw_bar_outline(painter, bar_rect);
                 }
             }
             VisualizerDirection::Left => {
@@ -1658,6 +1683,7 @@ impl VisualizerApp {
                         let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
                         painter.rect_filled(bar_rect, radius, color);
                     }
+                    self.draw_bar_outline(painter, bar_rect);
                 }
             }
         }
@@ -2652,7 +2678,27 @@ impl VisualizerApp {
 
         ui.separator();
         ui.heading("Appearance");
+        ui.horizontal(|ui| {
+            ui.label("Background Color:");
+            ui.color_edit_button_srgb(&mut self.config.bg_color);
+        });
         ui.add(egui::Slider::new(&mut self.config.bg_opacity, 0..=255).text("Background Opacity"));
+        ui.label("Opacity 0 = fully transparent overlay.");
+
+        ui.add_space(6.0);
+        ui.strong("Bar Outlines");
+        ui.checkbox(&mut self.config.bar_outline_enabled, "Enable Bar Outlines");
+        if self.config.bar_outline_enabled {
+            ui.add(
+                egui::Slider::new(&mut self.config.bar_outline_thickness, 0.5..=10.0)
+                    .text("Outline Thickness"),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Outline Color:");
+                ui.color_edit_button_srgb(&mut self.config.bar_outline_color);
+            });
+            ui.label("Outlines follow the bar corner radius and are drawn on top of fills.");
+        }
 
         ui.separator();
         self.draw_track_info_settings(ui);
