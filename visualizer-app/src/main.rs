@@ -1538,7 +1538,7 @@ impl VisualizerApp {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| p.clone()),
             };
-            egui::ComboBox::from_id_salt("track_font_select")
+            egui::ComboBox::from_id_source("track_font_select")
                 .selected_text(selected_label)
                 .show_ui(ui, |ui| {
                     if ui
