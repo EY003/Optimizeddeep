@@ -16,6 +16,9 @@ auto-palette = "0.5"
 crossbeam-channel = "0.5"
 dirs = "5.0"
 toml = "0.8"
+# NEW:
+arc-swap = "1.7"
+spin_sleep = "1.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
