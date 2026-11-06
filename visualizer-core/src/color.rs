@@ -160,27 +160,28 @@ fn is_vivid(c: [u8; 3]) -> bool {
 }
 
 fn brightest(colors: &[[u8; 3]]) -> [u8; 3] {
-    *colors
+    colors
         .iter()
+        .copied()
         .max_by(|a, b| {
             let la = 0.299 * a[0] as f32 + 0.587 * a[1] as f32 + 0.114 * a[2] as f32;
             let lb = 0.299 * b[0] as f32 + 0.587 * b[1] as f32 + 0.114 * b[2] as f32;
             la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
         })
-        .unwrap_or(&[255, 255, 255])
+        .unwrap_or([255, 255, 255])
 }
 
 fn most_vivid(colors: &[[u8; 3]]) -> [u8; 3] {
-    *colors
+    colors
         .iter()
+        .copied()
         .max_by(|a, b| {
-            vivid_score(a)
-                .partial_cmp(&vivid_score(b))
+            vivid_score(*a)
+                .partial_cmp(&vivid_score(*b))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .unwrap_or(&[255, 255, 255])
+        .unwrap_or([255, 255, 255])
 }
-
 fn vivid_score(c: [u8; 3]) -> f32 {
     let max = c[0].max(c[1]).max(c[2]) as f32;
     let min = c[0].min(c[1]).min(c[2]) as f32;
