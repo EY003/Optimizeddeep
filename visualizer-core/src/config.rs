@@ -245,34 +245,6 @@ impl Default for MotionSettings {
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TrackFontFamily {
-    Proportional,
-    Monospace,
-    /// Custom font loaded from `custom_font_path`.
-    Custom,
-}
-
-impl Default for TrackFontFamily {
-    fn default() -> Self {
-        TrackFontFamily::Proportional
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FontStyle {
-    Regular,
-    Bold,
-    Italic,
-    BoldItalic,
-}
-
-impl Default for FontStyle {
-    fn default() -> Self {
-        FontStyle::Regular
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrackTextColorMode {
     /// Use the user-chosen `static_color`.
     Static,
@@ -309,36 +281,41 @@ pub struct TrackInfoConfig {
     pub cover_x_offset: f32,
     pub cover_y_offset: f32,
 
+    // ── Visibility ──
+    pub show_title: bool,
+    pub show_artist: bool,
+
     // ── Font sizes (per-line, independent) ──
     pub title_font_size: f32,
     pub artist_font_size: f32,
 
     // ── Font selection (shared) ──
-    pub font_family: TrackFontFamily,
-    /// Path to a custom font file. Only used when `font_family == Custom`.
-    pub custom_font_path: Option<String>,
-    pub font_style: FontStyle,
+    /// `None` = egui's built-in proportional font.
+    /// `Some(path)` = a `.ttf`/`.otf` file (system font or custom).
+    /// Old configs used `custom_font_path`; the alias keeps them loading.
+    #[serde(default, alias = "custom_font_path")]
+    pub font_path: Option<String>,
 
-    // ── Text color (shared) ──
+    // ── Text color ──
     pub color_mode: TrackTextColorMode,
     pub static_color: [u8; 3],
     pub opacity: u8,
 
-    // ── Typography / positioning (shared) ──
+    // ── Typography / positioning ──
     pub letter_spacing: f32,
     pub line_height: f32,
     pub alignment: TrackTextAlign,
     pub text_x_offset: f32,
     pub text_y_offset: f32,
 
-    // ── Shadow (shared) ──
+    // ── Shadow ──
     pub shadow_enabled: bool,
     pub shadow_offset_x: f32,
     pub shadow_offset_y: f32,
     pub shadow_blur: f32,
     pub shadow_color: [u8; 3],
 
-    // ── Outline (shared) ──
+    // ── Outline ──
     pub outline_enabled: bool,
     pub outline_thickness: f32,
     pub outline_color: [u8; 3],
@@ -352,12 +329,13 @@ impl Default for TrackInfoConfig {
             cover_x_offset: 0.0,
             cover_y_offset: 0.0,
 
+            show_title: true,
+            show_artist: true,
+
             title_font_size: 21.0,
             artist_font_size: 30.0,
 
-            font_family: TrackFontFamily::Proportional,
-            custom_font_path: None,
-            font_style: FontStyle::Regular,
+            font_path: None,
 
             color_mode: TrackTextColorMode::Static,
             static_color: [220, 220, 220],
