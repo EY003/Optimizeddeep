@@ -1258,6 +1258,11 @@ impl VisualizerApp {
                 ui.label(
                     "MusicBee needs the 'mb_MediaControl' plugin installed for SMTC support.",
                 );
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 180, 80),
+                    "Note: If this visualizer is running as Administrator, it cannot see media players running as normal users.",
+                );
+                ui.label("Check 'smtc_debug.log' in the app folder for diagnostic details.");
             }
 
             if let Some(info) = &self.track_info {
