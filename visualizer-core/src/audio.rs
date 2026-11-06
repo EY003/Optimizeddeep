@@ -55,7 +55,7 @@ impl AudioEngine {
         // Wait for sample rate + device name before spawning analysis.
         let (device_name, sample_rate) = info_rx
             .recv()
-            .unwrap_or_else(|_| ("Unknown".to_string(), 48000));
+            .unwrap_or_else(|_| ("Unknown".to_string(), 48000.0));
 
         // ── Analysis thread ──────────────────────────────────────
         let settings_for_analysis = settings.clone();
@@ -87,7 +87,7 @@ fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("WASAPI: failed to get default render device: {e:?}");
-            let _ = info_tx.send(("Unknown".into(), 48000.0));
+            let _ = info_tx.send(("Unknown".to_string(), 48000.0));
             return;
         }
     };
@@ -95,7 +95,7 @@ fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("WASAPI: failed to get IAudioClient: {e:?}");
-            let _ = info_tx.send(("Unknown".into(), 48000.0));
+            let _ = info_tx.send(("Unknown".to_string(), 48000.0));
             return;
         }
     };
@@ -117,9 +117,12 @@ fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
     let blockalign = format.get_blockalign() as usize;
     let samples_per_frame = (blockalign / 4).max(1);
 
+    // `get_periods()` returns `(i64, i64)` — both values are REFERENCE_TIME
+    // in 100 ns units (Windows convention), *not* `Duration`. Fall back to
+    // 100_000 units = 10 ms if the query fails.
     let (_, min_time) = match audio_client.get_periods() {
         Ok(p) => p,
-        Err(_) => (Duration::from_millis(10), Duration::from_millis(10)),
+        Err(_) => (100_000i64, 100_000i64),
     };
 
     if audio_client
@@ -236,8 +239,6 @@ fn analysis_loop(
         let poll_period = Duration::from_secs_f32(1.0 / current.poll_rate_hz.max(1.0));
 
         // ── 2. Drain whatever samples have arrived ──
-        // Non-blocking drain; we intentionally do NOT wait, because
-        // the poll rate dictates when we process.
         while let Ok(chunk) = sample_rx.try_recv() {
             history.extend_from_slice(&chunk);
         }
@@ -273,6 +274,7 @@ fn analysis_loop(
 
 struct AudioProcessor {
     settings: Arc<ArcSwap<AudioSettings>>,
+    sample_rate: f32,
 
     // FFT state
     cached_fft_size: usize,
@@ -336,6 +338,7 @@ impl AudioProcessor {
 
         let mut lp = Self {
             settings,
+            sample_rate,
             cached_fft_size: fft_size,
             fft,
             window,
@@ -367,7 +370,7 @@ impl AudioProcessor {
     /// Resize / re-tune per-bar state if the current settings changed
     /// since last call. Called at the top of `process`.
     fn update_initial_state(&mut self, s: &AudioSettings) {
-        // FFT size changed → re-plan FFT + window + bin ranges
+        // FFT size changed → re-plan FFT + window + bin ranges.
         if s.fft_size != self.cached_fft_size {
             let mut planner = RealFftPlanner::new();
             self.fft = planner.plan_fft_forward(s.fft_size);
@@ -378,46 +381,38 @@ impl AudioProcessor {
             self.cached_window_fn = s.window_function;
             self.window = make_window(s.window_function, s.fft_size);
             self.bin_ranges = make_bin_ranges(
-                s.fft_size, s.num_bars, s.frequency_scaling, /* sample_rate passed in process */
-                self.sample_rate_placeholder(),
+                s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate,
             );
         }
 
-        // Window function changed without FFT size change
+        // Window function changed without FFT size change.
         if s.window_function != self.cached_window_fn {
             self.cached_window_fn = s.window_function;
             self.window = make_window(s.window_function, s.fft_size);
         }
 
-        // Bin mapping inputs changed
+        // Bin mapping inputs changed.
         if s.num_bars != self.cached_num_bars || s.frequency_scaling != self.cached_scaling {
             self.cached_num_bars = s.num_bars;
             self.cached_scaling = s.frequency_scaling;
             self.bin_ranges = make_bin_ranges(
-                s.fft_size, s.num_bars, s.frequency_scaling,
-                self.sample_rate_placeholder(),
+                s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate,
             );
             self.resize_bar_state(s.num_bars);
         }
     }
 
-    fn sample_rate_placeholder(&self) -> f32 {
-        // We store `sample_rate` in `lp_alpha` indirectly; recover via
-        // the coefficient. Simple enough — see `new`.
-        // Actually we already computed alpha with the true sample rate,
-        // so this method is only used to keep the signature clean; the
-        // true rate is fetched from the settings-independent store below.
-        48000.0
-    }
-
+    /// Resize per-bar state vectors so their length equals `n`.
+    /// `bin_ranges` is always regenerated by `update_initial_state`
+    /// before this is called, so we don't touch it here.
     fn resize_bar_state(&mut self, n: usize) {
         self.bar_values.resize(n, 0.0);
         self.bar_peaks.resize(n, 0.0);
         self.bar_velocities.resize(n, 0.0);
         self.peak_hold_remaining.resize(n, 0.0);
-        for f in self.frame_history.iter_mut() { f.resize(n, 0.0); }
-        for i in self.bin_ranges.len()..n { self.bin_ranges.push((1, 2)); }
-        self.bin_ranges.truncate(n);
+        for f in self.frame_history.iter_mut() {
+            f.resize(n, 0.0);
+        }
     }
 
     fn process(
@@ -465,9 +460,6 @@ impl AudioProcessor {
         let agc_gain = self.agc_envelope.clamp(0.01, 100.0);
 
         // ── Pre-FFT gain ──────────────────────────────────────
-        // The user's raw_gain multiplies the *magnitudes* (equivalent
-        // to pre-FFT gain for linear FFT). Kept here so the dB floor
-        // logic is applied to the gated signal.
         let user_gain = s.raw_gain.max(0.01) * agc_gain;
 
         // ── FFT ───────────────────────────────────────────────
@@ -504,9 +496,6 @@ impl AudioProcessor {
         }
 
         // ── dB mapping with sensitivity shift ─────────────────
-        // Sensitivity 0..100 → gamma of raw_gain already applied above;
-        // additionally lower the effective noise floor so quiet material
-        // is visible.
         let sens_norm = (s.sensitivity / 100.0).clamp(0.0, 1.0);
         let min_db_effective = s.min_decibels - (sens_norm - 0.5) * 20.0;
         let db_span = (s.max_decibels - min_db_effective).max(1.0);
@@ -522,7 +511,9 @@ impl AudioProcessor {
 
         // ── Temporal smoothing (average_size) ─────────────────
         let avg = s.average_size.max(1);
-        if self.frame_history.len() >= avg { self.frame_history.pop_front(); }
+        if self.frame_history.len() >= avg {
+            self.frame_history.pop_front();
+        }
         self.frame_history.push_back(mapped);
         let smoothed: Vec<f32> = {
             let n = num_bars;
@@ -533,7 +524,9 @@ impl AudioProcessor {
                     out[i] += frame[i];
                 }
             }
-            for x in &mut out { *x /= count.max(1.0); }
+            for x in &mut out {
+                *x /= count.max(1.0);
+            }
             out
         };
 
@@ -567,11 +560,11 @@ impl AudioProcessor {
             let prev = self.bar_values[i];
 
             if input > prev {
-                // Attack — reset gravity velocity
+                // Attack — reset gravity velocity.
                 self.bar_velocities[i] = 0.0;
                 self.bar_values[i] = prev + (input - prev) * attack_alpha;
             } else {
-                // Decay
+                // Decay.
                 self.bar_values[i] = match s.decay_mode {
                     DecayMode::Linear => (prev - dt / decay_s).max(input),
                     DecayMode::Exponential => {
@@ -595,8 +588,6 @@ impl AudioProcessor {
             } else if self.peak_hold_remaining[i] > 0.0 {
                 self.peak_hold_remaining[i] -= dt;
             } else {
-                // Peak falls linearly (independent of decay mode —
-                // keeps the peak marker predictable).
                 let fall_rate = 1.0 / decay_s;
                 self.bar_peaks[i] =
                     (self.bar_peaks[i] - dt * fall_rate).max(self.bar_values[i]);
@@ -629,15 +620,18 @@ impl AudioProcessor {
         };
 
         let sensitivity = s.beat_detection_sensitivity.clamp(0.0, 1.0);
-        let threshold = local_avg * s.energy_threshold_multiplier.max(1.0)
+        let threshold = local_avg
+            * s.energy_threshold_multiplier.max(1.0)
             * (1.0 - sensitivity * 0.5);
         let is_beat = energy > threshold
-            && energy > local_avg * 1.05  // reject steady tones
+            && energy > local_avg * 1.05
             && self.time_elapsed - self.beat_times.back().copied().unwrap_or(0.0) > 0.15;
 
         if is_beat {
             self.beat_times.push_back(self.time_elapsed);
-            while self.beat_times.len() > 8 { self.beat_times.pop_front(); }
+            while self.beat_times.len() > 8 {
+                self.beat_times.pop_front();
+            }
             self.recompute_bpm();
         }
 
@@ -645,13 +639,18 @@ impl AudioProcessor {
         // continuous phase even during silence.
         let period_s = if self.bpm > 20.0 { 60.0 / self.bpm } else { 0.5 };
         self.phase += dt / period_s;
-        if self.phase >= 1.0 { self.phase -= 1.0; }
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
 
-        // Phase-lock nudge: pull the phase toward the nearest beat
-        // boundary proportional to `bpm_phase_smoothing`.
+        // Phase-lock nudge.
         if is_beat && s.bpm_lock_enabled {
             let gain = s.bpm_phase_smoothing.clamp(0.0, 1.0);
-            let error = if self.phase < 0.5 { -self.phase } else { 1.0 - self.phase };
+            let error = if self.phase < 0.5 {
+                -self.phase
+            } else {
+                1.0 - self.phase
+            };
             self.phase = (self.phase + error * gain).rem_euclid(1.0);
         }
 
@@ -663,7 +662,6 @@ impl AudioProcessor {
             self.bpm = 0.0;
             return;
         }
-        // Median inter-beat interval.
         let mut intervals: Vec<f64> = self
             .beat_times
             .iter()
@@ -684,7 +682,7 @@ impl AudioProcessor {
 
 fn make_window(kind: WindowFunction, n: usize) -> Vec<f32> {
     let mut w = vec![0.0f32; n];
-    let denom = (n.saturating_sub(1)).max(1) as f32;
+    let denom = n.saturating_sub(1).max(1) as f32;
     let two_pi = 2.0 * std::f32::consts::PI;
     for (i, x) in w.iter_mut().enumerate() {
         let t = i as f32 / denom;
