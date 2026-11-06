@@ -6,14 +6,16 @@ use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use arc_swap::ArcSwap;
 use visualizer_core::{
-    audio::AudioEngine,
+    audio::{AudioEngine, BarFrame},
     color,
     config::{
-        AppConfig, BlendMode, ColorChangePreset, ColorMode, ColorSource, FrequencyDirection,
-        GradientPreset, GradientSource, GradientStop, MotionShape, PalettePriority,
-        StaticDistributionMode, StaticMultiPreset, TrackInfoConfig, TrackTextAlign,
-        TrackTextColorMode, VisualizerDirection,
+        AppConfig, BlendMode, ColorChangePreset, ColorMode, ColorSource, DecayMode,
+        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
+        MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
+        TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VisualizerDirection,
+        WindowFunction,
     },
     musicbee::{self, TrackInfo},
 };
@@ -193,19 +195,23 @@ fn compute_track_id(bytes: Option<&[u8]>, artist: &str, title: &str) -> u64 {
 
 struct VisualizerApp {
     config: AppConfig,
+
+    // Per-bar output of the audio engine
     current_bars: Vec<f32>,
-    audio_rx: crossbeam_channel::Receiver<Vec<f32>>,
-    audio_target_bars: Arc<std::sync::atomic::AtomicUsize>,
-    audio_update_interval: Arc<std::sync::atomic::AtomicU64>,
+    current_peaks: Vec<f32>,
+    last_bpm: f32,
+
+    // Audio engine plumbing
+    audio_rx: crossbeam_channel::Receiver<BarFrame>,
+    audio_settings: Arc<ArcSwap<visualizer_core::config::AudioSettings>>,
     should_quit: Arc<AtomicBool>,
 
     show_settings: bool,
     current_fps: f32,
     is_passthrough_set: bool,
-
     last_frame_time: Instant,
-
     new_preset_name: String,
+    last_decay_mode: DecayMode,
 
     // ── Track / cover art state ──────────────────────────────
     track_rx: crossbeam_channel::Receiver<TrackInfo>,
@@ -235,13 +241,12 @@ struct VisualizerApp {
 impl VisualizerApp {
     fn new() -> Self {
         let config = AppConfig::load();
-        let engine = AudioEngine::new(config.num_bars, config.audio_update_ms);
+        let engine = AudioEngine::new(config.audio.clone());
 
         let should_quit = Arc::new(AtomicBool::new(false));
         musicbee::log_smtc("APP: Initializing VisualizerApp. should_quit = false.");
 
-        let audio_target_bars = engine.target_bars.clone();
-        let audio_update_interval = engine.update_interval_ms.clone();
+        let audio_settings = engine.settings.clone();
 
         let (track_tx, track_rx) = crossbeam_channel::unbounded();
         let smtc_session_count = Arc::new(AtomicUsize::new(0));
@@ -271,12 +276,15 @@ impl VisualizerApp {
         hotkey_manager.register(hotkey).unwrap();
 
         let system_fonts = list_system_fonts();
+        let num_bars = config.audio.num_bars;
+        let last_decay_mode = config.audio.decay_mode;
 
         Self {
-            current_bars: vec![0.0; config.num_bars],
-            audio_rx: engine.data_rx,
-            audio_target_bars,
-            audio_update_interval,
+            current_bars: vec![0.0; num_bars],
+            current_peaks: vec![0.0; num_bars],
+            last_bpm: 0.0,
+            audio_rx: engine.frame_rx,
+            audio_settings,
             config,
             should_quit,
             show_settings: true,
@@ -284,6 +292,7 @@ impl VisualizerApp {
             is_passthrough_set: false,
             last_frame_time: Instant::now(),
             new_preset_name: String::new(),
+            last_decay_mode,
 
             track_rx,
             track_info: None,
@@ -770,6 +779,9 @@ impl eframe::App for VisualizerApp {
             self.reload_custom_font(ctx);
         }
 
+        // ── Push current AudioSettings to the engine ──
+        self.audio_settings.store(Arc::new(self.config.audio.clone()));
+
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id {
                 self.show_settings = true;
@@ -797,31 +809,25 @@ impl eframe::App for VisualizerApp {
             return;
         }
 
-        let current_target = self.audio_target_bars.load(Ordering::Relaxed);
-        if current_target != self.config.num_bars {
-            self.audio_target_bars.store(self.config.num_bars, Ordering::Relaxed);
-            self.current_bars.resize(self.config.num_bars, 0.0);
+        // Resize UI-side bar buffers if num_bars changed.
+        let n_bars = self.config.audio.num_bars;
+        if self.current_bars.len() != n_bars {
+            self.current_bars.resize(n_bars, 0.0);
+            self.current_peaks.resize(n_bars, 0.0);
         }
 
-        let current_interval = self.audio_update_interval.load(Ordering::Relaxed);
-        if current_interval != self.config.audio_update_ms {
-            self.audio_update_interval.store(self.config.audio_update_ms, Ordering::Relaxed);
+        // ── Receive the latest frame from the audio engine ──
+        let mut latest: Option<BarFrame> = None;
+        while let Ok(frame) = self.audio_rx.try_recv() {
+            latest = Some(frame);
         }
-
-        let mut latest_bars: Option<Vec<f32>> = None;
-        while let Ok(bars) = self.audio_rx.try_recv() {
-            latest_bars = Some(bars);
-        }
-        if let Some(bars) = latest_bars {
-            let limit = self.current_bars.len().min(bars.len());
+        if let Some(frame) = latest {
+            let limit = self.current_bars.len().min(frame.values.len());
             for i in 0..limit {
-                let val = bars[i];
-                if val > self.current_bars[i] {
-                    self.current_bars[i] = val;
-                } else {
-                    self.current_bars[i] = self.current_bars[i] * 0.8 + val * 0.2;
-                }
+                self.current_bars[i] = frame.values[i];
+                self.current_peaks[i] = frame.peaks[i];
             }
+            self.last_bpm = frame.bpm;
         }
 
         if !self.is_passthrough_set {
@@ -863,7 +869,7 @@ impl eframe::App for VisualizerApp {
         if self.show_settings {
             let settings_builder = egui::ViewportBuilder::default()
                 .with_title("Visualizer Settings")
-                .with_inner_size([430.0, 950.0])
+                .with_inner_size([460.0, 980.0])
                 .with_decorations(true)
                 .with_resizable(true)
                 .with_always_on_top();
@@ -1390,8 +1396,6 @@ impl VisualizerApp {
         }
     }
 
-    /// Draw the configured outline around a single bar's bounding rectangle.
-    /// Uses `bar_radius` for corner rounding so it matches the fill shape.
     fn draw_bar_outline(&self, painter: &egui::Painter, bar_rect: egui::Rect) {
         if !self.config.bar_outline_enabled || self.config.bar_outline_thickness <= 0.0 {
             return;
@@ -1424,7 +1428,6 @@ impl VisualizerApp {
         let stride = bar_width + gap;
         let total_size = visual_num_bars as f32 * stride - gap;
 
-        let sensitivity_multiplier = self.config.sensitivity / 30.0;
         let max_h = self.config.max_bar_height;
         let radius = self.config.bar_radius;
         let freq_dir = self.config.frequency_direction;
@@ -1445,6 +1448,8 @@ impl VisualizerApp {
             }
         };
 
+        // NOTE: sensitivity is now applied inside the audio engine, so
+        // the display just multiplies by the rect dimension.
         match self.config.visualizer_direction {
             VisualizerDirection::Up => {
                 let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
@@ -1453,57 +1458,57 @@ impl VisualizerApp {
 
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
-                    let mut h = self.current_bars[idx] * sensitivity_multiplier * rect_h;
-                    if max_h > 0.0 {
-                        h = h.min(max_h);
-                    }
-                    if h <= 0.0 {
-                        continue;
-                    }
+                    let mut h = self.current_bars[idx] * rect_h;
+                    if max_h > 0.0 { h = h.min(max_h); }
 
                     let x = start_x + i as f32 * stride;
-                    let bar_rect = egui::Rect::from_min_max(
-                        egui::pos2(x, bottom_y - h),
-                        egui::pos2(x + bar_width, bottom_y),
-                    );
 
-                    if is_vertical_stack {
-                        let colors = &self.active_palettes.static_multi_colors;
-                        let num_colors = colors.len().max(1);
-                        if colors.is_empty() {
-                            continue;
-                        }
-                        let slice_h = h / num_colors as f32;
-                        for c_idx in 0..num_colors {
-                            let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
-                            let y = bottom_y - h + (c_idx as f32 * slice_h);
-                            let slice_rect = egui::Rect::from_min_max(
-                                egui::pos2(x, y),
-                                egui::pos2(x + bar_width, y + slice_h),
-                            );
-                            let mut r = egui::Rounding::ZERO;
-                            if c_idx == num_colors - 1 {
-                                r.nw = radius;
-                                r.ne = radius;
-                            } else if c_idx == 0 {
-                                r.sw = radius;
-                                r.se = radius;
+                    if h > 0.0 {
+                        let bar_rect = egui::Rect::from_min_max(
+                            egui::pos2(x, bottom_y - h),
+                            egui::pos2(x + bar_width, bottom_y),
+                        );
+
+                        if is_vertical_stack {
+                            let colors = &self.active_palettes.static_multi_colors;
+                            let num_colors = colors.len().max(1);
+                            if !colors.is_empty() {
+                                let slice_h = h / num_colors as f32;
+                                for c_idx in 0..num_colors {
+                                    let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
+                                    let y = bottom_y - h + (c_idx as f32 * slice_h);
+                                    let slice_rect = egui::Rect::from_min_max(
+                                        egui::pos2(x, y),
+                                        egui::pos2(x + bar_width, y + slice_h),
+                                    );
+                                    let mut r = egui::Rounding::ZERO;
+                                    if c_idx == num_colors - 1 { r.nw = radius; r.ne = radius; }
+                                    else if c_idx == 0 { r.sw = radius; r.se = radius; }
+                                    painter.rect_filled(slice_rect, r, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                                }
                             }
-                            painter.rect_filled(
-                                slice_rect,
-                                r,
-                                egui::Color32::from_rgb(c[0], c[1], c[2]),
-                            );
+                        } else if is_animated_vertical {
+                            self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, true);
+                        } else if is_gradient {
+                            self.draw_gradient_bar(painter, bar_rect, rect);
+                        } else {
+                            let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
+                            painter.rect_filled(bar_rect, radius, color);
                         }
-                    } else if is_animated_vertical {
-                        self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, true);
-                    } else if is_gradient {
-                        self.draw_gradient_bar(painter, bar_rect, rect);
-                    } else {
-                        let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
-                        painter.rect_filled(bar_rect, radius, color);
+                        self.draw_bar_outline(painter, bar_rect);
                     }
-                    self.draw_bar_outline(painter, bar_rect);
+
+                    // Peak marker — independent of the bar's current height.
+                    let mut peak_h = self.current_peaks[idx] * rect_h;
+                    if max_h > 0.0 { peak_h = peak_h.min(max_h); }
+                    if peak_h > 0.001 {
+                        let peak_rect = egui::Rect::from_min_max(
+                            egui::pos2(x, bottom_y - peak_h - 1.5),
+                            egui::pos2(x + bar_width, bottom_y - peak_h + 1.5),
+                        );
+                        let color = self.get_bar_color(i, visual_num_bars, peak_rect, rect, time);
+                        painter.rect_filled(peak_rect, 1.0, color);
+                    }
                 }
             }
             VisualizerDirection::Down => {
@@ -1513,57 +1518,56 @@ impl VisualizerApp {
 
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
-                    let mut h = self.current_bars[idx] * sensitivity_multiplier * rect_h;
-                    if max_h > 0.0 {
-                        h = h.min(max_h);
-                    }
-                    if h <= 0.0 {
-                        continue;
-                    }
+                    let mut h = self.current_bars[idx] * rect_h;
+                    if max_h > 0.0 { h = h.min(max_h); }
 
                     let x = start_x + i as f32 * stride;
-                    let bar_rect = egui::Rect::from_min_max(
-                        egui::pos2(x, top_y),
-                        egui::pos2(x + bar_width, top_y + h),
-                    );
 
-                    if is_vertical_stack {
-                        let colors = &self.active_palettes.static_multi_colors;
-                        let num_colors = colors.len().max(1);
-                        if colors.is_empty() {
-                            continue;
-                        }
-                        let slice_h = h / num_colors as f32;
-                        for c_idx in 0..num_colors {
-                            let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
-                            let y = top_y + (c_idx as f32 * slice_h);
-                            let slice_rect = egui::Rect::from_min_max(
-                                egui::pos2(x, y),
-                                egui::pos2(x + bar_width, y + slice_h),
-                            );
-                            let mut r = egui::Rounding::ZERO;
-                            if c_idx == 0 {
-                                r.nw = radius;
-                                r.ne = radius;
-                            } else if c_idx == num_colors - 1 {
-                                r.sw = radius;
-                                r.se = radius;
+                    if h > 0.0 {
+                        let bar_rect = egui::Rect::from_min_max(
+                            egui::pos2(x, top_y),
+                            egui::pos2(x + bar_width, top_y + h),
+                        );
+
+                        if is_vertical_stack {
+                            let colors = &self.active_palettes.static_multi_colors;
+                            let num_colors = colors.len().max(1);
+                            if !colors.is_empty() {
+                                let slice_h = h / num_colors as f32;
+                                for c_idx in 0..num_colors {
+                                    let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
+                                    let y = top_y + (c_idx as f32 * slice_h);
+                                    let slice_rect = egui::Rect::from_min_max(
+                                        egui::pos2(x, y),
+                                        egui::pos2(x + bar_width, y + slice_h),
+                                    );
+                                    let mut r = egui::Rounding::ZERO;
+                                    if c_idx == 0 { r.nw = radius; r.ne = radius; }
+                                    else if c_idx == num_colors - 1 { r.sw = radius; r.se = radius; }
+                                    painter.rect_filled(slice_rect, r, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                                }
                             }
-                            painter.rect_filled(
-                                slice_rect,
-                                r,
-                                egui::Color32::from_rgb(c[0], c[1], c[2]),
-                            );
+                        } else if is_animated_vertical {
+                            self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, true);
+                        } else if is_gradient {
+                            self.draw_gradient_bar(painter, bar_rect, rect);
+                        } else {
+                            let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
+                            painter.rect_filled(bar_rect, radius, color);
                         }
-                    } else if is_animated_vertical {
-                        self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, true);
-                    } else if is_gradient {
-                        self.draw_gradient_bar(painter, bar_rect, rect);
-                    } else {
-                        let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
-                        painter.rect_filled(bar_rect, radius, color);
+                        self.draw_bar_outline(painter, bar_rect);
                     }
-                    self.draw_bar_outline(painter, bar_rect);
+
+                    let mut peak_h = self.current_peaks[idx] * rect_h;
+                    if max_h > 0.0 { peak_h = peak_h.min(max_h); }
+                    if peak_h > 0.001 {
+                        let peak_rect = egui::Rect::from_min_max(
+                            egui::pos2(x, top_y + peak_h - 1.5),
+                            egui::pos2(x + bar_width, top_y + peak_h + 1.5),
+                        );
+                        let color = self.get_bar_color(i, visual_num_bars, peak_rect, rect, time);
+                        painter.rect_filled(peak_rect, 1.0, color);
+                    }
                 }
             }
             VisualizerDirection::Right => {
@@ -1573,57 +1577,56 @@ impl VisualizerApp {
 
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
-                    let mut w = self.current_bars[idx] * sensitivity_multiplier * rect_w;
-                    if max_h > 0.0 {
-                        w = w.min(max_h);
-                    }
-                    if w <= 0.0 {
-                        continue;
-                    }
+                    let mut w = self.current_bars[idx] * rect_w;
+                    if max_h > 0.0 { w = w.min(max_h); }
 
                     let y = start_y + i as f32 * stride;
-                    let bar_rect = egui::Rect::from_min_max(
-                        egui::pos2(left_x, y),
-                        egui::pos2(left_x + w, y + bar_width),
-                    );
 
-                    if is_vertical_stack {
-                        let colors = &self.active_palettes.static_multi_colors;
-                        let num_colors = colors.len().max(1);
-                        if colors.is_empty() {
-                            continue;
-                        }
-                        let slice_w = w / num_colors as f32;
-                        for c_idx in 0..num_colors {
-                            let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
-                            let x = left_x + (c_idx as f32 * slice_w);
-                            let slice_rect = egui::Rect::from_min_max(
-                                egui::pos2(x, y),
-                                egui::pos2(x + slice_w, y + bar_width),
-                            );
-                            let mut r = egui::Rounding::ZERO;
-                            if c_idx == num_colors - 1 {
-                                r.ne = radius;
-                                r.se = radius;
-                            } else if c_idx == 0 {
-                                r.nw = radius;
-                                r.sw = radius;
+                    if w > 0.0 {
+                        let bar_rect = egui::Rect::from_min_max(
+                            egui::pos2(left_x, y),
+                            egui::pos2(left_x + w, y + bar_width),
+                        );
+
+                        if is_vertical_stack {
+                            let colors = &self.active_palettes.static_multi_colors;
+                            let num_colors = colors.len().max(1);
+                            if !colors.is_empty() {
+                                let slice_w = w / num_colors as f32;
+                                for c_idx in 0..num_colors {
+                                    let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
+                                    let x = left_x + (c_idx as f32 * slice_w);
+                                    let slice_rect = egui::Rect::from_min_max(
+                                        egui::pos2(x, y),
+                                        egui::pos2(x + slice_w, y + bar_width),
+                                    );
+                                    let mut r = egui::Rounding::ZERO;
+                                    if c_idx == num_colors - 1 { r.ne = radius; r.se = radius; }
+                                    else if c_idx == 0 { r.nw = radius; r.sw = radius; }
+                                    painter.rect_filled(slice_rect, r, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                                }
                             }
-                            painter.rect_filled(
-                                slice_rect,
-                                r,
-                                egui::Color32::from_rgb(c[0], c[1], c[2]),
-                            );
+                        } else if is_animated_vertical {
+                            self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, false);
+                        } else if is_gradient {
+                            self.draw_gradient_bar(painter, bar_rect, rect);
+                        } else {
+                            let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
+                            painter.rect_filled(bar_rect, radius, color);
                         }
-                    } else if is_animated_vertical {
-                        self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, false);
-                    } else if is_gradient {
-                        self.draw_gradient_bar(painter, bar_rect, rect);
-                    } else {
-                        let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
-                        painter.rect_filled(bar_rect, radius, color);
+                        self.draw_bar_outline(painter, bar_rect);
                     }
-                    self.draw_bar_outline(painter, bar_rect);
+
+                    let mut peak_w = self.current_peaks[idx] * rect_w;
+                    if max_h > 0.0 { peak_w = peak_w.min(max_h); }
+                    if peak_w > 0.001 {
+                        let peak_rect = egui::Rect::from_min_max(
+                            egui::pos2(left_x + peak_w - 1.5, y),
+                            egui::pos2(left_x + peak_w + 1.5, y + bar_width),
+                        );
+                        let color = self.get_bar_color(i, visual_num_bars, peak_rect, rect, time);
+                        painter.rect_filled(peak_rect, 1.0, color);
+                    }
                 }
             }
             VisualizerDirection::Left => {
@@ -1633,57 +1636,56 @@ impl VisualizerApp {
 
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
-                    let mut w = self.current_bars[idx] * sensitivity_multiplier * rect_w;
-                    if max_h > 0.0 {
-                        w = w.min(max_h);
-                    }
-                    if w <= 0.0 {
-                        continue;
-                    }
+                    let mut w = self.current_bars[idx] * rect_w;
+                    if max_h > 0.0 { w = w.min(max_h); }
 
                     let y = start_y + i as f32 * stride;
-                    let bar_rect = egui::Rect::from_min_max(
-                        egui::pos2(right_x - w, y),
-                        egui::pos2(right_x, y + bar_width),
-                    );
 
-                    if is_vertical_stack {
-                        let colors = &self.active_palettes.static_multi_colors;
-                        let num_colors = colors.len().max(1);
-                        if colors.is_empty() {
-                            continue;
-                        }
-                        let slice_w = w / num_colors as f32;
-                        for c_idx in 0..num_colors {
-                            let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
-                            let x = right_x - w + (c_idx as f32 * slice_w);
-                            let slice_rect = egui::Rect::from_min_max(
-                                egui::pos2(x, y),
-                                egui::pos2(x + slice_w, y + bar_width),
-                            );
-                            let mut r = egui::Rounding::ZERO;
-                            if c_idx == 0 {
-                                r.ne = radius;
-                                r.se = radius;
-                            } else if c_idx == num_colors - 1 {
-                                r.nw = radius;
-                                r.sw = radius;
+                    if w > 0.0 {
+                        let bar_rect = egui::Rect::from_min_max(
+                            egui::pos2(right_x - w, y),
+                            egui::pos2(right_x, y + bar_width),
+                        );
+
+                        if is_vertical_stack {
+                            let colors = &self.active_palettes.static_multi_colors;
+                            let num_colors = colors.len().max(1);
+                            if !colors.is_empty() {
+                                let slice_w = w / num_colors as f32;
+                                for c_idx in 0..num_colors {
+                                    let c = colors.get(c_idx).copied().unwrap_or([255, 255, 255]);
+                                    let x = right_x - w + (c_idx as f32 * slice_w);
+                                    let slice_rect = egui::Rect::from_min_max(
+                                        egui::pos2(x, y),
+                                        egui::pos2(x + slice_w, y + bar_width),
+                                    );
+                                    let mut r = egui::Rounding::ZERO;
+                                    if c_idx == 0 { r.ne = radius; r.se = radius; }
+                                    else if c_idx == num_colors - 1 { r.nw = radius; r.sw = radius; }
+                                    painter.rect_filled(slice_rect, r, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                                }
                             }
-                            painter.rect_filled(
-                                slice_rect,
-                                r,
-                                egui::Color32::from_rgb(c[0], c[1], c[2]),
-                            );
+                        } else if is_animated_vertical {
+                            self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, false);
+                        } else if is_gradient {
+                            self.draw_gradient_bar(painter, bar_rect, rect);
+                        } else {
+                            let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
+                            painter.rect_filled(bar_rect, radius, color);
                         }
-                    } else if is_animated_vertical {
-                        self.draw_color_changing_bar(painter, bar_rect, x_norm(i), time, radius, false);
-                    } else if is_gradient {
-                        self.draw_gradient_bar(painter, bar_rect, rect);
-                    } else {
-                        let color = self.get_bar_color(i, visual_num_bars, bar_rect, rect, time);
-                        painter.rect_filled(bar_rect, radius, color);
+                        self.draw_bar_outline(painter, bar_rect);
                     }
-                    self.draw_bar_outline(painter, bar_rect);
+
+                    let mut peak_w = self.current_peaks[idx] * rect_w;
+                    if max_h > 0.0 { peak_w = peak_w.min(max_h); }
+                    if peak_w > 0.001 {
+                        let peak_rect = egui::Rect::from_min_max(
+                            egui::pos2(right_x - peak_w - 1.5, y),
+                            egui::pos2(right_x - peak_w + 1.5, y + bar_width),
+                        );
+                        let color = self.get_bar_color(i, visual_num_bars, peak_rect, rect, time);
+                        painter.rect_filled(peak_rect, 1.0, color);
+                    }
                 }
             }
         }
@@ -1898,14 +1900,196 @@ impl VisualizerApp {
         });
     }
 
+    fn draw_audio_settings_ui(&mut self, ui: &mut egui::Ui) {
+        let a = &mut self.config.audio;
+
+        ui.heading("Audio — Signal Processing");
+        ui.label(
+            egui::RichText::new(
+                "These settings change what the engine analyses, not just how it's displayed.",
+            )
+            .weak()
+            .small(),
+        );
+
+        // FFT Size
+        ui.horizontal(|ui| {
+            ui.label("FFT Size:");
+            egui::ComboBox::from_id_source("fft_size")
+                .selected_text(format!("{}", a.fft_size))
+                .show_ui(ui, |ui| {
+                    for size in [512usize, 1024, 2048, 4096, 8192] {
+                        ui.selectable_value(&mut a.fft_size, size, format!("{size}"));
+                    }
+                });
+        })
+        .response
+        .on_hover_text(
+            "Number of samples analysed per frame. Larger = finer frequency \
+             detail but blurrier transients; smaller = snappier response with \
+             coarser frequency steps.",
+        );
+
+        // Window function
+        ui.horizontal(|ui| {
+            ui.label("Window Function:");
+            egui::ComboBox::from_id_source("window_fn")
+                .selected_text(a.window_function.display_name())
+                .show_ui(ui, |ui| {
+                    for w in WindowFunction::all() {
+                        ui.selectable_value(&mut a.window_function, w, w.display_name());
+                    }
+                });
+        })
+        .response
+        .on_hover_text(a.window_function.description());
+        ui.label(egui::RichText::new(a.window_function.description()).weak().small());
+
+        // Frequency scaling
+        ui.horizontal(|ui| {
+            ui.label("Frequency Scaling:");
+            ui.selectable_value(&mut a.frequency_scaling, FrequencyScaling::Linear, "Linear");
+            ui.selectable_value(&mut a.frequency_scaling, FrequencyScaling::Logarithmic, "Logarithmic");
+        })
+        .response
+        .on_hover_text(a.frequency_scaling.description());
+
+        ui.separator();
+        ui.heading("Audio — Amplitude");
+        ui.add(egui::Slider::new(&mut a.sensitivity, 0.0..=100.0).text("Sensitivity"))
+            .on_hover_text(
+                "Primary reactivity slider. Drives raw input gain and lowers \
+                 the noise floor. Higher = quieter material becomes visible.",
+            );
+        ui.add(egui::Slider::new(&mut a.raw_gain, 0.25..=4.0).text("Raw Gain (advanced)"))
+            .on_hover_text(
+                "Direct pre-analysis multiplier. Normally driven by Sensitivity; \
+                 expose it to fine-tune without touching the dB floor.",
+            );
+        ui.add(egui::Slider::new(&mut a.response_gamma, 0.5..=2.5).text("Response Curve (γ)"))
+            .on_hover_text(
+                "<1 lifts quiet passages; >1 emphasises only the loudest peaks. \
+                 Default 2.0 = punchy.",
+            );
+
+        ui.horizontal(|ui| {
+            ui.label("Min dB:");
+            ui.add(egui::Slider::new(&mut a.min_decibels, -120.0..=-30.0).show_value(true));
+        })
+        .response
+        .on_hover_text("Noise floor. Bins below this level are silent.");
+        ui.horizontal(|ui| {
+            ui.label("Max dB:");
+            ui.add(egui::Slider::new(&mut a.max_decibels, -60.0..=0.0).show_value(true));
+        })
+        .response
+        .on_hover_text("Ceiling. Bins at or above this level map to full bar height.");
+        if a.min_decibels >= a.max_decibels {
+            ui.colored_label(egui::Color32::RED, "⚠ Max dB must be greater than Min dB.");
+        }
+        ui.add(egui::Slider::new(&mut a.target_dynamic_range_db, 20.0..=90.0).text("Target Dynamic Range (dB)"))
+            .on_hover_text(
+                "Contrast between quiet and loud passages. Smaller = more \
+                 compression/punch; larger = flatter display.",
+            );
+
+        ui.checkbox(&mut a.agc_enabled, "AGC / Peak Normalisation")
+            .on_hover_text(
+                "Automatic Gain Control: normalises track loudness so quiet \
+                 songs stay lively and loud ones don't clip.",
+            );
+        if a.agc_enabled {
+            ui.add(egui::Slider::new(&mut a.agc_attack, 0.01..=0.9).text("AGC Attack"))
+                .on_hover_text("How quickly the AGC clamps down when loudness jumps.");
+            ui.add(egui::Slider::new(&mut a.agc_release, 0.0001..=0.05).text("AGC Release"))
+                .on_hover_text("How slowly the AGC lifts quiet material. Lower = smoother.");
+        }
+
+        ui.separator();
+        ui.heading("Audio — Timing");
+        ui.add(egui::Slider::new(&mut a.poll_rate_hz, 10.0..=120.0).text("Poll Rate (Hz)"))
+            .on_hover_text(
+                "How often a new spectrum is computed. 60 Hz matches most \
+                 displays; higher = smoother but more CPU.",
+            );
+        ui.label(
+            egui::RichText::new(format!("≈ {:.1} ms per frame", 1000.0 / a.poll_rate_hz.max(1.0)))
+                .weak()
+                .small(),
+        );
+
+        ui.separator();
+        ui.heading("Audio — Ballistics");
+
+        // Detect DecayMode change → apply per-mode defaults.
+        if a.decay_mode != self.last_decay_mode {
+            let (atk, dec) = a.decay_mode.default_ballistics();
+            a.attack_time_ms = atk;
+            a.decay_time_ms = dec;
+            self.last_decay_mode = a.decay_mode;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Decay Mode:");
+            ui.selectable_value(&mut a.decay_mode, DecayMode::Linear, "Linear");
+            ui.selectable_value(&mut a.decay_mode, DecayMode::Exponential, "Exponential");
+            ui.selectable_value(&mut a.decay_mode, DecayMode::Gravity, "Gravity");
+        })
+        .response
+        .on_hover_text(a.decay_mode.description());
+
+        ui.add(egui::Slider::new(&mut a.attack_time_ms, 0.0..=100.0).text("Attack Time (ms)"))
+            .on_hover_text("0 = snap instantly. Higher = glide up over the given time.");
+        ui.add(egui::Slider::new(&mut a.decay_time_ms, 50.0..=2000.0).text("Decay Time (ms)"))
+            .on_hover_text("Roughly how long a bar takes to fall back to silence after a peak.");
+        ui.add(egui::Slider::new(&mut a.average_size, 1..=16).text("Average Size (frames)"))
+            .on_hover_text("Moving average across N frames. Higher = less jitter, slight lag.");
+        ui.add(egui::Slider::new(&mut a.peak_hold_ms, 0.0..=2000.0).text("Peak Hold (ms)"))
+            .on_hover_text("How long the peak marker hangs above the bar before falling.");
+        if a.decay_mode == DecayMode::Gravity || a.peak_hold_ms > 0.0 {
+            ui.add(egui::Slider::new(&mut a.gravity_coefficient, 0.1..=5.0).text("Gravity Coefficient"))
+                .on_hover_text(
+                    "Acceleration applied to falling bars / peaks in Gravity mode. \
+                     Higher = snappier fall.",
+                );
+        }
+
+        ui.separator();
+        ui.heading("Audio — Rhythm");
+        ui.add(egui::Slider::new(&mut a.beat_detection_sensitivity, 0.0..=1.0).text("Beat Detection Sensitivity"))
+            .on_hover_text("Higher = detects weaker beats (more flashes).");
+        ui.add(egui::Slider::new(&mut a.energy_threshold_multiplier, 1.0..=3.0).text("Energy Threshold Multiplier"))
+            .on_hover_text("A frame must exceed local average energy by this factor to register a beat.");
+        ui.checkbox(&mut a.bpm_lock_enabled, "BPM Lock / Phase Smoothing")
+            .on_hover_text("Locks the phase of beat pulses to the song's tempo (visual effects only).");
+        if a.bpm_lock_enabled {
+            ui.add(egui::Slider::new(&mut a.bpm_phase_smoothing, 0.0..=1.0).text("Phase Smoothing"))
+                .on_hover_text("How strongly beats nudge the phase. Higher = tighter lock.");
+        }
+        if self.last_bpm > 0.0 {
+            ui.label(
+                egui::RichText::new(format!("Detected BPM (auto): {:.1}", self.last_bpm))
+                    .weak()
+                    .small(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("Detected BPM (auto): (listening…)")
+                    .weak()
+                    .small(),
+            );
+        }
+    }
+
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Performance & Optimization");
         ui.checkbox(&mut self.config.use_vsync, "Enable VSync (Requires Restart)");
         ui.add(egui::Slider::new(&mut self.config.target_fps, 15.0..=144.0).text("Max Target FPS"));
-        ui.add(egui::Slider::new(&mut self.config.audio_update_ms, 10..=100).text("Audio Poll Rate (ms)"));
-        ui.label("Higher ms = lower CPU usage but more input latency.");
         ui.checkbox(&mut self.config.show_fps, "Show FPS Counter");
         ui.label(format!("Current FPS: {:.1}", self.current_fps));
+
+        ui.separator();
+        self.draw_audio_settings_ui(ui);
 
         ui.separator();
         ui.heading("Visualizer Direction");
@@ -1929,9 +2113,8 @@ impl VisualizerApp {
         ui.heading("Layout");
         ui.add(egui::Slider::new(&mut self.config.bar_width, 1.0..=50.0).text("Bar width"));
         ui.add(egui::Slider::new(&mut self.config.bar_gap, 0.0..=20.0).text("Bar gap"));
-        ui.add(egui::Slider::new(&mut self.config.sensitivity, 1.0..=100.0).text("Sensitivity"));
         ui.add(egui::Slider::new(&mut self.config.max_bar_height, 0.0..=1000.0).text("Max Bar Height (0 = Full)"));
-        ui.add(egui::Slider::new(&mut self.config.num_bars, 16..=256).text("Number of Bars"));
+        ui.add(egui::Slider::new(&mut self.config.audio.num_bars, 16..=256).text("Number of Bars"));
 
         ui.separator();
         ui.heading("Positioning");
@@ -2706,11 +2889,10 @@ impl VisualizerApp {
         ui.separator();
         if ui.button("Reset to Defaults").clicked() {
             self.config = AppConfig::default();
-            self.audio_target_bars
-                .store(self.config.num_bars, Ordering::Relaxed);
-            self.audio_update_interval
-                .store(self.config.audio_update_ms, Ordering::Relaxed);
-            self.current_bars = vec![0.0; self.config.num_bars];
+            self.audio_settings.store(Arc::new(self.config.audio.clone()));
+            self.last_decay_mode = self.config.audio.decay_mode;
+            self.current_bars = vec![0.0; self.config.audio.num_bars];
+            self.current_peaks = vec![0.0; self.config.audio.num_bars];
             self.loaded_font_path = Some("__reset__".to_string());
         }
     }
