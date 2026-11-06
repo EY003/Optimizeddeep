@@ -170,7 +170,7 @@ impl MotionShape {
             MotionShape::VerticalWipe | MotionShape::DiagonalWipe
         )
     }
-        /// Shapes that vary brightness over time (intensity dips below 1.0 for
+    /// Shapes that vary brightness over time (intensity dips below 1.0 for
     /// some pixels or at some moments). Only these care about `off_color`.
     pub fn uses_intensity(self) -> bool {
         matches!(
@@ -240,6 +240,152 @@ impl Default for MotionSettings {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Track Info (cover art + song text) configuration
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrackFontFamily {
+    Proportional,
+    Monospace,
+    /// Custom font loaded from `custom_font_path`.
+    Custom,
+}
+
+impl Default for TrackFontFamily {
+    fn default() -> Self {
+        TrackFontFamily::Proportional
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FontStyle {
+    Regular,
+    Bold,
+    Italic,
+    BoldItalic,
+}
+
+impl Default for FontStyle {
+    fn default() -> Self {
+        FontStyle::Regular
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrackTextColorMode {
+    /// Use the user-chosen `static_color`.
+    Static,
+    /// Track the current visualizer color in real time.
+    Visualizer,
+}
+
+impl Default for TrackTextColorMode {
+    fn default() -> Self {
+        TrackTextColorMode::Static
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrackTextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+impl Default for TrackTextAlign {
+    fn default() -> Self {
+        TrackTextAlign::Right
+    }
+}
+
+/// Everything the overlay uses for the cover art + "artist / title" text.
+/// All settings are global (same for every track).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TrackInfoConfig {
+    // ── Cover art ──
+    pub show_cover_art: bool,
+    pub cover_size: f32,
+    pub cover_x_offset: f32,
+    pub cover_y_offset: f32,
+
+    // ── Font sizes (per-line, independent) ──
+    pub title_font_size: f32,
+    pub artist_font_size: f32,
+
+    // ── Font selection (shared) ──
+    pub font_family: TrackFontFamily,
+    /// Path to a custom font file. Only used when `font_family == Custom`.
+    pub custom_font_path: Option<String>,
+    pub font_style: FontStyle,
+
+    // ── Text color (shared) ──
+    pub color_mode: TrackTextColorMode,
+    pub static_color: [u8; 3],
+    pub opacity: u8,
+
+    // ── Typography / positioning (shared) ──
+    pub letter_spacing: f32,
+    pub line_height: f32,
+    pub alignment: TrackTextAlign,
+    pub text_x_offset: f32,
+    pub text_y_offset: f32,
+
+    // ── Shadow (shared) ──
+    pub shadow_enabled: bool,
+    pub shadow_offset_x: f32,
+    pub shadow_offset_y: f32,
+    pub shadow_blur: f32,
+    pub shadow_color: [u8; 3],
+
+    // ── Outline (shared) ──
+    pub outline_enabled: bool,
+    pub outline_thickness: f32,
+    pub outline_color: [u8; 3],
+}
+
+impl Default for TrackInfoConfig {
+    fn default() -> Self {
+        Self {
+            show_cover_art: true,
+            cover_size: 190.0,
+            cover_x_offset: 0.0,
+            cover_y_offset: 0.0,
+
+            title_font_size: 21.0,
+            artist_font_size: 30.0,
+
+            font_family: TrackFontFamily::Proportional,
+            custom_font_path: None,
+            font_style: FontStyle::Regular,
+
+            color_mode: TrackTextColorMode::Static,
+            static_color: [220, 220, 220],
+            opacity: 255,
+
+            letter_spacing: 0.0,
+            line_height: 1.3,
+            alignment: TrackTextAlign::Right,
+            text_x_offset: 0.0,
+            text_y_offset: 0.0,
+
+            shadow_enabled: true,
+            shadow_offset_x: 2.0,
+            shadow_offset_y: 2.0,
+            shadow_blur: 0.0,
+            shadow_color: [0, 0, 0],
+
+            outline_enabled: false,
+            outline_thickness: 1.0,
+            outline_color: [0, 0, 0],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// AppConfig
+// ─────────────────────────────────────────────────────────────
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub bar_width: f32,
@@ -300,6 +446,10 @@ pub struct AppConfig {
     pub color_change_presets: Vec<ColorChangePreset>,
     #[serde(default)]
     pub color_change_motion: MotionSettings,
+
+    // ── Cover Art / Song Info Text ──
+    #[serde(default)]
+    pub track_info: TrackInfoConfig,
 }
 
 fn default_static_colors() -> Vec<[u8; 3]> {
@@ -619,6 +769,8 @@ impl Default for AppConfig {
             color_change_speed: default_speed(),
             color_change_presets: default_color_change_presets(),
             color_change_motion: MotionSettings::default(),
+
+            track_info: TrackInfoConfig::default(),
         }
     }
 }
