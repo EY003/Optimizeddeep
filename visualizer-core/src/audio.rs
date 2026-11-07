@@ -100,7 +100,6 @@ fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
     let blockalign = format.get_blockalign() as usize;
     let samples_per_frame = (blockalign / 4).max(1);
 
-    // get_periods() returns (i64, i64) in REFERENCE_TIME (100-ns units).
     let (_, min_time) = match audio_client.get_periods() {
         Ok(p) => p,
         Err(_) => (100_000i64, 100_000i64),
@@ -171,8 +170,6 @@ fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
             (frames_read as usize * samples_per_frame).min(sample_buffer.len());
         let samples = &sample_buffer[..valid_samples];
 
-        // RMS-per-channel then sum — preserves energy through stereo
-        // cancellation (phase-inverted bass etc.).
         mono.clear();
         mono.reserve(valid_samples / channels.max(1));
         for chunk in samples.chunks_exact(channels.max(1)) {
@@ -200,7 +197,7 @@ fn analysis_loop(
     frame_tx: Sender<BarFrame>,
     sample_rate: f32,
 ) {
-    let mut processor = AudioProcessor::new(settings.clone(), sample_rate);
+    let mut processor = AudioProcessor::new(sample_rate);
     let mut history: Vec<f32> = Vec::with_capacity(16_384);
     let mut last_tick = Instant::now();
 
@@ -238,7 +235,6 @@ fn analysis_loop(
 
 struct AudioProcessor {
     sample_rate: f32,
-
     cached_fft_size: usize,
     fft: Arc<dyn RealToComplex<f32>>,
     window: Vec<f32>,
@@ -257,7 +253,6 @@ struct AudioProcessor {
     peak_hold_remaining: Vec<f32>,
 
     frame_history: VecDeque<Vec<f32>>,
-
     agc_envelope: f32,
 
     lp_state: f32,
@@ -271,21 +266,17 @@ struct AudioProcessor {
 }
 
 impl AudioProcessor {
-    fn new(settings: Arc<ArcSwap<AudioSettings>>, sample_rate: f32) -> Self {
-        let current = settings.load();
-        let fft_size = current.fft_size;
-        let window_fn = current.window_function;
-        let num_bars = current.num_bars;
-        let scaling = current.frequency_scaling;
-
+    fn new(sample_rate: f32) -> Self {
         let mut planner = RealFftPlanner::new();
+        let fft_size = 2048;
+        let window_fn = WindowFunction::Hann;
         let fft = planner.plan_fft_forward(fft_size);
         let input_buffer = fft.make_input_vec();
         let output_buffer = fft.make_output_vec();
         let scratch_buffer = fft.make_scratch_vec();
 
         let window = make_window(window_fn, fft_size);
-        let bin_ranges = make_bin_ranges(fft_size, num_bars, scaling, sample_rate);
+        let bin_ranges = make_bin_ranges(fft_size, 86, FrequencyScaling::Logarithmic, sample_rate);
 
         let rc = 1.0 / (2.0 * std::f32::consts::PI * 200.0);
         let dt_s = 1.0 / sample_rate.max(1.0);
@@ -300,13 +291,13 @@ impl AudioProcessor {
             input_buffer,
             output_buffer,
             scratch_buffer,
-            cached_num_bars: num_bars,
-            cached_scaling: scaling,
+            cached_num_bars: 86,
+            cached_scaling: FrequencyScaling::Logarithmic,
             bin_ranges,
-            bar_values: vec![0.0; num_bars],
-            bar_peaks: vec![0.0; num_bars],
-            bar_velocities: vec![0.0; num_bars],
-            peak_hold_remaining: vec![0.0; num_bars],
+            bar_values: vec![0.0; 86],
+            bar_peaks: vec![0.0; 86],
+            bar_velocities: vec![0.0; 86],
+            peak_hold_remaining: vec![0.0; 86],
             frame_history: VecDeque::with_capacity(16),
             agc_envelope: 1.0,
             lp_state: 0.0,
@@ -317,7 +308,7 @@ impl AudioProcessor {
             phase: 0.0,
             time_elapsed: 0.0,
         };
-        lp.update_initial_state(&current);
+        // The state will be properly synced in the first `process` call.
         lp
     }
 
@@ -331,9 +322,7 @@ impl AudioProcessor {
             self.cached_fft_size = s.fft_size;
             self.cached_window_fn = s.window_function;
             self.window = make_window(s.window_function, s.fft_size);
-            self.bin_ranges = make_bin_ranges(
-                s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate,
-            );
+            self.bin_ranges = make_bin_ranges(s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate);
         }
 
         if s.window_function != self.cached_window_fn {
@@ -344,9 +333,7 @@ impl AudioProcessor {
         if s.num_bars != self.cached_num_bars || s.frequency_scaling != self.cached_scaling {
             self.cached_num_bars = s.num_bars;
             self.cached_scaling = s.frequency_scaling;
-            self.bin_ranges = make_bin_ranges(
-                s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate,
-            );
+            self.bin_ranges = make_bin_ranges(s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate);
             self.resize_bar_state(s.num_bars);
         }
     }
@@ -356,17 +343,10 @@ impl AudioProcessor {
         self.bar_peaks.resize(n, 0.0);
         self.bar_velocities.resize(n, 0.0);
         self.peak_hold_remaining.resize(n, 0.0);
-        for f in self.frame_history.iter_mut() {
-            f.resize(n, 0.0);
-        }
+        for f in self.frame_history.iter_mut() { f.resize(n, 0.0); }
     }
 
-    fn process(
-        &mut self,
-        history: &[f32],
-        s: &AudioSettings,
-        dt: f32,
-    ) -> Option<BarFrame> {
+    fn process(&mut self, history: &[f32], s: &AudioSettings, dt: f32) -> Option<BarFrame> {
         self.update_initial_state(s);
         self.time_elapsed += dt as f64;
 
@@ -382,15 +362,12 @@ impl AudioProcessor {
         }
         let window_slice = &history[history.len() - n_fft..];
 
-        // AGC on the raw window.
         let raw_rms = {
             let sum_sq: f32 = window_slice.iter().map(|x| x * x).sum();
             (sum_sq / n_fft as f32).sqrt()
         };
         if s.agc_enabled {
-            // Target ≈ -28 dBFS effective RMS — leaves headroom for
-            // peaks while still lifting quiet tracks into view.
-            let desired = 0.04 / raw_rms.max(1e-6);
+            let desired = 0.08 / raw_rms.max(1e-6); // Tamed AGC target
             let coeff = if desired < self.agc_envelope {
                 s.agc_attack.clamp(0.0001, 1.0)
             } else {
@@ -400,25 +377,14 @@ impl AudioProcessor {
         } else {
             self.agc_envelope = 1.0;
         }
-        // Cap at 20× (26 dB) so true silence doesn't get amplified
-        // absurdly, but quiet tracks still get rescued.
         let agc_gain = self.agc_envelope.clamp(0.01, 20.0);
-
         let user_gain = s.raw_gain.max(0.01) * agc_gain;
 
-        // FFT.
         self.input_buffer.copy_from_slice(window_slice);
         for i in 0..n_fft {
             self.input_buffer[i] *= self.window[i];
         }
-        if self.fft
-            .process_with_scratch(
-                &mut self.input_buffer,
-                &mut self.output_buffer,
-                &mut self.scratch_buffer,
-            )
-            .is_err()
-        {
+        if self.fft.process_with_scratch(&mut self.input_buffer, &mut self.output_buffer, &mut self.scratch_buffer).is_err() {
             return None;
         }
 
@@ -447,12 +413,19 @@ impl AudioProcessor {
         let mut mapped = vec![0.0f32; num_bars];
         for i in 0..num_bars {
             let db = 20.0 * raw_bars[i].log10();
-            let n01 = ((db - min_db_effective) / db_span).clamp(0.0, 1.0);
+            
+            // Apply Spectrum Tilt (e.g., +3.0 dB per octave above 1kHz)
+            let (start, end) = self.bin_ranges[i];
+            let center_bin = (start + end) as f32 / 2.0;
+            let center_freq = (center_bin * self.sample_rate / n_fft as f32).max(20.0);
+            let octaves_from_1k = (center_freq / 1000.0).log2();
+            let tilt_db = s.spectrum_tilt * octaves_from_1k;
+
+            let tilted_db = db + tilt_db;
+            let n01 = ((tilted_db - min_db_effective) / db_span).clamp(0.0, 1.0);
             mapped[i] = n01.powf(gamma);
         }
 
-        // Temporal smoothing (average_size) — the `while` loop ensures
-        // that lowering `average_size` immediately shrinks the history.
         let avg = s.average_size.max(1);
         while self.frame_history.len() >= avg {
             self.frame_history.pop_front();
@@ -468,9 +441,7 @@ impl AudioProcessor {
                     out[i] += frame[i];
                 }
             }
-            for x in &mut out {
-                *x /= count.max(1.0);
-            }
+            for x in &mut out { *x /= count.max(1.0); }
             out
         };
 
@@ -511,8 +482,7 @@ impl AudioProcessor {
                         (input + (prev - input) * (-dt / tau).exp()).max(input)
                     }
                     DecayMode::Gravity => {
-                        let g = 2.0 / (decay_s * decay_s)
-                            * s.gravity_coefficient.max(0.01);
+                        let g = 2.0 / (decay_s * decay_s) * s.gravity_coefficient.max(0.01);
                         self.bar_velocities[i] += g * dt;
                         (prev - self.bar_velocities[i] * dt).max(input)
                     }
@@ -520,8 +490,6 @@ impl AudioProcessor {
             }
             self.bar_values[i] = self.bar_values[i].clamp(0.0, 1.0);
 
-            // Peak-hold marker. When peak_hold_ms = 0 the marker
-            // tracks the bar exactly (equivalent to "no peak-hold").
             if peak_hold_s <= 0.0 {
                 self.bar_peaks[i] = self.bar_values[i];
                 self.peak_hold_remaining[i] = 0.0;
@@ -532,8 +500,7 @@ impl AudioProcessor {
                 self.peak_hold_remaining[i] -= dt;
             } else {
                 let fall_rate = 1.0 / decay_s;
-                self.bar_peaks[i] =
-                    (self.bar_peaks[i] - dt * fall_rate).max(self.bar_values[i]);
+                self.bar_peaks[i] = (self.bar_peaks[i] - dt * fall_rate).max(self.bar_values[i]);
             }
         }
     }
@@ -556,39 +523,28 @@ impl AudioProcessor {
         let local_avg = if self.low_energy_history.is_empty() {
             energy
         } else {
-            self.low_energy_history.iter().sum::<f32>()
-                / self.low_energy_history.len() as f32
+            self.low_energy_history.iter().sum::<f32>() / self.low_energy_history.len() as f32
         };
 
         let sensitivity = s.beat_detection_sensitivity.clamp(0.0, 1.0);
-        let threshold = local_avg
-            * s.energy_threshold_multiplier.max(1.0)
-            * (1.0 - sensitivity * 0.5);
+        let threshold = local_avg * s.energy_threshold_multiplier.max(1.0) * (1.0 - sensitivity * 0.5);
         let is_beat = energy > threshold
             && energy > local_avg * 1.05
             && self.time_elapsed - self.beat_times.back().copied().unwrap_or(0.0) > 0.15;
 
         if is_beat {
             self.beat_times.push_back(self.time_elapsed);
-            while self.beat_times.len() > 8 {
-                self.beat_times.pop_front();
-            }
+            while self.beat_times.len() > 8 { self.beat_times.pop_front(); }
             self.recompute_bpm();
         }
 
         let period_s = if self.bpm > 20.0 { 60.0 / self.bpm } else { 0.5 };
         self.phase += dt / period_s;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
-        }
+        if self.phase >= 1.0 { self.phase -= 1.0; }
 
         if is_beat && s.bpm_lock_enabled {
             let gain = s.bpm_phase_smoothing.clamp(0.0, 1.0);
-            let error = if self.phase < 0.5 {
-                -self.phase
-            } else {
-                1.0 - self.phase
-            };
+            let error = if self.phase < 0.5 { -self.phase } else { 1.0 - self.phase };
             self.phase = (self.phase + error * gain).rem_euclid(1.0);
         }
 
@@ -596,21 +552,11 @@ impl AudioProcessor {
     }
 
     fn recompute_bpm(&mut self) {
-        if self.beat_times.len() < 2 {
-            self.bpm = 0.0;
-            return;
-        }
-        let mut intervals: Vec<f64> = self
-            .beat_times
-            .iter()
-            .zip(self.beat_times.iter().skip(1))
-            .map(|(a, b)| b - a)
-            .collect();
+        if self.beat_times.len() < 2 { self.bpm = 0.0; return; }
+        let mut intervals: Vec<f64> = self.beat_times.iter().zip(self.beat_times.iter().skip(1)).map(|(a, b)| b - a).collect();
         intervals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = intervals[intervals.len() / 2];
-        if median > 0.001 {
-            self.bpm = (60.0 / median) as f32;
-        }
+        if median > 0.001 { self.bpm = (60.0 / median) as f32; }
     }
 }
 
@@ -644,12 +590,7 @@ fn make_window(kind: WindowFunction, n: usize) -> Vec<f32> {
     w
 }
 
-fn make_bin_ranges(
-    fft_size: usize,
-    num_bars: usize,
-    scaling: FrequencyScaling,
-    _sample_rate: f32,
-) -> Vec<(usize, usize)> {
+fn make_bin_ranges(fft_size: usize, num_bars: usize, scaling: FrequencyScaling, _sample_rate: f32) -> Vec<(usize, usize)> {
     let nyquist = fft_size / 2;
     let mut ranges = Vec::with_capacity(num_bars);
     match scaling {
@@ -664,12 +605,8 @@ fn make_bin_ranges(
             let min_bin = 1.0f32;
             let max_bin = (nyquist as f32).max(2.0);
             for i in 0..num_bars {
-                let lo = (min_bin
-                    * (max_bin / min_bin).powf(i as f32 / num_bars as f32))
-                    .floor() as usize;
-                let hi = (min_bin
-                    * (max_bin / min_bin).powf((i + 1) as f32 / num_bars as f32))
-                    .ceil() as usize;
+                let lo = (min_bin * (max_bin / min_bin).powf(i as f32 / num_bars as f32)).floor() as usize;
+                let hi = (min_bin * (max_bin / min_bin).powf((i + 1) as f32 / num_bars as f32)).ceil() as usize;
                 let s = lo.max(1);
                 let e = hi.max(s + 1).min(nyquist);
                 ranges.push((s, e));
