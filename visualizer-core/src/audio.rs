@@ -10,7 +10,7 @@ use realfft::{RealFftPlanner, RealToComplex};
 use wasapi::*;
 
 use crate::config::{
-    AudioSettings, DecayMode, FrequencyScaling, WindowFunction,
+    AudioSettings, BeatFocusMode, ChannelMixMode, DecayMode, FrequencyScaling, WindowFunction,
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -40,8 +40,9 @@ impl AudioEngine {
         let (sample_tx, sample_rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
         let (info_tx, info_rx) = crossbeam_channel::bounded(1);
 
+        let settings_for_capture = settings.clone();
         let capture_handle = thread::spawn(move || {
-            capture_loop(sample_tx, info_tx);
+            capture_loop(settings_for_capture, sample_tx, info_tx);
         });
 
         let (device_name, sample_rate) = info_rx
@@ -63,7 +64,7 @@ impl AudioEngine {
 // Capture thread
 // ─────────────────────────────────────────────────────────────
 
-fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
+fn capture_loop(settings: Arc<ArcSwap<AudioSettings>>, sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
     let _ = initialize_mta();
 
     let device = match get_default_device(&Direction::Render) {
@@ -83,9 +84,7 @@ fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
         }
     };
 
-    let device_name = device
-        .get_friendlyname()
-        .unwrap_or_else(|_| "Default Device".to_string());
+    let device_name = device.get_friendlyname().unwrap_or_else(|_| "Default Device".to_string());
 
     let format = match audio_client.get_mixformat() {
         Ok(f) => f,
@@ -105,10 +104,7 @@ fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
         Err(_) => (100_000i64, 100_000i64),
     };
 
-    if audio_client
-        .initialize_client(&format, min_time, &Direction::Capture, &ShareMode::Shared, true)
-        .is_err()
-    {
+    if audio_client.initialize_client(&format, min_time, &Direction::Capture, &ShareMode::Shared, true).is_err() {
         let _ = info_tx.send((device_name, sample_rate));
         return;
     }
@@ -135,19 +131,11 @@ fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
     loop {
         let mut packet_size = 0u32;
         for _ in 0..2000 {
-            packet_size = capture_client
-                .get_next_nbr_frames()
-                .ok()
-                .flatten()
-                .unwrap_or(0);
-            if packet_size > 0 {
-                break;
-            }
+            packet_size = capture_client.get_next_nbr_frames().ok().flatten().unwrap_or(0);
+            if packet_size > 0 { break; }
             thread::sleep(Duration::from_millis(1));
         }
-        if packet_size == 0 {
-            continue;
-        }
+        if packet_size == 0 { continue; }
 
         let needed = packet_size as usize * samples_per_frame;
         sample_buffer.resize(needed, 0.0);
@@ -159,31 +147,36 @@ fn capture_loop(sample_tx: Sender<Vec<f32>>, info_tx: Sender<(String, f32)>) {
             )
         };
 
-        let (frames_read, _) = capture_client
-            .read_from_device(byte_slice)
-            .unwrap_or((0, BufferFlags::none()));
-        if frames_read == 0 {
-            continue;
-        }
+        let (frames_read, _) = capture_client.read_from_device(byte_slice).unwrap_or((0, BufferFlags::none()));
+        if frames_read == 0 { continue; }
 
-        let valid_samples =
-            (frames_read as usize * samples_per_frame).min(sample_buffer.len());
+        let valid_samples = (frames_read as usize * samples_per_frame).min(sample_buffer.len());
         let samples = &sample_buffer[..valid_samples];
+
+        // Read the current channel mix mode
+        let mix_mode = settings.load().channel_mix;
 
         mono.clear();
         mono.reserve(valid_samples / channels.max(1));
+        
         for chunk in samples.chunks_exact(channels.max(1)) {
-            let sum_sq: f32 = chunk.iter().map(|s| s * s).sum();
-            mono.push((sum_sq / chunk.len() as f32).sqrt());
+            if channels >= 2 {
+                let l = chunk[0];
+                let r = chunk[1];
+                let val = match mix_mode {
+                    ChannelMixMode::Mono | ChannelMixMode::Mid => (l + r) * 0.5,
+                    ChannelMixMode::Left => l,
+                    ChannelMixMode::Right => r,
+                    ChannelMixMode::Side => (l - r) * 0.5,
+                };
+                mono.push(val);
+            } else {
+                mono.push(chunk[0]);
+            }
         }
 
-        if mono.is_empty() {
-            continue;
-        }
-
-        if sample_tx.send(mono.clone()).is_err() {
-            return;
-        }
+        if mono.is_empty() { continue; }
+        if sample_tx.send(mono.clone()).is_err() { return; }
     }
 }
 
@@ -245,6 +238,8 @@ struct AudioProcessor {
 
     cached_num_bars: usize,
     cached_scaling: FrequencyScaling,
+    cached_min_freq: f32,
+    cached_max_freq: f32,
     bin_ranges: Vec<(usize, usize)>,
 
     bar_values: Vec<f32>,
@@ -255,10 +250,7 @@ struct AudioProcessor {
     frame_history: VecDeque<Vec<f32>>,
     agc_envelope: f32,
 
-    lp_state: f32,
-    lp_alpha: f32,
-    low_energy_history: VecDeque<f32>,
-
+    beat_energy_history: VecDeque<f32>,
     beat_times: VecDeque<f64>,
     bpm: f32,
     phase: f32,
@@ -276,11 +268,7 @@ impl AudioProcessor {
         let scratch_buffer = fft.make_scratch_vec();
 
         let window = make_window(window_fn, fft_size);
-        let bin_ranges = make_bin_ranges(fft_size, 86, FrequencyScaling::Logarithmic, sample_rate);
-
-        let rc = 1.0 / (2.0 * std::f32::consts::PI * 200.0);
-        let dt_s = 1.0 / sample_rate.max(1.0);
-        let lp_alpha = dt_s / (rc + dt_s);
+        let bin_ranges = make_bin_ranges(fft_size, 86, FrequencyScaling::Logarithmic, sample_rate, 20.0, 20000.0);
 
         let lp = Self {
             sample_rate,
@@ -293,6 +281,8 @@ impl AudioProcessor {
             scratch_buffer,
             cached_num_bars: 86,
             cached_scaling: FrequencyScaling::Logarithmic,
+            cached_min_freq: 20.0,
+            cached_max_freq: 20000.0,
             bin_ranges,
             bar_values: vec![0.0; 86],
             bar_peaks: vec![0.0; 86],
@@ -300,15 +290,12 @@ impl AudioProcessor {
             peak_hold_remaining: vec![0.0; 86],
             frame_history: VecDeque::with_capacity(16),
             agc_envelope: 1.0,
-            lp_state: 0.0,
-            lp_alpha,
-            low_energy_history: VecDeque::with_capacity(240),
+            beat_energy_history: VecDeque::with_capacity(240),
             beat_times: VecDeque::with_capacity(8),
             bpm: 0.0,
             phase: 0.0,
             time_elapsed: 0.0,
         };
-        // The state will be properly synced in the first `process` call.
         lp
     }
 
@@ -322,7 +309,7 @@ impl AudioProcessor {
             self.cached_fft_size = s.fft_size;
             self.cached_window_fn = s.window_function;
             self.window = make_window(s.window_function, s.fft_size);
-            self.bin_ranges = make_bin_ranges(s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate);
+            self.bin_ranges = make_bin_ranges(s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate, s.min_frequency_hz, s.max_frequency_hz);
         }
 
         if s.window_function != self.cached_window_fn {
@@ -330,10 +317,16 @@ impl AudioProcessor {
             self.window = make_window(s.window_function, s.fft_size);
         }
 
-        if s.num_bars != self.cached_num_bars || s.frequency_scaling != self.cached_scaling {
+        if s.num_bars != self.cached_num_bars 
+            || s.frequency_scaling != self.cached_scaling 
+            || s.min_frequency_hz != self.cached_min_freq
+            || s.max_frequency_hz != self.cached_max_freq 
+        {
             self.cached_num_bars = s.num_bars;
             self.cached_scaling = s.frequency_scaling;
-            self.bin_ranges = make_bin_ranges(s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate);
+            self.cached_min_freq = s.min_frequency_hz;
+            self.cached_max_freq = s.max_frequency_hz;
+            self.bin_ranges = make_bin_ranges(s.fft_size, s.num_bars, s.frequency_scaling, self.sample_rate, s.min_frequency_hz, s.max_frequency_hz);
             self.resize_bar_state(s.num_bars);
         }
     }
@@ -367,7 +360,7 @@ impl AudioProcessor {
             (sum_sq / n_fft as f32).sqrt()
         };
         if s.agc_enabled {
-            let desired = 0.08 / raw_rms.max(1e-6); // Tamed AGC target
+            let desired = 0.08 / raw_rms.max(1e-6);
             let coeff = if desired < self.agc_envelope {
                 s.agc_attack.clamp(0.0001, 1.0)
             } else {
@@ -390,6 +383,7 @@ impl AudioProcessor {
 
         let num_bars = self.cached_num_bars;
         let nyquist = n_fft / 2;
+        let bin_width = self.sample_rate / n_fft as f32;
         let norm = 1.0 / (n_fft as f32 / 2.0) * user_gain;
 
         let mut raw_bars = vec![0.0f32; num_bars];
@@ -414,15 +408,30 @@ impl AudioProcessor {
         for i in 0..num_bars {
             let db = 20.0 * raw_bars[i].log10();
             
-            // Apply Spectrum Tilt (e.g., +3.0 dB per octave above 1kHz)
             let (start, end) = self.bin_ranges[i];
             let center_bin = (start + end) as f32 / 2.0;
-            let center_freq = (center_bin * self.sample_rate / n_fft as f32).max(20.0);
+            let center_freq = (center_bin * bin_width).max(20.0);
+            
+            // Tilt & EQ
             let octaves_from_1k = (center_freq / 1000.0).log2();
             let tilt_db = s.spectrum_tilt * octaves_from_1k;
 
-            let tilted_db = db + tilt_db;
-            let n01 = ((tilted_db - min_db_effective) / db_span).clamp(0.0, 1.0);
+            let eq_db = if center_freq < 250.0 {
+                s.eq_bass_db
+            } else if center_freq < 4000.0 {
+                s.eq_mid_db
+            } else {
+                s.eq_treble_db
+            };
+
+            let tilted_db = db + tilt_db + eq_db;
+            let mut n01 = ((tilted_db - min_db_effective) / db_span).clamp(0.0, 1.0);
+
+            // Noise Gate
+            if n01 < s.noise_gate {
+                n01 = 0.0;
+            }
+
             mapped[i] = n01.powf(gamma);
         }
 
@@ -446,7 +455,7 @@ impl AudioProcessor {
         };
 
         self.update_ballistics(&smoothed, s, dt);
-        let (beat, phase) = self.detect_rhythm(window_slice, s, dt);
+        let (beat, phase) = self.detect_rhythm(s, dt);
 
         Some(BarFrame {
             values: self.bar_values.clone(),
@@ -505,25 +514,42 @@ impl AudioProcessor {
         }
     }
 
-    fn detect_rhythm(&mut self, window: &[f32], s: &AudioSettings, dt: f32) -> (bool, f32) {
-        let mut lp = self.lp_state;
-        let mut sum_sq = 0.0f32;
-        for &x in window {
-            lp += self.lp_alpha * (x - lp);
-            sum_sq += lp * lp;
+    fn detect_rhythm(&mut self, s: &AudioSettings, dt: f32) -> (bool, f32) {
+        let n_fft = self.cached_fft_size;
+        let nyquist = n_fft / 2;
+        let bin_width = self.sample_rate / n_fft as f32;
+        
+        let mut bass_energy = 0.0;
+        let mut mid_energy = 0.0;
+        let mut treble_energy = 0.0;
+
+        for bin in 1..nyquist {
+            let f = bin as f32 * bin_width;
+            let mag = self.output_buffer[bin].norm();
+            if f < 250.0 {
+                bass_energy += mag;
+            } else if f < 4000.0 {
+                mid_energy += mag;
+            } else {
+                treble_energy += mag;
+            }
         }
-        self.lp_state = lp;
-        let energy = (sum_sq / window.len() as f32).sqrt();
+
+        let energy = match s.beat_focus {
+            BeatFocusMode::Bass => bass_energy,
+            BeatFocusMode::Mid => mid_energy,
+            BeatFocusMode::Treble => treble_energy,
+        };
 
         let hist_len = (s.poll_rate_hz * 1.5).max(30.0) as usize;
-        self.low_energy_history.push_back(energy);
-        while self.low_energy_history.len() > hist_len {
-            self.low_energy_history.pop_front();
+        self.beat_energy_history.push_back(energy);
+        while self.beat_energy_history.len() > hist_len {
+            self.beat_energy_history.pop_front();
         }
-        let local_avg = if self.low_energy_history.is_empty() {
+        let local_avg = if self.beat_energy_history.is_empty() {
             energy
         } else {
-            self.low_energy_history.iter().sum::<f32>() / self.low_energy_history.len() as f32
+            self.beat_energy_history.iter().sum::<f32>() / self.beat_energy_history.len() as f32
         };
 
         let sensitivity = s.beat_detection_sensitivity.clamp(0.0, 1.0);
@@ -590,25 +616,30 @@ fn make_window(kind: WindowFunction, n: usize) -> Vec<f32> {
     w
 }
 
-fn make_bin_ranges(fft_size: usize, num_bars: usize, scaling: FrequencyScaling, _sample_rate: f32) -> Vec<(usize, usize)> {
+fn make_bin_ranges(fft_size: usize, num_bars: usize, scaling: FrequencyScaling, sample_rate: f32, min_freq: f32, max_freq: f32) -> Vec<(usize, usize)> {
     let nyquist = fft_size / 2;
+    let bin_width = sample_rate / fft_size as f32;
+    
+    let min_bin = ((min_freq / bin_width).floor() as usize).max(1);
+    let max_bin = ((max_freq / bin_width).ceil() as usize).min(nyquist);
+    
     let mut ranges = Vec::with_capacity(num_bars);
     match scaling {
         FrequencyScaling::Linear => {
             for i in 0..num_bars {
-                let s = i * nyquist / num_bars;
-                let e = ((i + 1) * nyquist / num_bars).max(s + 1).min(nyquist);
-                ranges.push((s.max(1), e.max(s.max(1) + 1).min(nyquist)));
+                let s = min_bin + (i * (max_bin - min_bin)) / num_bars;
+                let e = min_bin + ((i + 1) * (max_bin - min_bin)) / num_bars;
+                ranges.push((s, e.max(s + 1).min(nyquist)));
             }
         }
         FrequencyScaling::Logarithmic => {
-            let min_bin = 1.0f32;
-            let max_bin = (nyquist as f32).max(2.0);
+            let min_b = min_bin as f32;
+            let max_b = max_bin as f32;
             for i in 0..num_bars {
-                let lo = (min_bin * (max_bin / min_bin).powf(i as f32 / num_bars as f32)).floor() as usize;
-                let hi = (min_bin * (max_bin / min_bin).powf((i + 1) as f32 / num_bars as f32)).ceil() as usize;
-                let s = lo.max(1);
-                let e = hi.max(s + 1).min(nyquist);
+                let lo = (min_b * (max_b / min_b).powf(i as f32 / num_bars as f32)).floor() as usize;
+                let hi = (min_b * (max_b / min_b).powf((i + 1) as f32 / num_bars as f32)).ceil() as usize;
+                let s = lo.max(min_bin);
+                let e = hi.max(s + 1).min(max_bin);
                 ranges.push((s, e));
             }
         }
