@@ -282,7 +282,7 @@ impl AudioProcessor {
         let dt_s = 1.0 / sample_rate.max(1.0);
         let lp_alpha = dt_s / (rc + dt_s);
 
-        let mut lp = Self {
+        let lp = Self {
             sample_rate,
             cached_fft_size: fft_size,
             fft,
