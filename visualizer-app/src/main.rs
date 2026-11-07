@@ -648,7 +648,6 @@ fn draw_spaced(
     }
 }
 
-/// Small helper: renders a persistent (not hover-only) description line.
 fn help_text(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).weak().small());
 }
@@ -1129,7 +1128,8 @@ impl VisualizerApp {
             VisualizerDirection::Up => {
                 let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
                 let bottom_y = rect.bottom() + self.config.y_offset;
-                let rect_h = rect.height();
+                // Apply the height scale here
+                let rect_h = rect.height() * self.config.height_scale;
 
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
@@ -1171,8 +1171,6 @@ impl VisualizerApp {
                         self.draw_bar_outline(painter, bar_rect);
                     }
 
-                    // Peak marker — only drawn when it's meaningfully
-                    // above the bar (which is never the case at peak_hold=0).
                     let mut peak_h = self.current_peaks[idx] * rect_h;
                     if max_h > 0.0 { peak_h = peak_h.min(max_h); }
                     if peak_h > h + 1.5 {
@@ -1188,7 +1186,7 @@ impl VisualizerApp {
             VisualizerDirection::Down => {
                 let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
                 let top_y = rect.top() + self.config.y_offset;
-                let rect_h = rect.height();
+                let rect_h = rect.height() * self.config.height_scale;
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut h = self.current_bars[idx] * rect_h;
@@ -1242,7 +1240,7 @@ impl VisualizerApp {
             VisualizerDirection::Right => {
                 let left_x = rect.left() + self.config.x_offset;
                 let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
-                let rect_w = rect.width();
+                let rect_w = rect.width() * self.config.height_scale;
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut w = self.current_bars[idx] * rect_w;
@@ -1296,7 +1294,7 @@ impl VisualizerApp {
             VisualizerDirection::Left => {
                 let right_x = rect.right() + self.config.x_offset;
                 let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
-                let rect_w = rect.width();
+                let rect_w = rect.width() * self.config.height_scale;
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let mut w = self.current_bars[idx] * rect_w;
@@ -1521,22 +1519,15 @@ impl VisualizerApp {
         });
     }
 
-        fn draw_audio_settings_ui(&mut self, ui: &mut egui::Ui) {
+    fn draw_audio_settings_ui(&mut self, ui: &mut egui::Ui) {
         let detected = AudioPreset::detect(&self.config.audio);
 
-        // ── Presets ──
-        // NOTE: the preset picker must run *before* we borrow
-        // `self.config.audio` mutably below. We capture the click in a
-        // local and apply it after the closure — that's what keeps the
-        // borrow checker happy.
         ui.heading("Audio");
         ui.label(
             egui::RichText::new(
                 "Quick-apply a tuning that works well for a specific style of music. \
                  All settings remain adjustable afterwards.",
-            )
-            .weak()
-            .small(),
+            ).weak().small(),
         );
 
         let mut chosen_preset: Option<AudioPreset> = None;
@@ -1568,7 +1559,6 @@ impl VisualizerApp {
         // NOW safe to take the mutable borrow of `self.config.audio`.
         let a = &mut self.config.audio;
 
-        // ── Signal Processing ──
         ui.separator();
         ui.heading("Signal Processing");
 
@@ -1609,7 +1599,6 @@ impl VisualizerApp {
         });
         help_text(ui, a.frequency_scaling.description());
 
-        // ── Amplitude ──
         ui.separator();
         ui.heading("Amplitude");
 
@@ -1627,6 +1616,11 @@ impl VisualizerApp {
         help_text(ui,
             "<1 lifts quiet passages; >1 emphasises only the loudest peaks. \
              Default 1.5 = balanced; 2.0 = punchy.");
+
+        ui.add(egui::Slider::new(&mut a.spectrum_tilt, -6.0..=6.0).text("Spectrum Tilt (dB/oct)"));
+        help_text(ui,
+            "Balances bass and treble. Positive values boost highs and tame bass. \
+             Negative values make the visualizer more bass-heavy.");
 
         ui.horizontal(|ui| {
             ui.label("Min dB:");
@@ -1663,7 +1657,6 @@ impl VisualizerApp {
             help_text(ui, "How slowly the AGC lifts quiet material. Lower = smoother.");
         }
 
-        // ── Timing ──
         ui.separator();
         ui.heading("Timing");
 
@@ -1673,11 +1666,9 @@ impl VisualizerApp {
              higher = smoother but more CPU.");
         help_text(ui, &format!("≈ {:.1} ms per frame", 1000.0 / a.poll_rate_hz.max(1.0)));
 
-        // ── Ballistics ──
         ui.separator();
         ui.heading("Ballistics");
 
-        // Apply per-mode defaults when the user switches decay modes.
         if a.decay_mode != self.last_decay_mode {
             let (atk, dec) = a.decay_mode.default_ballistics();
             a.attack_time_ms = atk;
@@ -1715,7 +1706,6 @@ impl VisualizerApp {
                  Higher = snappier fall.");
         }
 
-        // ── Rhythm ──
         ui.separator();
         ui.heading("Rhythm");
 
@@ -1773,6 +1763,10 @@ impl VisualizerApp {
         ui.add(egui::Slider::new(&mut self.config.bar_gap, 0.0..=20.0).text("Bar gap"));
         ui.add(egui::Slider::new(&mut self.config.max_bar_height, 0.0..=1000.0).text("Max Bar Height (0 = Full)"));
         ui.add(egui::Slider::new(&mut self.config.audio.num_bars, 16..=256).text("Number of Bars"));
+
+        ui.add(egui::Slider::new(&mut self.config.height_scale, 0.1..=1.0).text("Height Scale"))
+            .custom_formatter(|n, _| format!("{:.0}%", n * 100.0));
+        help_text(ui, "Scales how much of the screen the visualizer fills.");
 
         ui.separator();
         ui.heading("Positioning");
