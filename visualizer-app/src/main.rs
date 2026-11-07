@@ -1521,11 +1521,14 @@ impl VisualizerApp {
         });
     }
 
-    fn draw_audio_settings_ui(&mut self, ui: &mut egui::Ui) {
-        let a = &mut self.config.audio;
-        let detected = AudioPreset::detect(a);
+        fn draw_audio_settings_ui(&mut self, ui: &mut egui::Ui) {
+        let detected = AudioPreset::detect(&self.config.audio);
 
         // ── Presets ──
+        // NOTE: the preset picker must run *before* we borrow
+        // `self.config.audio` mutably below. We capture the click in a
+        // local and apply it after the closure — that's what keeps the
+        // borrow checker happy.
         ui.heading("Audio");
         ui.label(
             egui::RichText::new(
@@ -1536,6 +1539,7 @@ impl VisualizerApp {
             .small(),
         );
 
+        let mut chosen_preset: Option<AudioPreset> = None;
         ui.horizontal(|ui| {
             ui.label("Preset:");
             let current_label = detected.map(|p| p.display_name()).unwrap_or("Custom");
@@ -1546,17 +1550,23 @@ impl VisualizerApp {
                     for preset in AudioPreset::all() {
                         let is_active = detected == Some(preset);
                         if ui.selectable_label(is_active, preset.display_name()).clicked() {
-                            preset.apply(&mut self.config.audio);
-                            self.last_decay_mode = self.config.audio.decay_mode;
+                            chosen_preset = Some(preset);
                         }
                     }
                 });
         });
+        if let Some(p) = chosen_preset {
+            p.apply(&mut self.config.audio);
+            self.last_decay_mode = self.config.audio.decay_mode;
+        }
         if let Some(p) = detected {
             help_text(ui, p.description());
         } else {
             help_text(ui, "Custom settings — pick a preset above to reset, or tweak freely.");
         }
+
+        // NOW safe to take the mutable borrow of `self.config.audio`.
+        let a = &mut self.config.audio;
 
         // ── Signal Processing ──
         ui.separator();
