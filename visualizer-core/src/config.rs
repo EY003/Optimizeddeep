@@ -45,6 +45,12 @@ impl VerticalColorStyle {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GradientStop { pub color: [u8; 3], pub position: f32 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ColorPreset {
+    pub color: [u8; 3],
+    #[serde(default)] pub is_premade: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StaticMultiPreset {
     pub name: String, pub colors: Vec<[u8; 3]>,
@@ -142,6 +148,7 @@ pub enum MotionShape {
     SineWave, TriangleWave, SquareWave, SawtoothWave,
     Strobe, Pulse, Heartbeat, Stutter, Comet, Chase, BouncingBall, Sparkle,
     FireSimulation, Plasma, RainbowCycle, Confetti, Sinelon,
+    Breathing, FlipFlop, Kaleidoscope, DigitalRain, MeteorShower,
 }
 impl Default for MotionShape { fn default() -> Self { MotionShape::Uniform } }
 impl MotionShape {
@@ -172,6 +179,11 @@ impl MotionShape {
             MotionShape::RainbowCycle => "Rainbow Cycle",
             MotionShape::Confetti => "Confetti",
             MotionShape::Sinelon => "Sinelon",
+            MotionShape::Breathing => "Breathing",
+            MotionShape::FlipFlop => "Flip Flop",
+            MotionShape::Kaleidoscope => "Kaleidoscope",
+            MotionShape::DigitalRain => "Digital Rain",
+            MotionShape::MeteorShower => "Meteor Shower",
         }
     }
     pub fn uses_vertical_axis(self) -> bool {
@@ -179,7 +191,8 @@ impl MotionShape {
             MotionShape::VerticalWipe | MotionShape::DiagonalWipe
             | MotionShape::RadialWipe | MotionShape::Spiral
             | MotionShape::WaveInterference | MotionShape::Ripple
-            | MotionShape::Plasma
+            | MotionShape::Plasma | MotionShape::Kaleidoscope
+            | MotionShape::DigitalRain | MotionShape::MeteorShower
         )
     }
     pub fn uses_intensity(self) -> bool {
@@ -189,9 +202,10 @@ impl MotionShape {
             | MotionShape::Comet | MotionShape::Chase | MotionShape::BouncingBall
             | MotionShape::Sparkle | MotionShape::Sinelon
             | MotionShape::FireSimulation | MotionShape::Confetti
+            | MotionShape::Breathing | MotionShape::FlipFlop | MotionShape::DigitalRain | MotionShape::MeteorShower
         )
     }
-    pub fn all() -> [MotionShape; 25] {
+    pub fn all() -> [MotionShape; 30] {
         [
             MotionShape::Uniform, MotionShape::HorizontalWipe, MotionShape::VerticalWipe,
             MotionShape::DiagonalWipe, MotionShape::RadialWipe, MotionShape::Spiral,
@@ -201,7 +215,9 @@ impl MotionShape {
             MotionShape::Heartbeat, MotionShape::Stutter, MotionShape::Comet,
             MotionShape::Chase, MotionShape::BouncingBall, MotionShape::Sparkle,
             MotionShape::FireSimulation, MotionShape::Plasma, MotionShape::RainbowCycle,
-            MotionShape::Confetti, MotionShape::Sinelon,
+            MotionShape::Confetti, MotionShape::Sinelon, MotionShape::Breathing,
+            MotionShape::FlipFlop, MotionShape::Kaleidoscope, MotionShape::DigitalRain,
+            MotionShape::MeteorShower,
         ]
     }
 }
@@ -416,7 +432,7 @@ impl BarInterpolation {
 }
 
 // ─────────────────────────────────────────────────────────────
-// AudioSettings (unchanged)
+// AudioSettings
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -511,7 +527,7 @@ impl Default for AudioSettings {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Audio presets (unchanged)
+// Audio presets
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -634,7 +650,7 @@ impl AudioPreset {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Preset builders
+// Default Premade Preset Builders
 // ─────────────────────────────────────────────────────────────
 
 fn smp(name: &str, colors: Vec<[u8; 3]>, mode: StaticDistributionMode, bars: usize) -> StaticMultiPreset {
@@ -660,7 +676,7 @@ fn ccp(name: &str, colors: Vec<[u8; 3]>, speed: f32, motion: MotionSettings) -> 
 }
 
 // ─────────────────────────────────────────────────────────────
-// Default presets
+// Defaults
 // ─────────────────────────────────────────────────────────────
 
 fn default_static_colors() -> Vec<[u8; 3]> { vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]] }
@@ -679,6 +695,19 @@ fn default_static_single_source() -> ColorSource {
 fn default_static_multi_source() -> ColorSource { ColorSource::Static(default_static_colors()) }
 fn default_animated_source() -> ColorSource { ColorSource::Static(default_static_colors()) }
 fn default_gradient_source() -> GradientSource { GradientSource::Static(default_gradient_stops()) }
+
+fn default_color_presets() -> Vec<ColorPreset> {
+    let colors = [
+        // Standard & Neon
+        [255, 0, 0], [255, 128, 0], [255, 255, 0], [128, 255, 0], [0, 255, 0], [0, 255, 128],
+        [0, 255, 255], [0, 128, 255], [0, 0, 255], [128, 0, 255], [255, 0, 255], [255, 0, 128],
+        // Grays & White
+        [255, 255, 255], [200, 200, 200], [150, 150, 150], [100, 100, 100], [50, 50, 50], [0, 0, 0],
+        // Pastel, Earth & Rich Tones
+        [255, 105, 180], [255, 165, 0], [75, 0, 130], [0, 191, 255], [34, 139, 34], [139, 69, 19]
+    ];
+    colors.iter().map(|&c| ColorPreset { color: c, is_premade: true }).collect()
+}
 
 fn default_static_multi_presets() -> Vec<StaticMultiPreset> {
     use StaticDistributionMode::*;
@@ -699,6 +728,13 @@ fn default_static_multi_presets() -> Vec<StaticMultiPreset> {
         smp("Pastel Dream",      vec![[255, 182, 193], [173, 216, 230], [144, 238, 144], [255, 255, 224]],     Blocks,     1),
         smp("Tropical",          vec![[0, 200, 150], [255, 200, 0], [255, 80, 80]],                           Random,     1),
         smp("Northern Sky",      vec![[10, 10, 60], [40, 40, 140], [80, 120, 220], [160, 200, 255]],           Vertical,   1),
+        // Additional Premades
+        smp("Galactic Core",     vec![[255, 255, 255], [255, 230, 150], [200, 100, 255], [60, 0, 120]],        Vertical,   1),
+        smp("Autumn Leaves",     vec![[100, 30, 0], [200, 80, 20], [230, 150, 40], [255, 220, 100]],           Vertical,   1),
+        smp("Retro Arcade",      vec![[0, 255, 0], [0, 100, 0], [255, 0, 255], [100, 0, 100]],                 Sequential, 4),
+        smp("Bioluminescence",   vec![[0, 50, 100], [0, 150, 200], [0, 255, 200], [100, 255, 150]],            Vertical,   1),
+        smp("Candy Cane",        vec![[255, 0, 0], [255, 255, 255], [255, 0, 0], [255, 255, 255]],             Sequential, 1),
+        smp("Midnight Sun",      vec![[20, 0, 40], [80, 0, 80], [200, 0, 100], [255, 100, 0]],                 Vertical,   1),
     ]
 }
 
@@ -720,6 +756,13 @@ fn default_gradient_presets() -> Vec<GradientPreset> {
         gp("Cyber Grid",       vec![gs([255, 0, 150], 0.0), gs([100, 0, 255], 0.5), gs([0, 255, 255], 1.0)], 45.0),
         gp("Cherry Blossom",   vec![gs([255, 200, 220], 0.0), gs([255, 105, 180], 0.5), gs([180, 50, 120], 1.0)], 0.0),
         gp("Northern Lights",  vec![gs([0, 20, 20], 0.0), gs([0, 180, 150], 0.4), gs([100, 255, 180], 0.7), gs([200, 240, 255], 1.0)], 90.0),
+        // Additional Premades
+        gp("Synthwave",        vec![gs([20, 0, 50], 0.0), gs([255, 0, 100], 0.5), gs([255, 200, 0], 1.0)], 0.0),
+        gp("Deep Space",       vec![gs([0, 0, 0], 0.0), gs([20, 20, 60], 0.4), gs([80, 60, 150], 0.8), gs([255, 255, 255], 1.0)], 90.0),
+        gp("Radioactive",      vec![gs([10, 20, 10], 0.0), gs([50, 255, 50], 0.5), gs([200, 255, 200], 1.0)], 90.0),
+        gp("Desert Mirage",    vec![gs([255, 230, 200], 0.0), gs([240, 160, 80], 0.4), gs([180, 80, 30], 1.0)], 0.0),
+        gp("Electric Blue",    vec![gs([0, 50, 255], 0.0), gs([0, 200, 255], 0.5), gs([255, 255, 255], 1.0)], 90.0),
+        gp("Vintage Sunset",   vec![gs([50, 20, 30], 0.0), gs([200, 80, 60], 0.5), gs([250, 200, 100], 1.0)], 90.0),
     ]
 }
 
@@ -760,6 +803,17 @@ fn default_color_change_presets() -> Vec<ColorChangePreset> {
             0.35, ccms(Ripple, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
         ccp("Wave Interference", vec![[255, 100, 100], [100, 255, 100], [100, 100, 255]],
             0.5, ccms(WaveInterference, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        // Additional Premades
+        ccp("Cyber Rain",        vec![[0, 255, 100], [0, 150, 50], [0, 50, 20]],
+            0.6, ccms(DigitalRain, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Meteor Strike",     vec![[255, 255, 255], [255, 100, 0], [100, 0, 0]],
+            0.7, ccms(MeteorShower, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Zen Breath",        vec![[100, 200, 200], [150, 255, 150]],
+            0.2, ccms(Breathing, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [10, 20, 20], 200)),
+        ccp("Hyper Flash",       vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+            1.0, ccms(FlipFlop, Hard, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Kaleidoscope",      vec![[255, 100, 200], [100, 255, 200], [200, 100, 255]],
+            0.4, ccms(Kaleidoscope, Smooth, 1.0, 0.25, 0.3, 3.0, 0.1, [0, 0, 0], 255)),
     ]
 }
 
@@ -767,13 +821,28 @@ fn default_color_change_presets() -> Vec<ColorChangePreset> {
 // AppConfig
 // ─────────────────────────────────────────────────────────────
 
+fn deserialize_color_presets<'de, D>(deserializer: D) -> Result<Vec<ColorPreset>, D::Error>
+where D: serde::Deserializer<'de> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Helper {
+        Old([u8; 3]),
+        New(ColorPreset),
+    }
+    let vals: Vec<Helper> = Vec::deserialize(deserializer)?;
+    Ok(vals.into_iter().map(|v| match v {
+        Helper::Old(c) => ColorPreset { color: c, is_premade: false },
+        Helper::New(p) => p,
+    }).collect())
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub bar_width: f32, pub bar_gap: f32, pub bar_radius: f32,
     pub dynamic_colors: bool, pub text_border: bool, pub font_path: Option<String>,
     pub bg_opacity: u8,
     #[serde(default)] pub bg_color: [u8; 3],
-    pub color_presets: Vec<[u8; 3]>,
+    #[serde(default = "default_color_presets", deserialize_with = "deserialize_color_presets")] pub color_presets: Vec<ColorPreset>,
     pub x_offset: f32, pub y_offset: f32,
 
     #[serde(default, alias = "bar_outline_enabled")]
@@ -824,10 +893,7 @@ impl Default for AppConfig {
             bar_width: 9.0, bar_gap: 1.0, bar_radius: 2.0,
             dynamic_colors: true, text_border: false, font_path: None,
             bg_opacity: 0, bg_color: [0, 0, 0],
-            color_presets: vec![
-                [255, 255, 255], [0, 255, 255], [255, 0, 255], [255, 255, 0], [255, 0, 0],
-                [0, 255, 0], [0, 0, 255], [255, 165, 0], [128, 0, 128], [0, 128, 128],
-            ],
+            color_presets: default_color_presets(),
             x_offset: 0.0, y_offset: 0.0,
             visualizer_outline_enabled: false,
             visualizer_outline_thickness: 1.0,
@@ -864,36 +930,43 @@ impl AppConfig {
             .join("RustVisualizer").join("config.toml")
     }
 
-    /// Overwrites all premade presets with the shipped defaults, preserving any user presets.
     fn refresh_premade_presets(&mut self) {
-    // If no preset anywhere is marked premade, this config predates the field.
-    // Wipe and replace everything (user said they haven't released yet).
-    let has_any_premade = self.static_multi_presets.iter().any(|p| p.is_premade)
-        || self.gradient_presets.iter().any(|p| p.is_premade)
-        || self.color_change_presets.iter().any(|p| p.is_premade);
-    if !has_any_premade {
-        self.static_multi_presets = default_static_multi_presets();
-        self.gradient_presets = default_gradient_presets();
-        self.color_change_presets = default_color_change_presets();
-        return;
+        let has_any_premade = self.static_multi_presets.iter().any(|p| p.is_premade)
+            || self.gradient_presets.iter().any(|p| p.is_premade)
+            || self.color_change_presets.iter().any(|p| p.is_premade)
+            || self.color_presets.iter().any(|p| p.is_premade);
+        
+        if !has_any_premade {
+            // Clean slate or fully legacy config
+            self.color_presets = default_color_presets();
+            self.static_multi_presets = default_static_multi_presets();
+            self.gradient_presets = default_gradient_presets();
+            self.color_change_presets = default_color_change_presets();
+            return;
+        }
+
+        // Replace premades, keep user presets
+        self.color_presets.retain(|p| !p.is_premade);
+        self.static_multi_presets.retain(|p| !p.is_premade);
+        self.gradient_presets.retain(|p| !p.is_premade);
+        self.color_change_presets.retain(|p| !p.is_premade);
+
+        let mut new_cp = default_color_presets();
+        new_cp.append(&mut self.color_presets);
+        self.color_presets = new_cp;
+
+        let mut new_smp = default_static_multi_presets();
+        new_smp.append(&mut self.static_multi_presets);
+        self.static_multi_presets = new_smp;
+
+        let mut new_gp = default_gradient_presets();
+        new_gp.append(&mut self.gradient_presets);
+        self.gradient_presets = new_gp;
+
+        let mut new_ccp = default_color_change_presets();
+        new_ccp.append(&mut self.color_change_presets);
+        self.color_change_presets = new_ccp;
     }
-    // Otherwise: replace premades, keep user presets.
-    self.static_multi_presets.retain(|p| !p.is_premade);
-    self.gradient_presets.retain(|p| !p.is_premade);
-    self.color_change_presets.retain(|p| !p.is_premade);
-
-    let mut new_smp = default_static_multi_presets();
-    new_smp.append(&mut self.static_multi_presets);
-    self.static_multi_presets = new_smp;
-
-    let mut new_gp = default_gradient_presets();
-    new_gp.append(&mut self.gradient_presets);
-    self.gradient_presets = new_gp;
-
-    let mut new_ccp = default_color_change_presets();
-    new_ccp.append(&mut self.color_change_presets);
-    self.color_change_presets = new_ccp;
-}
 
     pub fn load() -> Self {
         let path = Self::get_path();
