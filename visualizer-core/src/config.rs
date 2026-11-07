@@ -24,6 +24,25 @@ impl Default for ColorMode { fn default() -> Self { ColorMode::StaticSingle } }
 pub enum StaticDistributionMode { Blocks, Sequential, Random, Vertical }
 impl Default for StaticDistributionMode { fn default() -> Self { StaticDistributionMode::Blocks } }
 
+// NEW: Added to allow switching between the old and new vertical styles
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerticalColorStyle { Gradient, Blocks }
+impl Default for VerticalColorStyle { fn default() -> Self { VerticalColorStyle::Gradient } }
+impl VerticalColorStyle {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            VerticalColorStyle::Gradient => "Gradient (Smooth Blend)",
+            VerticalColorStyle::Blocks => "Blocks (Distinct Sections)",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            VerticalColorStyle::Gradient => "Smoothly blends all colors vertically across the bar.",
+            VerticalColorStyle::Blocks => "Divides the bar into solid, distinct color sections (classic style).",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GradientStop { pub color: [u8; 3], pub position: f32 }
 
@@ -618,7 +637,6 @@ pub struct AppConfig {
     pub color_presets: Vec<[u8; 3]>,
     pub x_offset: f32, pub y_offset: f32,
 
-    // Renamed from bar_outline to visualizer_outline
     #[serde(default, alias = "bar_outline_enabled")] 
     pub visualizer_outline_enabled: bool,
     #[serde(default = "default_visualizer_outline_thickness", alias = "bar_outline_thickness")] 
@@ -637,6 +655,9 @@ pub struct AppConfig {
     #[serde(default)] pub static_mode: StaticDistributionMode,
     #[serde(default = "default_sequential_bars_per_color")] pub sequential_bars_per_color: usize,
     #[serde(default = "default_static_multi_presets")] pub static_multi_presets: Vec<StaticMultiPreset>,
+    
+    // NEW: Defines how vertical colors are rendered (Gradient or Blocks)
+    #[serde(default)] pub vertical_color_style: VerticalColorStyle,
 
     #[serde(default = "default_gradient_source")] pub gradient_source: GradientSource,
     #[serde(default)] pub gradient_angle: f32,
@@ -741,6 +762,7 @@ impl Default for AppConfig {
             static_mode: StaticDistributionMode::Blocks,
             sequential_bars_per_color: default_sequential_bars_per_color(),
             static_multi_presets: default_static_multi_presets(),
+            vertical_color_style: VerticalColorStyle::default(),
             gradient_source: default_gradient_source(),
             gradient_angle: 0.0,
             gradient_presets: default_gradient_presets(),
