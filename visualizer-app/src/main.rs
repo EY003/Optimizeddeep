@@ -13,7 +13,7 @@ use visualizer_core::{
     config::{
         AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
         ColorChangePreset, ColorMode, ColorPreset, ColorSource, DecayMode, FrequencyDirection,
-        FrequencyScaling, GradientPreset, GradientSource, GradientStop, MotionShape, MotionSettings,
+        FrequencyScaling, GradientPreset, GradientSource, GradientStop, MotionShape,
         PalettePriority, StaticDistributionMode, StaticMultiPreset, TrackInfoConfig,
         TrackTextAlign, TrackTextColorMode, VerticalColorStyle, VisualizerDirection, WindowFunction,
     },
@@ -1379,7 +1379,7 @@ impl VisualizerApp {
         let freq_dir = self.config.frequency_direction;
         let is_smooth = self.config.audio.bar_interpolation == BarInterpolation::Smooth;
 
-        let mut max_val = 0.0;
+        let mut max_val: f32 = 0.0;
         for i in 0..base_num_bars {
             max_val = max_val.max(self.current_bars[i]);
         }
