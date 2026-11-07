@@ -866,24 +866,34 @@ impl AppConfig {
 
     /// Overwrites all premade presets with the shipped defaults, preserving any user presets.
     fn refresh_premade_presets(&mut self) {
-        // Drop all premades
-        self.static_multi_presets.retain(|p| !p.is_premade);
-        self.gradient_presets.retain(|p| !p.is_premade);
-        self.color_change_presets.retain(|p| !p.is_premade);
-
-        // Prepend defaults
-        let mut new_smp = default_static_multi_presets();
-        new_smp.append(&mut self.static_multi_presets);
-        self.static_multi_presets = new_smp;
-
-        let mut new_gp = default_gradient_presets();
-        new_gp.append(&mut self.gradient_presets);
-        self.gradient_presets = new_gp;
-
-        let mut new_ccp = default_color_change_presets();
-        new_ccp.append(&mut self.color_change_presets);
-        self.color_change_presets = new_ccp;
+    // If no preset anywhere is marked premade, this config predates the field.
+    // Wipe and replace everything (user said they haven't released yet).
+    let has_any_premade = self.static_multi_presets.iter().any(|p| p.is_premade)
+        || self.gradient_presets.iter().any(|p| p.is_premade)
+        || self.color_change_presets.iter().any(|p| p.is_premade);
+    if !has_any_premade {
+        self.static_multi_presets = default_static_multi_presets();
+        self.gradient_presets = default_gradient_presets();
+        self.color_change_presets = default_color_change_presets();
+        return;
     }
+    // Otherwise: replace premades, keep user presets.
+    self.static_multi_presets.retain(|p| !p.is_premade);
+    self.gradient_presets.retain(|p| !p.is_premade);
+    self.color_change_presets.retain(|p| !p.is_premade);
+
+    let mut new_smp = default_static_multi_presets();
+    new_smp.append(&mut self.static_multi_presets);
+    self.static_multi_presets = new_smp;
+
+    let mut new_gp = default_gradient_presets();
+    new_gp.append(&mut self.gradient_presets);
+    self.gradient_presets = new_gp;
+
+    let mut new_ccp = default_color_change_presets();
+    new_ccp.append(&mut self.color_change_presets);
+    self.color_change_presets = new_ccp;
+}
 
     pub fn load() -> Self {
         let path = Self::get_path();
