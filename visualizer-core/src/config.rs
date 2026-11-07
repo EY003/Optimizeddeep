@@ -24,7 +24,6 @@ impl Default for ColorMode { fn default() -> Self { ColorMode::StaticSingle } }
 pub enum StaticDistributionMode { Blocks, Sequential, Random, Vertical }
 impl Default for StaticDistributionMode { fn default() -> Self { StaticDistributionMode::Blocks } }
 
-// NEW: Added to allow switching between the old and new vertical styles
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VerticalColorStyle { Gradient, Blocks }
 impl Default for VerticalColorStyle { fn default() -> Self { VerticalColorStyle::Gradient } }
@@ -51,11 +50,19 @@ pub struct StaticMultiPreset {
     pub name: String, pub colors: Vec<[u8; 3]>,
     pub mode: StaticDistributionMode,
     #[serde(default = "default_sequential_bars_per_color")] pub bars_per_color: usize,
+    #[serde(default)] pub is_premade: bool,
 }
 #[derive(Serialize, Deserialize, Clone)]
-pub struct GradientPreset { pub name: String, pub stops: Vec<GradientStop>, pub angle: f32 }
+pub struct GradientPreset {
+    pub name: String, pub stops: Vec<GradientStop>, pub angle: f32,
+    #[serde(default)] pub is_premade: bool,
+}
 #[derive(Serialize, Deserialize, Clone)]
-pub struct ColorChangePreset { pub name: String, pub colors: Vec<[u8; 3]>, pub speed: f32 }
+pub struct ColorChangePreset {
+    pub name: String, pub colors: Vec<[u8; 3]>, pub speed: f32,
+    #[serde(default)] pub is_premade: bool,
+    #[serde(default)] pub motion: MotionSettings,
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PalettePriority { MostCommon, MostCommonLight, Vivid }
@@ -131,6 +138,7 @@ fn default_palette_size() -> u8 { 1 }
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MotionShape {
     Uniform, HorizontalWipe, VerticalWipe, DiagonalWipe,
+    RadialWipe, Spiral, WaveInterference, Ripple,
     SineWave, TriangleWave, SquareWave, SawtoothWave,
     Strobe, Pulse, Heartbeat, Stutter, Comet, Chase, BouncingBall, Sparkle,
     FireSimulation, Plasma, RainbowCycle, Confetti, Sinelon,
@@ -143,6 +151,10 @@ impl MotionShape {
             MotionShape::HorizontalWipe => "Horizontal Wipe",
             MotionShape::VerticalWipe => "Vertical Wipe",
             MotionShape::DiagonalWipe => "Diagonal Wipe",
+            MotionShape::RadialWipe => "Radial Wipe",
+            MotionShape::Spiral => "Spiral",
+            MotionShape::WaveInterference => "Wave Interference",
+            MotionShape::Ripple => "Ripple",
             MotionShape::SineWave => "Sine Wave",
             MotionShape::TriangleWave => "Triangle Wave",
             MotionShape::SquareWave => "Square Wave",
@@ -163,7 +175,12 @@ impl MotionShape {
         }
     }
     pub fn uses_vertical_axis(self) -> bool {
-        matches!(self, MotionShape::VerticalWipe | MotionShape::DiagonalWipe)
+        matches!(self,
+            MotionShape::VerticalWipe | MotionShape::DiagonalWipe
+            | MotionShape::RadialWipe | MotionShape::Spiral
+            | MotionShape::WaveInterference | MotionShape::Ripple
+            | MotionShape::Plasma
+        )
     }
     pub fn uses_intensity(self) -> bool {
         matches!(
@@ -173,6 +190,19 @@ impl MotionShape {
             | MotionShape::Sparkle | MotionShape::Sinelon
             | MotionShape::FireSimulation | MotionShape::Confetti
         )
+    }
+    pub fn all() -> [MotionShape; 25] {
+        [
+            MotionShape::Uniform, MotionShape::HorizontalWipe, MotionShape::VerticalWipe,
+            MotionShape::DiagonalWipe, MotionShape::RadialWipe, MotionShape::Spiral,
+            MotionShape::WaveInterference, MotionShape::Ripple,
+            MotionShape::SineWave, MotionShape::TriangleWave, MotionShape::SquareWave,
+            MotionShape::SawtoothWave, MotionShape::Strobe, MotionShape::Pulse,
+            MotionShape::Heartbeat, MotionShape::Stutter, MotionShape::Comet,
+            MotionShape::Chase, MotionShape::BouncingBall, MotionShape::Sparkle,
+            MotionShape::FireSimulation, MotionShape::Plasma, MotionShape::RainbowCycle,
+            MotionShape::Confetti, MotionShape::Sinelon,
+        ]
     }
 }
 
@@ -186,13 +216,16 @@ pub struct MotionSettings {
     pub trail_length: f32, pub stutter_intensity: f32,
     pub wave_frequency: f32, pub wipe_softness: f32,
     #[serde(default)] pub off_color: [u8; 3],
+    #[serde(default = "default_off_color_opacity")] pub off_color_opacity: u8,
 }
+fn default_off_color_opacity() -> u8 { 255 }
 impl Default for MotionSettings {
     fn default() -> Self {
         Self {
             shape: MotionShape::Uniform, blend: BlendMode::Smooth, speed: 1.0,
             trail_length: 0.25, stutter_intensity: 0.3,
-            wave_frequency: 2.0, wipe_softness: 0.1, off_color: [0, 0, 0],
+            wave_frequency: 2.0, wipe_softness: 0.1,
+            off_color: [0, 0, 0], off_color_opacity: 255,
         }
     }
 }
@@ -383,7 +416,7 @@ impl BarInterpolation {
 }
 
 // ─────────────────────────────────────────────────────────────
-// AudioSettings
+// AudioSettings (unchanged)
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -394,7 +427,6 @@ pub struct AudioSettings {
     #[serde(default)]                                  pub frequency_scaling: FrequencyScaling,
     #[serde(default = "default_min_freq")]             pub min_frequency_hz: f32,
     #[serde(default = "default_max_freq")]             pub max_frequency_hz: f32,
-
     #[serde(default = "default_min_db")]               pub min_decibels: f32,
     #[serde(default = "default_max_db")]               pub max_decibels: f32,
     #[serde(default = "default_target_range")]         pub target_dynamic_range_db: f32,
@@ -406,24 +438,19 @@ pub struct AudioSettings {
     #[serde(default = "default_eq_mid")]               pub eq_mid_db: f32,
     #[serde(default = "default_eq_treble")]            pub eq_treble_db: f32,
     #[serde(default = "default_noise_gate")]           pub noise_gate: f32,
-
     #[serde(default = "default_agc_enabled")]          pub agc_enabled: bool,
     #[serde(default = "default_agc_attack")]           pub agc_attack: f32,
     #[serde(default = "default_agc_release")]          pub agc_release: f32,
-
     #[serde(default = "default_poll_rate_hz")]         pub poll_rate_hz: f32,
-
     #[serde(default = "default_attack_ms")]            pub attack_time_ms: f32,
     #[serde(default = "default_decay_ms")]             pub decay_time_ms: f32,
     #[serde(default)]                                  pub decay_mode: DecayMode,
     #[serde(default = "default_average_size")]         pub average_size: usize,
     #[serde(default = "default_peak_hold_ms")]         pub peak_hold_ms: f32,
     #[serde(default = "default_gravity_coeff")]        pub gravity_coefficient: f32,
-
     #[serde(default)]                                  pub channel_mix: ChannelMixMode,
     #[serde(default)]                                  pub beat_focus: BeatFocusMode,
     #[serde(default)]                                  pub bar_interpolation: BarInterpolation,
-
     #[serde(default = "default_beat_sensitivity")]     pub beat_detection_sensitivity: f32,
     #[serde(default = "default_energy_threshold")]     pub energy_threshold_multiplier: f32,
     #[serde(default)]                                  pub bpm_lock_enabled: bool,
@@ -484,14 +511,13 @@ impl Default for AudioSettings {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Audio presets
+// Audio presets (unchanged)
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AudioPreset {
     Universal, Pop, Rock, Electronic, HipHop, Classical, Piano, Jazz, Ambient,
 }
-
 impl AudioPreset {
     pub fn all() -> [AudioPreset; 9] {
         [
@@ -500,7 +526,6 @@ impl AudioPreset {
             AudioPreset::Piano, AudioPreset::Jazz, AudioPreset::Ambient,
         ]
     }
-
     pub fn display_name(self) -> &'static str {
         match self {
             AudioPreset::Universal => "Universal",
@@ -514,7 +539,6 @@ impl AudioPreset {
             AudioPreset::Ambient => "Ambient",
         }
     }
-
     pub fn description(self) -> &'static str {
         match self {
             AudioPreset::Universal => "Balanced defaults that work well across most music.",
@@ -528,12 +552,10 @@ impl AudioPreset {
             AudioPreset::Ambient => "Slow and flowing — heavy smoothing, no peak-hold, soft attack.",
         }
     }
-
     pub fn settings(self) -> AudioSettings {
         let d = AudioSettings::default();
         match self {
             AudioPreset::Universal => d,
-
             AudioPreset::Pop => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hann,
                 sensitivity: 55.0, response_gamma: 1.8, spectrum_tilt: 1.5,
@@ -542,17 +564,14 @@ impl AudioPreset {
                 beat_detection_sensitivity: 0.6, energy_threshold_multiplier: 1.4,
                 ..d
             },
-
             AudioPreset::Rock => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hamming,
                 sensitivity: 55.0, response_gamma: 1.6, spectrum_tilt: 2.0,
                 target_dynamic_range_db: 60.0, attack_time_ms: 3.0,
                 decay_time_ms: 250.0, decay_mode: DecayMode::Exponential,
                 average_size: 2, beat_detection_sensitivity: 0.55,
-                eq_mid_db: 1.5, beat_focus: BeatFocusMode::Mid,
-                ..d
+                eq_mid_db: 1.5, beat_focus: BeatFocusMode::Mid, ..d
             },
-
             AudioPreset::Electronic => AudioSettings {
                 fft_size: 1024, window_function: WindowFunction::Hann,
                 sensitivity: 60.0, response_gamma: 2.0, spectrum_tilt: 1.5,
@@ -560,10 +579,8 @@ impl AudioPreset {
                 decay_time_ms: 150.0, decay_mode: DecayMode::Gravity,
                 average_size: 1, beat_detection_sensitivity: 0.7,
                 energy_threshold_multiplier: 1.3, bpm_lock_enabled: true,
-                eq_bass_db: 1.5, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass,
-                ..d
+                eq_bass_db: 1.5, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass, ..d
             },
-
             AudioPreset::HipHop => AudioSettings {
                 fft_size: 1024, window_function: WindowFunction::Hann,
                 sensitivity: 65.0, response_gamma: 1.8, spectrum_tilt: 1.0,
@@ -571,10 +588,8 @@ impl AudioPreset {
                 decay_time_ms: 250.0, decay_mode: DecayMode::Gravity,
                 average_size: 1, beat_detection_sensitivity: 0.7,
                 energy_threshold_multiplier: 1.3, eq_bass_db: 2.5,
-                beat_focus: BeatFocusMode::Bass,
-                ..d
+                beat_focus: BeatFocusMode::Bass, ..d
             },
-
             AudioPreset::Classical => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
                 min_decibels: -95.0, max_decibels: -15.0, target_dynamic_range_db: 75.0,
@@ -584,7 +599,6 @@ impl AudioPreset {
                 beat_detection_sensitivity: 0.4, max_frequency_hz: 18000.0,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
-
             AudioPreset::Piano => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
                 min_decibels: -90.0, max_decibels: -20.0, target_dynamic_range_db: 65.0,
@@ -594,16 +608,13 @@ impl AudioPreset {
                 max_frequency_hz: 5000.0, eq_mid_db: 1.0,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
-
             AudioPreset::Jazz => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hamming,
                 min_decibels: -85.0, max_decibels: -22.0, target_dynamic_range_db: 60.0,
                 sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.5,
                 attack_time_ms: 10.0, decay_time_ms: 400.0, decay_mode: DecayMode::Exponential,
-                average_size: 3, beat_detection_sensitivity: 0.45,
-                ..d
+                average_size: 3, beat_detection_sensitivity: 0.45, ..d
             },
-
             AudioPreset::Ambient => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
                 min_decibels: -95.0, max_decibels: -25.0, target_dynamic_range_db: 70.0,
@@ -613,15 +624,143 @@ impl AudioPreset {
             },
         }
     }
-
     pub fn apply(self, s: &mut AudioSettings) { *s = self.settings(); }
-
     pub fn detect(s: &AudioSettings) -> Option<AudioPreset> {
         for p in Self::all() {
             if p.settings() == *s { return Some(p); }
         }
         None
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Preset builders
+// ─────────────────────────────────────────────────────────────
+
+fn smp(name: &str, colors: Vec<[u8; 3]>, mode: StaticDistributionMode, bars: usize) -> StaticMultiPreset {
+    StaticMultiPreset { name: name.into(), colors, mode, bars_per_color: bars, is_premade: true }
+}
+
+fn gp(name: &str, stops: Vec<GradientStop>, angle: f32) -> GradientPreset {
+    GradientPreset { name: name.into(), stops, angle, is_premade: true }
+}
+
+fn gs(color: [u8; 3], position: f32) -> GradientStop { GradientStop { color, position } }
+
+fn ccms(shape: MotionShape, blend: BlendMode, speed: f32, trail: f32, stutter: f32, wave: f32, wipe: f32, off: [u8; 3], off_a: u8) -> MotionSettings {
+    MotionSettings {
+        shape, blend, speed, trail_length: trail, stutter_intensity: stutter,
+        wave_frequency: wave, wipe_softness: wipe,
+        off_color: off, off_color_opacity: off_a,
+    }
+}
+
+fn ccp(name: &str, colors: Vec<[u8; 3]>, speed: f32, motion: MotionSettings) -> ColorChangePreset {
+    ColorChangePreset { name: name.into(), colors, speed, is_premade: true, motion }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Default presets
+// ─────────────────────────────────────────────────────────────
+
+fn default_static_colors() -> Vec<[u8; 3]> { vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]] }
+fn default_gradient_stops() -> Vec<GradientStop> {
+    vec![GradientStop { color: [255, 0, 0], position: 0.0 }, GradientStop { color: [0, 0, 255], position: 1.0 }]
+}
+fn default_speed() -> f32 { 0.5 }
+fn default_sequential_bars_per_color() -> usize { 1 }
+fn default_visualizer_outline_thickness() -> f32 { 1.0 }
+fn default_visualizer_outline_color() -> [u8; 3] { [0, 0, 0] }
+fn default_height_scale() -> f32 { 0.5 }
+
+fn default_static_single_source() -> ColorSource {
+    ColorSource::Dynamic { palette_size: 1, variants_per_color: 0, priority: PalettePriority::MostCommon }
+}
+fn default_static_multi_source() -> ColorSource { ColorSource::Static(default_static_colors()) }
+fn default_animated_source() -> ColorSource { ColorSource::Static(default_static_colors()) }
+fn default_gradient_source() -> GradientSource { GradientSource::Static(default_gradient_stops()) }
+
+fn default_static_multi_presets() -> Vec<StaticMultiPreset> {
+    use StaticDistributionMode::*;
+    vec![
+        smp("Sunset Boulevard",  vec![[255, 94, 0], [255, 0, 128], [128, 0, 255]],                              Blocks,     1),
+        smp("Deep Ocean",        vec![[0, 30, 60], [0, 100, 160], [0, 180, 216], [144, 224, 239]],             Sequential, 2),
+        smp("Enchanted Forest",  vec![[20, 80, 20], [34, 139, 34], [50, 205, 50], [144, 238, 144]],            Random,     1),
+        smp("Cyberpunk Neon",    vec![[255, 0, 255], [0, 255, 255], [255, 255, 0]],                           Vertical,   1),
+        smp("Traffic Light",     vec![[255, 60, 60], [255, 200, 60], [60, 220, 60]],                          Vertical,   1),
+        smp("Thermal Camera",    vec![[40, 20, 80], [140, 20, 140], [240, 80, 40], [255, 220, 60]],            Vertical,   1),
+        smp("Fire & Ice",        vec![[255, 50, 0], [255, 150, 0], [100, 200, 255], [0, 150, 255]],            Vertical,   1),
+        smp("Vaporwave",         vec![[255, 113, 206], [1, 205, 254], [5, 255, 161], [185, 103, 255]],          Vertical,   1),
+        smp("Rainbow Blocks",    vec![[255, 0, 0], [255, 127, 0], [255, 255, 0], [0, 255, 0], [0, 0, 255], [75, 0, 130], [148, 0, 211]], Blocks, 1),
+        smp("Candy Shop",        vec![[255, 105, 180], [255, 215, 0], [0, 255, 255]],                          Sequential, 3),
+        smp("Lava Lamp",         vec![[255, 0, 0], [255, 100, 0], [150, 0, 200], [80, 0, 150]],                Random,     1),
+        smp("Monochrome",        vec![[255, 255, 255], [150, 150, 150], [80, 80, 80]],                        Sequential, 2),
+        smp("Iris Stack",        vec![[80, 40, 20], [180, 80, 60], [240, 180, 100], [220, 240, 180], [100, 180, 120]], Vertical, 1),
+        smp("Pastel Dream",      vec![[255, 182, 193], [173, 216, 230], [144, 238, 144], [255, 255, 224]],     Blocks,     1),
+        smp("Tropical",          vec![[0, 200, 150], [255, 200, 0], [255, 80, 80]],                           Random,     1),
+        smp("Northern Sky",      vec![[10, 10, 60], [40, 40, 140], [80, 120, 220], [160, 200, 255]],           Vertical,   1),
+    ]
+}
+
+fn default_gradient_presets() -> Vec<GradientPreset> {
+    vec![
+        gp("Sunset",           vec![gs([255, 94, 0], 0.0), gs([255, 0, 128], 0.5), gs([128, 0, 255], 1.0)], 0.0),
+        gp("Ocean Deep",       vec![gs([0, 30, 60], 0.0), gs([0, 180, 216], 0.5), gs([144, 224, 239], 1.0)], 90.0),
+        gp("Rainbow",          vec![gs([255, 0, 0], 0.0), gs([255, 127, 0], 0.17), gs([255, 255, 0], 0.33), gs([0, 255, 0], 0.5), gs([0, 0, 255], 0.67), gs([75, 0, 130], 0.83), gs([148, 0, 211], 1.0)], 45.0),
+        gp("Fire",             vec![gs([255, 0, 0], 0.0), gs([255, 165, 0], 0.5), gs([255, 255, 0], 1.0)], 90.0),
+        gp("Aurora",           vec![gs([0, 255, 150], 0.0), gs([0, 150, 255], 0.5), gs([150, 0, 255], 1.0)], 90.0),
+        gp("Cotton Candy",     vec![gs([255, 182, 193], 0.0), gs([173, 216, 230], 0.5), gs([255, 105, 180], 1.0)], 0.0),
+        gp("Gold Rush",        vec![gs([80, 40, 0], 0.0), gs([255, 180, 0], 0.5), gs([255, 255, 150], 1.0)], 90.0),
+        gp("Neon Nights",      vec![gs([255, 0, 150], 0.0), gs([100, 0, 255], 0.5), gs([0, 255, 255], 1.0)], 45.0),
+        gp("Enchanted Forest", vec![gs([0, 50, 0], 0.0), gs([50, 150, 50], 0.5), gs([200, 255, 150], 1.0)], 90.0),
+        gp("Grayscale",        vec![gs([0, 0, 0], 0.0), gs([255, 255, 255], 1.0)], 90.0),
+        gp("Twilight",         vec![gs([25, 25, 80], 0.0), gs([150, 50, 150], 0.5), gs([255, 150, 100], 1.0)], 90.0),
+        gp("Ice",              vec![gs([200, 240, 255], 0.0), gs([100, 180, 255], 0.5), gs([30, 100, 200], 1.0)], 90.0),
+        gp("Lava Flow",        vec![gs([10, 0, 0], 0.0), gs([180, 30, 0], 0.3), gs([255, 180, 0], 0.7), gs([255, 255, 200], 1.0)], 90.0),
+        gp("Cyber Grid",       vec![gs([255, 0, 150], 0.0), gs([100, 0, 255], 0.5), gs([0, 255, 255], 1.0)], 45.0),
+        gp("Cherry Blossom",   vec![gs([255, 200, 220], 0.0), gs([255, 105, 180], 0.5), gs([180, 50, 120], 1.0)], 0.0),
+        gp("Northern Lights",  vec![gs([0, 20, 20], 0.0), gs([0, 180, 150], 0.4), gs([100, 255, 180], 0.7), gs([200, 240, 255], 1.0)], 90.0),
+    ]
+}
+
+fn default_color_change_presets() -> Vec<ColorChangePreset> {
+    use MotionShape::*; use BlendMode::*;
+    vec![
+        ccp("Rainbow Cycle",     vec![[255, 0, 0], [255, 127, 0], [255, 255, 0], [0, 255, 0], [0, 0, 255], [75, 0, 130], [148, 0, 211]],
+            0.5, ccms(Uniform, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Aurora Veil",       vec![[0, 255, 180], [60, 140, 255], [180, 60, 255]],
+            0.35, ccms(VerticalWipe, Smooth, 1.0, 0.25, 0.3, 2.0, 0.35, [4, 8, 20], 220)),
+        ccp("Comet Tail",        vec![[255, 200, 80], [255, 90, 0], [120, 20, 0]],
+            0.55, ccms(Comet, Smooth, 1.0, 0.55, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Neon Rain",         vec![[255, 0, 255], [0, 255, 255], [0, 255, 120]],
+            0.75, ccms(Chase, Hard, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Heartbeat Pop",     vec![[255, 60, 90], [255, 180, 180]],
+            0.45, ccms(Heartbeat, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [30, 0, 10], 180)),
+        ccp("Candy Sparkle",     vec![[255, 105, 180], [255, 215, 0], [0, 255, 255]],
+            0.4, ccms(Sparkle, Hard, 1.0, 0.25, 0.5, 2.0, 0.1, [20, 0, 20], 200)),
+        ccp("Fireflies",         vec![[255, 220, 0], [255, 120, 0]],
+            0.5, ccms(Confetti, Smooth, 1.0, 0.25, 0.35, 2.0, 0.1, [10, 5, 0], 150)),
+        ccp("Diagonal Storm",    vec![[40, 40, 255], [200, 0, 255], [255, 0, 80]],
+            0.6, ccms(DiagonalWipe, Smooth, 1.0, 0.25, 0.3, 2.0, 0.2, [0, 0, 10], 230)),
+        ccp("Plasma Drift",      vec![[255, 50, 200], [0, 200, 255], [180, 255, 0]],
+            0.3, ccms(Plasma, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Electric Pulse",    vec![[0, 255, 255], [255, 0, 255]],
+            0.65, ccms(Pulse, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Bouncing Comet",    vec![[255, 255, 0], [255, 0, 0]],
+            0.5, ccms(BouncingBall, Smooth, 1.0, 0.4, 0.3, 2.0, 0.1, [10, 10, 0], 220)),
+        ccp("Retro Strobe",      vec![[255, 80, 80], [80, 80, 255]],
+            0.85, ccms(Strobe, Hard, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Smooth Sinelon",    vec![[120, 255, 120], [0, 180, 255], [255, 120, 255]],
+            0.4, ccms(Sinelon, Smooth, 1.0, 0.6, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Radial Burst",      vec![[255, 200, 0], [255, 50, 100], [100, 50, 255]],
+            0.4, ccms(RadialWipe, Smooth, 1.0, 0.25, 0.3, 2.0, 0.15, [0, 0, 0], 255)),
+        ccp("Spiral Galaxy",     vec![[255, 255, 255], [150, 100, 255], [50, 20, 150]],
+            0.3, ccms(Spiral, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Ripple Pond",       vec![[0, 150, 200], [100, 220, 255], [255, 255, 255]],
+            0.35, ccms(Ripple, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+        ccp("Wave Interference", vec![[255, 100, 100], [100, 255, 100], [100, 100, 255]],
+            0.5, ccms(WaveInterference, Smooth, 1.0, 0.25, 0.3, 2.0, 0.1, [0, 0, 0], 255)),
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -637,11 +776,11 @@ pub struct AppConfig {
     pub color_presets: Vec<[u8; 3]>,
     pub x_offset: f32, pub y_offset: f32,
 
-    #[serde(default, alias = "bar_outline_enabled")] 
+    #[serde(default, alias = "bar_outline_enabled")]
     pub visualizer_outline_enabled: bool,
-    #[serde(default = "default_visualizer_outline_thickness", alias = "bar_outline_thickness")] 
+    #[serde(default = "default_visualizer_outline_thickness", alias = "bar_outline_thickness")]
     pub visualizer_outline_thickness: f32,
-    #[serde(default = "default_visualizer_outline_color", alias = "bar_outline_color")]     
+    #[serde(default = "default_visualizer_outline_color", alias = "bar_outline_color")]
     pub visualizer_outline_color: [u8; 3],
 
     pub max_bar_height: f32, pub target_fps: f32, pub show_fps: bool, pub use_vsync: bool,
@@ -655,8 +794,7 @@ pub struct AppConfig {
     #[serde(default)] pub static_mode: StaticDistributionMode,
     #[serde(default = "default_sequential_bars_per_color")] pub sequential_bars_per_color: usize,
     #[serde(default = "default_static_multi_presets")] pub static_multi_presets: Vec<StaticMultiPreset>,
-    
-    // NEW: Defines how vertical colors are rendered (Gradient or Blocks)
+
     #[serde(default)] pub vertical_color_style: VerticalColorStyle,
 
     #[serde(default = "default_gradient_source")] pub gradient_source: GradientSource,
@@ -679,64 +817,6 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub gradient_stops: Option<Vec<GradientStop>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub color_change_colors: Option<Vec<[u8; 3]>>,
 }
-
-fn default_static_colors() -> Vec<[u8; 3]> { vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]] }
-fn default_gradient_stops() -> Vec<GradientStop> {
-    vec![GradientStop { color: [255, 0, 0], position: 0.0 }, GradientStop { color: [0, 0, 255], position: 1.0 }]
-}
-fn default_speed() -> f32 { 0.5 }
-fn default_sequential_bars_per_color() -> usize { 1 }
-fn default_visualizer_outline_thickness() -> f32 { 1.0 }
-fn default_visualizer_outline_color() -> [u8; 3] { [0, 0, 0] }
-fn default_height_scale() -> f32 { 0.5 }
-
-fn default_static_single_source() -> ColorSource {
-    ColorSource::Dynamic { palette_size: 1, variants_per_color: 0, priority: PalettePriority::MostCommon }
-}
-fn default_static_multi_source() -> ColorSource { ColorSource::Static(default_static_colors()) }
-fn default_animated_source() -> ColorSource { ColorSource::Static(default_static_colors()) }
-fn default_gradient_source() -> GradientSource { GradientSource::Static(default_gradient_stops()) }
-
-fn default_static_multi_presets() -> Vec<StaticMultiPreset> { vec![
-    StaticMultiPreset { name: "Sunset Boulevard".into(), colors: vec![[255, 94, 0], [255, 0, 128], [128, 0, 255]], mode: StaticDistributionMode::Blocks, bars_per_color: 1 },
-    StaticMultiPreset { name: "Deep Ocean".into(), colors: vec![[0, 30, 60], [0, 100, 160], [0, 180, 216], [144, 224, 239]], mode: StaticDistributionMode::Sequential, bars_per_color: 2 },
-    StaticMultiPreset { name: "Enchanted Forest".into(), colors: vec![[20, 80, 20], [34, 139, 34], [50, 205, 50], [144, 238, 144]], mode: StaticDistributionMode::Random, bars_per_color: 1 },
-    StaticMultiPreset { name: "Cyberpunk Neon".into(), colors: vec![[255, 0, 255], [0, 255, 255], [255, 255, 0]], mode: StaticDistributionMode::Vertical, bars_per_color: 1 },
-    StaticMultiPreset { name: "Pastel Dream".into(), colors: vec![[255, 182, 193], [173, 216, 230], [144, 238, 144], [255, 255, 224]], mode: StaticDistributionMode::Blocks, bars_per_color: 1 },
-    StaticMultiPreset { name: "Fire & Ice".into(), colors: vec![[255, 50, 0], [255, 150, 0], [100, 200, 255], [0, 150, 255]], mode: StaticDistributionMode::Vertical, bars_per_color: 1 },
-    StaticMultiPreset { name: "Vaporwave".into(), colors: vec![[255, 113, 206], [1, 205, 254], [5, 255, 161], [185, 103, 255]], mode: StaticDistributionMode::Sequential, bars_per_color: 1 },
-    StaticMultiPreset { name: "Candy Shop".into(), colors: vec![[255, 105, 180], [255, 215, 0], [0, 255, 255]], mode: StaticDistributionMode::Sequential, bars_per_color: 3 },
-    StaticMultiPreset { name: "Lava Lamp".into(), colors: vec![[255, 0, 0], [255, 100, 0], [150, 0, 200], [80, 0, 150]], mode: StaticDistributionMode::Random, bars_per_color: 1 },
-    StaticMultiPreset { name: "Monochrome".into(), colors: vec![[255, 255, 255], [150, 150, 150], [80, 80, 80]], mode: StaticDistributionMode::Sequential, bars_per_color: 2 },
-    StaticMultiPreset { name: "Rainbow Blocks".into(), colors: vec![[255, 0, 0], [255, 127, 0], [255, 255, 0], [0, 255, 0], [0, 0, 255], [75, 0, 130], [148, 0, 211]], mode: StaticDistributionMode::Blocks, bars_per_color: 1 },
-    StaticMultiPreset { name: "Tropical".into(), colors: vec![[0, 200, 150], [255, 200, 0], [255, 80, 80]], mode: StaticDistributionMode::Random, bars_per_color: 1 },
-]}
-
-fn default_gradient_presets() -> Vec<GradientPreset> { vec![
-    GradientPreset { name: "Sunset".into(), stops: vec![GradientStop { color: [255, 94, 0], position: 0.0 }, GradientStop { color: [255, 0, 128], position: 0.5 }, GradientStop { color: [128, 0, 255], position: 1.0 }], angle: 0.0 },
-    GradientPreset { name: "Ocean Deep".into(), stops: vec![GradientStop { color: [0, 30, 60], position: 0.0 }, GradientStop { color: [0, 180, 216], position: 0.5 }, GradientStop { color: [144, 224, 239], position: 1.0 }], angle: 90.0 },
-    GradientPreset { name: "Rainbow".into(), stops: vec![GradientStop { color: [255, 0, 0], position: 0.0 }, GradientStop { color: [255, 127, 0], position: 0.17 }, GradientStop { color: [255, 255, 0], position: 0.33 }, GradientStop { color: [0, 255, 0], position: 0.5 }, GradientStop { color: [0, 0, 255], position: 0.67 }, GradientStop { color: [75, 0, 130], position: 0.83 }, GradientStop { color: [148, 0, 211], position: 1.0 }], angle: 45.0 },
-    GradientPreset { name: "Fire".into(), stops: vec![GradientStop { color: [255, 0, 0], position: 0.0 }, GradientStop { color: [255, 165, 0], position: 0.5 }, GradientStop { color: [255, 255, 0], position: 1.0 }], angle: 90.0 },
-    GradientPreset { name: "Aurora".into(), stops: vec![GradientStop { color: [0, 255, 150], position: 0.0 }, GradientStop { color: [0, 150, 255], position: 0.5 }, GradientStop { color: [150, 0, 255], position: 1.0 }], angle: 90.0 },
-    GradientPreset { name: "Cotton Candy".into(), stops: vec![GradientStop { color: [255, 182, 193], position: 0.0 }, GradientStop { color: [173, 216, 230], position: 0.5 }, GradientStop { color: [255, 105, 180], position: 1.0 }], angle: 0.0 },
-    GradientPreset { name: "Gold Rush".into(), stops: vec![GradientStop { color: [80, 40, 0], position: 0.0 }, GradientStop { color: [255, 180, 0], position: 0.5 }, GradientStop { color: [255, 255, 150], position: 1.0 }], angle: 90.0 },
-    GradientPreset { name: "Neon Nights".into(), stops: vec![GradientStop { color: [255, 0, 150], position: 0.0 }, GradientStop { color: [100, 0, 255], position: 0.5 }, GradientStop { color: [0, 255, 255], position: 1.0 }], angle: 45.0 },
-    GradientPreset { name: "Enchanted Forest".into(), stops: vec![GradientStop { color: [0, 50, 0], position: 0.0 }, GradientStop { color: [50, 150, 50], position: 0.5 }, GradientStop { color: [200, 255, 150], position: 1.0 }], angle: 90.0 },
-    GradientPreset { name: "Grayscale".into(), stops: vec![GradientStop { color: [0, 0, 0], position: 0.0 }, GradientStop { color: [255, 255, 255], position: 1.0 }], angle: 90.0 },
-    GradientPreset { name: "Twilight".into(), stops: vec![GradientStop { color: [25, 25, 80], position: 0.0 }, GradientStop { color: [150, 50, 150], position: 0.5 }, GradientStop { color: [255, 150, 100], position: 1.0 }], angle: 90.0 },
-    GradientPreset { name: "Ice".into(), stops: vec![GradientStop { color: [200, 240, 255], position: 0.0 }, GradientStop { color: [100, 180, 255], position: 0.5 }, GradientStop { color: [30, 100, 200], position: 1.0 }], angle: 90.0 },
-]}
-
-fn default_color_change_presets() -> Vec<ColorChangePreset> { vec![
-    ColorChangePreset { name: "Rainbow".into(), colors: vec![[255, 0, 0], [255, 127, 0], [255, 255, 0], [0, 255, 0], [0, 0, 255], [75, 0, 130], [148, 0, 211]], speed: 0.5 },
-    ColorChangePreset { name: "Pastel Cycle".into(), colors: vec![[255, 182, 193], [173, 216, 230], [144, 238, 144], [255, 255, 224]], speed: 0.2 },
-    ColorChangePreset { name: "Neon Pulse".into(), colors: vec![[255, 0, 255], [0, 255, 255], [255, 255, 0]], speed: 0.7 },
-    ColorChangePreset { name: "Warm Fire".into(), colors: vec![[255, 50, 0], [255, 150, 0], [255, 220, 0]], speed: 0.4 },
-    ColorChangePreset { name: "Ocean Waves".into(), colors: vec![[0, 50, 150], [0, 150, 220], [100, 220, 255]], speed: 0.3 },
-    ColorChangePreset { name: "Traffic".into(), colors: vec![[255, 0, 0], [255, 220, 0], [0, 200, 0]], speed: 0.5 },
-    ColorChangePreset { name: "Cotton Candy".into(), colors: vec![[255, 105, 180], [255, 182, 193], [200, 150, 255]], speed: 0.2 },
-    ColorChangePreset { name: "Cyberpunk".into(), colors: vec![[255, 0, 255], [0, 255, 255], [255, 255, 0]], speed: 0.6 },
-]}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -784,6 +864,27 @@ impl AppConfig {
             .join("RustVisualizer").join("config.toml")
     }
 
+    /// Overwrites all premade presets with the shipped defaults, preserving any user presets.
+    fn refresh_premade_presets(&mut self) {
+        // Drop all premades
+        self.static_multi_presets.retain(|p| !p.is_premade);
+        self.gradient_presets.retain(|p| !p.is_premade);
+        self.color_change_presets.retain(|p| !p.is_premade);
+
+        // Prepend defaults
+        let mut new_smp = default_static_multi_presets();
+        new_smp.append(&mut self.static_multi_presets);
+        self.static_multi_presets = new_smp;
+
+        let mut new_gp = default_gradient_presets();
+        new_gp.append(&mut self.gradient_presets);
+        self.gradient_presets = new_gp;
+
+        let mut new_ccp = default_color_change_presets();
+        new_ccp.append(&mut self.color_change_presets);
+        self.color_change_presets = new_ccp;
+    }
+
     pub fn load() -> Self {
         let path = Self::get_path();
         if let Ok(content) = std::fs::read_to_string(path) {
@@ -796,7 +897,6 @@ impl AppConfig {
                     config.color_mode = ColorMode::StaticSingle;
                     config.static_single_source = ColorSource::Dynamic { palette_size: 1, variants_per_color: 0, priority: PalettePriority::MostCommon };
                 }
-
                 if let Some(n) = config.num_bars.take() { config.audio.num_bars = n; }
                 if let Some(f) = config.fft_size.take() { config.audio.fft_size = f; }
                 if let Some(ms) = config.audio_update_ms.take() {
@@ -804,9 +904,7 @@ impl AppConfig {
                 }
                 if let Some(s) = config.sensitivity.take() { config.audio.sensitivity = s.clamp(0.0, 100.0); }
 
-                if config.static_multi_presets.is_empty() { config.static_multi_presets = default_static_multi_presets(); }
-                if config.gradient_presets.is_empty()     { config.gradient_presets = default_gradient_presets(); }
-                if config.color_change_presets.is_empty() { config.color_change_presets = default_color_change_presets(); }
+                config.refresh_premade_presets();
                 return config;
             }
         }
