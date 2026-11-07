@@ -618,9 +618,13 @@ pub struct AppConfig {
     pub color_presets: Vec<[u8; 3]>,
     pub x_offset: f32, pub y_offset: f32,
 
-    #[serde(default)] pub bar_outline_enabled: bool,
-    #[serde(default = "default_bar_outline_thickness")] pub bar_outline_thickness: f32,
-    #[serde(default = "default_bar_outline_color")]     pub bar_outline_color: [u8; 3],
+    // Renamed from bar_outline to visualizer_outline
+    #[serde(default, alias = "bar_outline_enabled")] 
+    pub visualizer_outline_enabled: bool,
+    #[serde(default = "default_visualizer_outline_thickness", alias = "bar_outline_thickness")] 
+    pub visualizer_outline_thickness: f32,
+    #[serde(default = "default_visualizer_outline_color", alias = "bar_outline_color")]     
+    pub visualizer_outline_color: [u8; 3],
 
     pub max_bar_height: f32, pub target_fps: f32, pub show_fps: bool, pub use_vsync: bool,
     #[serde(default = "default_height_scale")] pub height_scale: f32,
@@ -661,8 +665,8 @@ fn default_gradient_stops() -> Vec<GradientStop> {
 }
 fn default_speed() -> f32 { 0.5 }
 fn default_sequential_bars_per_color() -> usize { 1 }
-fn default_bar_outline_thickness() -> f32 { 1.0 }
-fn default_bar_outline_color() -> [u8; 3] { [0, 0, 0] }
+fn default_visualizer_outline_thickness() -> f32 { 1.0 }
+fn default_visualizer_outline_color() -> [u8; 3] { [0, 0, 0] }
 fn default_height_scale() -> f32 { 0.5 }
 
 fn default_static_single_source() -> ColorSource {
@@ -724,7 +728,9 @@ impl Default for AppConfig {
                 [0, 255, 0], [0, 0, 255], [255, 165, 0], [128, 0, 128], [0, 128, 128],
             ],
             x_offset: 0.0, y_offset: 0.0,
-            bar_outline_enabled: false, bar_outline_thickness: 1.0, bar_outline_color: [0, 0, 0],
+            visualizer_outline_enabled: false,
+            visualizer_outline_thickness: 1.0,
+            visualizer_outline_color: [0, 0, 0],
             max_bar_height: 0.0, target_fps: 60.0, show_fps: false, use_vsync: false,
             height_scale: default_height_scale(),
             visualizer_direction: VisualizerDirection::default(),
