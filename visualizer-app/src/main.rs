@@ -1764,8 +1764,10 @@ impl VisualizerApp {
         ui.add(egui::Slider::new(&mut self.config.max_bar_height, 0.0..=1000.0).text("Max Bar Height (0 = Full)"));
         ui.add(egui::Slider::new(&mut self.config.audio.num_bars, 16..=256).text("Number of Bars"));
 
-        ui.add(egui::Slider::new(&mut self.config.height_scale, 0.1..=1.0).text("Height Scale"))
+                let height_slider = egui::Slider::new(&mut self.config.height_scale, 0.1..=1.0)
+            .text("Height Scale")
             .custom_formatter(|n, _| format!("{:.0}%", n * 100.0));
+        ui.add(height_slider);
         help_text(ui, "Scales how much of the screen the visualizer fills.");
 
         ui.separator();
