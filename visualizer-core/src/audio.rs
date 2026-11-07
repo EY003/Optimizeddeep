@@ -237,7 +237,6 @@ fn analysis_loop(
 // ─────────────────────────────────────────────────────────────
 
 struct AudioProcessor {
-    settings: Arc<ArcSwap<AudioSettings>>,
     sample_rate: f32,
 
     cached_fft_size: usize,
@@ -293,7 +292,6 @@ impl AudioProcessor {
         let lp_alpha = dt_s / (rc + dt_s);
 
         let mut lp = Self {
-            settings,
             sample_rate,
             cached_fft_size: fft_size,
             fft,
