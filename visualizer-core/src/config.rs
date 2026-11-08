@@ -376,7 +376,7 @@ impl WindowFunction {
     pub fn description(self) -> &'static str {
         match self {
             WindowFunction::Hann => "Balanced default. Good amplitude accuracy with low spectral leakage.",
-            WindowFunction::Hamming => "Slightly narrower main lobe than Hann; less leakage suppression.",
+            WindowFunction::Hamming => "Slightly narrower main lobe than Hann, less leakage suppression.",
             WindowFunction::BlackmanHarris => "Strongest side-lobe suppression. Tones look cleanest, at the cost of a wider main lobe.",
             WindowFunction::FlatTop => "Best amplitude accuracy. Peaks read true, but neighbouring bins blur more.",
             WindowFunction::Rectangular => "No tapering. Sharpest time resolution, but leaks badly on non-integer-period tones.",
@@ -708,20 +708,20 @@ impl AudioPreset {
     pub fn description(self) -> &'static str {
         match self {
             AudioPreset::Universal => "Balanced defaults that work well across most music.",
-            AudioPreset::Pop => "Punchy and bright — emphasises vocals and kicks for modern radio pop.",
-            AudioPreset::Rock => "Mid-forward with dynamic transients — good for guitars and drums.",
-            AudioPreset::Electronic => "Kick-focused with tight decay and BPM lock — tuned for EDM and house.",
-            AudioPreset::HipHop => "Bass-heavy and punchy — emphasises 808s and kick drums.",
-            AudioPreset::Classical => "Preserves dynamic range (AGC off) — softer attack, long decay, clean tones.",
-            AudioPreset::Piano => "Clean tone with sustain — good for solo piano and acoustic material.",
-            AudioPreset::Jazz => "Warm and smooth — gentler response curve and longer decay.",
-            AudioPreset::Ambient => "Slow and flowing — heavy smoothing, no peak-hold, soft attack.",
+            AudioPreset::Pop => "Punchy and bright, emphasises vocals and kicks for modern radio pop.",
+            AudioPreset::Rock => "Mid-forward with dynamic transients, good for guitars and drums.",
+            AudioPreset::Electronic => "Kick-focused with tight decay and BPM lock, tuned for EDM and house.",
+            AudioPreset::HipHop => "Bass-heavy and punchy, emphasises 808s and kick drums.",
+            AudioPreset::Classical => "Preserves dynamic range (AGC off), softer attack, long decay, clean tones.",
+            AudioPreset::Piano => "Clean tone with sustain, good for solo piano and acoustic material.",
+            AudioPreset::Jazz => "Warm and smooth, gentler response curve and longer decay.",
+            AudioPreset::Ambient => "Slow and flowing, heavy smoothing, soft attack.",
             AudioPreset::LoFi => "Soft, warm, and slow. Long smoothing window and rolled-off highs for a mellow look.",
             AudioPreset::Metal => "Aggressive and punchy. Fast attack, wide dynamic range, mid-forward.",
             AudioPreset::Country => "Clean and dynamic. Balanced mids with moderate smoothing.",
             AudioPreset::RnB => "Smooth bass emphasis with vocal presence. Sweet spot between Pop and Hip-hop.",
             AudioPreset::Vocal => "Mid-focused and voice-oriented. Narrow band, longer decay, gentle comp.",
-            AudioPreset::Podcast => "Narrow speech band with heavy smoothing. No peak-hold — clean and steady.",
+            AudioPreset::Podcast => "Narrow speech band with heavy smoothing, clean and steady.",
         }
     }
     pub fn settings(self) -> AudioSettings {
