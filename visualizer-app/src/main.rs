@@ -31,7 +31,6 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
 };
 
-// Windows-only: 1 ms timer resolution for accurate std::thread::sleep in audio.rs.
 #[cfg(windows)]
 #[link(name = "winmm")]
 extern "system" {
@@ -237,7 +236,7 @@ fn frequency_index(i: usize, base_num_bars: usize, dir: FrequencyDirection) -> u
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Fonts
+// Fonts & Palette Caches (Unchanged)
 // ═══════════════════════════════════════════════════════════════
 
 const CUSTOM_FONT_FAMILY: &str = "custom_track";
@@ -270,10 +269,6 @@ fn list_system_fonts() -> Vec<(String, String)> {
     result
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Palette cache
-// ═══════════════════════════════════════════════════════════════
-
 struct PaletteCacheEntry {
     track_id: u64, palette_size: u8, variants: u8, priority: PalettePriority,
     colors: Vec<[u8; 3]>,
@@ -300,10 +295,6 @@ struct ActivePalettes {
     gradient_stops: Vec<GradientStop>,
     animated_colors: Vec<[u8; 3]>,
 }
-
-// ═══════════════════════════════════════════════════════════════
-// Fingerprint helpers
-// ═══════════════════════════════════════════════════════════════
 
 fn hash_color_source<H: std::hash::Hasher>(s: &ColorSource, h: &mut H) {
     use std::hash::Hash;
@@ -335,10 +326,6 @@ fn hash_gradient_source<H: std::hash::Hasher>(s: &GradientSource, h: &mut H) {
         }
     }
 }
-
-// ═══════════════════════════════════════════════════════════════
-// Settings UI helpers (unchanged)
-// ═══════════════════════════════════════════════════════════════
 
 fn accent() -> egui::Color32 { egui::Color32::from_rgb(0xB7, 0x41, 0x0E) }
 
@@ -438,10 +425,6 @@ fn combo_reset<T: PartialEq + Copy + 'static>(
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Settings tabs
-// ═══════════════════════════════════════════════════════════════
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     Visualizer, Colors, Audio, TrackInfo, Appearance, Performance,
@@ -476,10 +459,6 @@ const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
     (SettingsTab::Appearance,  "UI",                 &["scale", "size", "help", "launch"]),
     (SettingsTab::Performance, "Performance",        &["fps", "vsync", "performance", "frame"]),
 ];
-
-// ═══════════════════════════════════════════════════════════════
-// Background track-load result
-// ═══════════════════════════════════════════════════════════════
 
 struct TrackLoadResult {
     artist: String,
@@ -530,11 +509,10 @@ struct VisualizerApp {
     settings_icon: egui::IconData,
     old_settings_scale: f32,
 
-    // NEW: activity scheduling
+    // activity scheduling
     last_audio_frame_time: Instant,
-    last_paint_time: Instant,
 
-    // NEW: background track-load (color extraction off the UI thread)
+    // background track-load
     track_load_tx: crossbeam_channel::Sender<TrackLoadResult>,
     track_load_rx: crossbeam_channel::Receiver<TrackLoadResult>,
 
@@ -617,7 +595,6 @@ impl VisualizerApp {
             settings_icon: egui_icon,
             old_settings_scale,
             last_audio_frame_time: Instant::now() - Duration::from_secs(5),
-            last_paint_time: Instant::now(),
             track_load_tx,
             track_load_rx,
             _tray_icon: tray_icon,
@@ -627,10 +604,7 @@ impl VisualizerApp {
         }
     }
 
-    /// Receives track updates. Colour extraction happens on a worker thread so
-    /// the UI thread never blocks on image decode / palette clustering.
     fn poll_track_updates(&mut self, ctx: &egui::Context) {
-        // 1) Apply finished background extractions.
         while let Ok(result) = self.track_load_rx.try_recv() {
             self.track_id = compute_track_id(
                 result.cover_art.as_deref(),
@@ -640,13 +614,8 @@ impl VisualizerApp {
             if let Some((_colors, img)) = result.extracted {
                 let rgba = img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
-                let color_image =
-                    egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                self.cover_texture = Some(ctx.load_texture(
-                    "cover_art",
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                ));
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                self.cover_texture = Some(ctx.load_texture("cover_art", color_image, egui::TextureOptions::LINEAR));
                 self.cover_image = Some(img);
             } else {
                 self.cover_texture = None;
@@ -654,7 +623,6 @@ impl VisualizerApp {
             }
         }
 
-        // 2) Receive raw track events and dispatch workers.
         while let Ok(info) = self.track_rx.try_recv() {
             if info.title.is_empty() && info.artist.is_empty() {
                 self.track_info = None;
@@ -671,9 +639,7 @@ impl VisualizerApp {
 
             let tx = self.track_load_tx.clone();
             std::thread::spawn(move || {
-                let extracted = cover
-                    .as_deref()
-                    .and_then(|bytes| color::extract_colors_from_bytes(bytes));
+                let extracted = cover.as_deref().and_then(|bytes| color::extract_colors_from_bytes(bytes));
                 let _ = tx.send(TrackLoadResult { artist, title, cover_art: cover, extracted });
             });
         }
@@ -1035,7 +1001,7 @@ impl VisualizerApp {
                 let k = (base_t * TAU * 0.5).sin() * 0.5 + 0.5;
                 MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
-            MotionShape::FlipFlop => {
+            MotionSample::FlipFlop => {
                 let k = if (base_t * 2.0).fract() < 0.5 { 1.0 } else { 0.0 };
                 MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
@@ -1525,8 +1491,7 @@ impl VisualizerApp {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 { return; }
 
-        // ── Idle fast-path ───────────────────────────────────────
-        // Nothing to draw when every bar and peak is empty.
+        // Idle fast-path: skip all drawing if bars and peaks are empty.
         if self.current_bars.iter().all(|&v| v < 0.001)
             && self.current_peaks.iter().all(|&p| p < 0.001)
         {
@@ -2113,7 +2078,7 @@ impl VisualizerApp {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Settings UI (unchanged body; only `tab_performance` updated)
+// Settings UI
 // ═══════════════════════════════════════════════════════════════
 
 impl VisualizerApp {
@@ -3145,7 +3110,6 @@ impl VisualizerApp {
         checkbox_reset(ui, &mut self.config.show_help_text, "Show Inline Help Text", DEFAULT_SHOW_HELP_TEXT);
     }
 
-    // UPDATED: honest VSync toggle + explicit restart notice
     fn tab_performance(&mut self, ui: &mut egui::Ui) {
         use cfg::*;
         section_header(ui, "Frame Rate");
@@ -3160,7 +3124,6 @@ impl VisualizerApp {
         );
         ui.add_space(4.0);
 
-        // VSync changes require a restart; make that explicit.
         let mut new_vsync = self.config.use_vsync;
         checkbox_reset(ui, &mut new_vsync, "Enable VSync (Requires Restart)", false);
         if new_vsync != self.config.use_vsync {
@@ -3197,10 +3160,6 @@ impl VisualizerApp {
     }
 
     fn config_initial_vsync(&self) -> bool {
-        // We don't actually track the initial value; treat the current value as
-        // authoritative so we only warn when the checkbox just changed. The
-        // simplest heuristic is to show the warning whenever VSync is off but
-        // was recently flipped. Skip in this build for simplicity.
         self.config.use_vsync
     }
 
@@ -3256,10 +3215,6 @@ fn fft_size_combo(ui: &mut egui::Ui, a: &mut visualizer_core::config::AudioSetti
     });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// eframe::App
-// ═══════════════════════════════════════════════════════════════
-
 impl eframe::App for VisualizerApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] { egui::Rgba::TRANSPARENT.to_array() }
 
@@ -3312,9 +3267,6 @@ impl eframe::App for VisualizerApp {
             self.current_peaks.resize(n_bars, 0.0);
         }
 
-        // ── Audio pump ────────────────────────────────────────────
-        // Update activity timestamp only when a real signal is present.
-        // Silent frames (WASAPI delivers zeros while paused) don't count.
         let mut latest: Option<BarFrame> = None;
         while let Ok(frame) = self.audio_rx.try_recv() {
             latest = Some(frame);
@@ -3337,7 +3289,6 @@ impl eframe::App for VisualizerApp {
             self.is_passthrough_set = true;
         }
 
-        // ── Visualizer ────────────────────────────────────────────
         let rect = ctx.screen_rect();
         egui::Area::new(egui::Id::new("overlay")).fixed_pos(rect.min).show(ctx, |ui| {
             ui.set_min_size(rect.size());
@@ -3357,7 +3308,6 @@ impl eframe::App for VisualizerApp {
             }
         });
 
-        // ── Settings viewport ─────────────────────────────────────
         if self.show_settings {
             let scale = self.config.settings_scale.clamp(0.75, 1.5);
 
@@ -3419,14 +3369,6 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        // ── Activity-driven repaint scheduling ────────────────────
-        //
-        // Full speed (60 Hz) only when there is something to animate:
-        //   * audio was received within the last 500 ms, or
-        //   * the visualizer is in animated-color mode, or
-        //   * peaks are still decaying above the idle threshold.
-        // Otherwise idle at 4 Hz — enough to react to a new track quickly
-        // without compositing an empty full-screen overlay at 60 Hz.
         let audio_active = now.duration_since(self.last_audio_frame_time) < Duration::from_millis(500);
         let is_animated  = self.config.color_mode == ColorMode::Animated;
         let peaks_active = self.current_peaks.iter().any(|&p| p > 0.001);
@@ -3434,20 +3376,14 @@ impl eframe::App for VisualizerApp {
 
         if wants_full_fps {
             if self.config.use_vsync {
-                // Swapchain paces us to display refresh; no timer needed.
                 ctx.request_repaint();
             } else {
                 let target_dt = Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0));
                 ctx.request_repaint_after(target_dt);
             }
         } else {
-            // Idle: 4 Hz heartbeat. Sub-frame drawing is skipped via the
-            // zero-bar guard in draw_bars, so this composes an empty window
-            // four times a second and costs effectively nothing.
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-
-        self.last_paint_time = now;
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
@@ -3457,12 +3393,7 @@ impl eframe::App for VisualizerApp {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// main
-// ═══════════════════════════════════════════════════════════════
-
 fn main() -> eframe::Result<()> {
-    // 1 ms timer resolution for audio thread sleep accuracy. Reverted in on_exit.
     #[cfg(windows)]
     unsafe { timeBeginPeriod(1); }
 
@@ -3475,8 +3406,10 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_always_on_top()
             .with_maximized(true)
+            .with_skip_taskbar(true) // <--- Added: lowers OS window message overhead
             .with_icon(egui_icon),
         vsync: config.use_vsync,
+        renderer: eframe::Renderer::Wgpu, // <--- THE BIG ONE: bypasses DWM OpenGL bottleneck
         ..Default::default()
     };
     eframe::run_native(
