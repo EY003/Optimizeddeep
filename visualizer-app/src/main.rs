@@ -3248,13 +3248,9 @@ impl eframe::App for VisualizerApp {
         }
 
         // Lower FPS when settings is open (main viewport is a live preview).
+        // Always run at the configured target FPS, whether or not settings are open.
         let target_duration = Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0));
-        let repaint_after = if self.show_settings {
-            Duration::from_millis(100)
-        } else {
-            target_duration
-        };
-        ctx.request_repaint_after(repaint_after);
+        ctx.request_repaint_after(target_duration);
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) { self.config.save(); }
