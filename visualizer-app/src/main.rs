@@ -1963,7 +1963,7 @@ impl VisualizerApp {
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_left });
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_left });
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::Pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_right });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_right });
                         mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                     }
                     painter.add(egui::Shape::mesh(mesh));
@@ -2243,8 +2243,8 @@ impl VisualizerApp {
         section_header(ui, "Visualizer Outlines");
         checkbox_reset(ui, &mut self.config.visualizer_outline_enabled, "Enable Outlines", false);
         if self.config.visualizer_outline_enabled {
-            slider_f32(ui, &mut self.config.visualizer_outline_thickness, 0.5..=10.0, "Outline Thickness", default_visualizer_outline_thickness());
-            color_edit_reset(ui, &mut self.config.visualizer_outline_color, "Outline Color", default_visualizer_outline_color());
+            slider_f32(ui, &mut self.config.visualizer_outline_thickness, 0.5..=10.0, "Outline Thickness", cfg::default_visualizer_outline_thickness());
+            color_edit_reset(ui, &mut self.config.visualizer_outline_color, "Outline Color", cfg::default_visualizer_outline_color());
             self.help_text(ui, "Outlines follow the visualizer's shape. In Smooth mode, a single perimeter is drawn.");
         }
     }
