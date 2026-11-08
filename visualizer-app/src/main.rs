@@ -12,12 +12,12 @@ use visualizer_core::{
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
+        AppConfig, AudioPreset, BarInterpolation, BlendMode,
         ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
-        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
+        FrequencyDirection, GradientPreset, GradientSource, GradientStop,
         MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
         TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
-        VisualizerDirection, WeightingCurve, WindowFunction,
+        VisualizerDirection,
     },
     musicbee::{self, TrackInfo},
 };
@@ -2325,8 +2325,14 @@ impl VisualizerApp {
             ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Vertical, "Vertical");
         });
         if self.config.static_mode == StaticDistributionMode::Sequential {
-            slider_f32(ui, &mut self.config.sequential_bars_per_color as *mut usize as *mut f32, 1.0..=20.0, "Bars per Color", 1.0);
-            // (Better typed helper skipped here — see note below)
+           ui.horizontal(|ui| {
+               let mut n = self.config.sequential_bars_per_color as i32;
+               let r = ui.add(egui::Slider::new(&mut n, 1..=20).text("Bars per Color"));
+               if r.secondary_clicked() { n = 1; }
+               self.config.sequential_bars_per_color = n.max(1) as usize;
+               reset_btn(ui, self.config.sequential_bars_per_color != 1,
+                         || self.config.sequential_bars_per_color = 1);
+            });
         }
         if self.config.static_mode == StaticDistributionMode::Vertical {
             ui.horizontal(|ui| {
@@ -2593,12 +2599,6 @@ impl VisualizerApp {
         let a = &mut self.config.audio;
 
         section_header(ui, "Signal Processing");
-        combo_reset(ui, &mut a.fft_size as *mut usize as *mut _, 2048usize, "FFT Size", "fft_size", 100.0,
-                    &[512, 1024, 2048, 4096, 8192], |v| {
-                        match v { 512 => "512", 1024 => "1024", 2048 => "2048", 4096 => "4096", 8192 => "8192", _ => "?" }
-                    });
-        // (skip for brevity below — the more idiomatic pattern is used in the actual file)
-        // See the accompanying helper `combo_usize_fft` that handles this cleanly:
         fft_size_combo(ui, a);
         combo_reset_desc(ui, &mut a.window_function, WindowFunction::default(), "Window Function", "window_fn", 160.0,
                     &WindowFunction::all(), WindowFunction::display_name, WindowFunction::description);
@@ -2618,13 +2618,13 @@ impl VisualizerApp {
 
         ui.horizontal(|ui| {
             ui.label("Min Frequency:");
-            let r = ui.add(egui::DragValue::new(&mut a.min_frequency_hz).speed(10.0).range(10.0..=1000.0).suffix(" Hz"));
+            let r = ui.add(egui::DragValue::new(&mut a.min_frequency_hz).speed(10.0).clamp_range(10.0..=1000.0).suffix(" Hz"));
             if r.secondary_clicked() { a.min_frequency_hz = DEFAULT_MIN_FREQ; }
             reset_btn(ui, (a.min_frequency_hz - DEFAULT_MIN_FREQ).abs() > 1e-3, || a.min_frequency_hz = DEFAULT_MIN_FREQ);
         });
         ui.horizontal(|ui| {
             ui.label("Max Frequency:");
-            let r = ui.add(egui::DragValue::new(&mut a.max_frequency_hz).speed(100.0).range(2000.0..=24000.0).suffix(" Hz"));
+            let r = ui.add(egui::DragValue::new(&mut a.max_frequency_hz).speed(100.0).clamp_range(2000.0..=24000.0).suffix(" Hz"));
             if r.secondary_clicked() { a.max_frequency_hz = DEFAULT_MAX_FREQ; }
             reset_btn(ui, (a.max_frequency_hz - DEFAULT_MAX_FREQ).abs() > 1e-3, || a.max_frequency_hz = DEFAULT_MAX_FREQ);
         });
@@ -2673,8 +2673,14 @@ impl VisualizerApp {
 
         section_header(ui, "Timing");
         slider_f32(ui, &mut a.poll_rate_hz, 10.0..=120.0, "Poll Rate (Hz)", DEFAULT_POLL_RATE);
-        slider_f32(ui, &mut a.average_size as *mut usize as *mut f32, 1.0..=16.0, "Average Size (frames)", DEFAULT_AVERAGE_SIZE as f32);
-        // (Same typed-slider caveat as bars_per_color.)
+        ui.horizontal(|ui| {
+            let mut n = a.average_size as i32;
+            let r = ui.add(egui::Slider::new(&mut n, 1..=16).text("Average Size (frames)"));
+            if r.secondary_clicked() { n = DEFAULT_AVERAGE_SIZE as i32; }
+            a.average_size = n.max(1) as usize;
+            reset_btn(ui, a.average_size != DEFAULT_AVERAGE_SIZE,
+                      || a.average_size = DEFAULT_AVERAGE_SIZE);
+        });
 
         section_header(ui, "Ballistics");
         if a.decay_mode != self.last_decay_mode {
@@ -2751,10 +2757,10 @@ impl VisualizerApp {
                 .show_ui(ui, |ui| {
                     for p in AudioPreset::all() {
                         let active = detected == Some(p);
-                        let resp = ui.selectable_label(active, p.display_name());
-                        if active { resp.on_hover_text(p.description()); }
-                        else { resp.on_hover_text(p.description()); }
-                        if ui.rect_contains_pointer(ui.min_rect()) && resp.clicked() {
+                        if ui.selectable_label(active, p.display_name())
+                            .on_hover_text(p.description())
+                            .clicked()
+                        {
                             chosen_builtin = Some(p);
                         }
                     }
@@ -2885,13 +2891,13 @@ impl VisualizerApp {
             });
             ui.horizontal(|ui| {
                 ui.label("X Offset:");
-                let r = ui.add(egui::DragValue::new(&mut cfg.cover_x_offset).speed(1.0).max_decimals(0).range(-5000.0..=200.0).suffix(" px"));
+                let r = ui.add(egui::DragValue::new(&mut cfg.cover_x_offset).speed(1.0).max_decimals(0).clamp_range(-5000.0..=200.0).suffix(" px"));
                 if r.secondary_clicked() { cfg.cover_x_offset = 0.0; }
                 reset_btn(ui, (cfg.cover_x_offset).abs() > 1e-3, || cfg.cover_x_offset = 0.0);
             });
             ui.horizontal(|ui| {
                 ui.label("Y Offset:");
-                let r = ui.add(egui::DragValue::new(&mut cfg.cover_y_offset).speed(1.0).max_decimals(0).range(-200.0..=5000.0).suffix(" px"));
+                let r = ui.add(egui::DragValue::new(&mut cfg.cover_y_offset).speed(1.0).max_decimals(0).clamp_range(-200.0..=5000.0).suffix(" px"));
                 if r.secondary_clicked() { cfg.cover_y_offset = 0.0; }
                 reset_btn(ui, (cfg.cover_y_offset).abs() > 1e-3, || cfg.cover_y_offset = 0.0);
             });
@@ -2968,13 +2974,13 @@ impl VisualizerApp {
         });
         ui.horizontal(|ui| {
             ui.label("Text X Offset:");
-            let r = ui.add(egui::DragValue::new(&mut cfg.text_x_offset).speed(1.0).max_decimals(0).range(-5000.0..=200.0).suffix(" px"));
+            let r = ui.add(egui::DragValue::new(&mut cfg.text_x_offset).speed(1.0).max_decimals(0).clamp_range(-5000.0..=200.0).suffix(" px"));
             if r.secondary_clicked() { cfg.text_x_offset = 0.0; }
             reset_btn(ui, cfg.text_x_offset.abs() > 1e-3, || cfg.text_x_offset = 0.0);
         });
         ui.horizontal(|ui| {
             ui.label("Text Y Offset:");
-            let r = ui.add(egui::DragValue::new(&mut cfg.text_y_offset).speed(1.0).max_decimals(0).range(-200.0..=5000.0).suffix(" px"));
+            let r = ui.add(egui::DragValue::new(&mut cfg.text_y_offset).speed(1.0).max_decimals(0).clamp_range(-200.0..=5000.0).suffix(" px"));
             if r.secondary_clicked() { cfg.text_y_offset = 0.0; }
             reset_btn(ui, cfg.text_y_offset.abs() > 1e-3, || cfg.text_y_offset = 0.0);
         });
@@ -3051,13 +3057,13 @@ impl VisualizerApp {
             if show_size {
                 let mut v = *palette_size as i32;
                 let r = ui.add(egui::Slider::new(&mut v, 1..=3).text("Colors from Cover"));
-                if r.secondary_clicked() { *palette_size = 1; }
-                *palette_size = v.clamp(1, 3) as u8;
+                if r.secondary_clicked() { v = 1; }
+               *palette_size = v.clamp(1, 3) as u8;
             }
             if show_variants {
                 let mut v = *variants as i32;
                 let r = ui.add(egui::Slider::new(&mut v, 0..=5).text("Shade Variants per Color"));
-                if r.secondary_clicked() { *variants = 0; }
+                if r.secondary_clicked() { v = 0; }
                 *variants = v.clamp(0, 5) as u8;
             }
         });
