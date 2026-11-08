@@ -334,6 +334,12 @@ fn reset_btn<F: FnOnce()>(ui: &mut egui::Ui, changed: bool, on_reset: F) {
     }
 }
 
+fn help_text(ui: &mut egui::Ui, show: bool, text: &str) {
+    if show {
+        ui.label(egui::RichText::new(text).weak().small());
+    }
+}
+
 fn slider_f32(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, label: &str, default: f32) {
     ui.horizontal(|ui| {
         let r = ui.add(egui::Slider::new(value, range).text(label));
@@ -1478,7 +1484,6 @@ impl VisualizerApp {
         let stride = bar_width + gap;
         let total_size = visual_num_bars as f32 * stride - gap;
         let max_h = self.config.max_bar_height;
-        let radius = self.config.bar_radius;
         let freq_dir = self.config.frequency_direction;
         let is_smooth = self.config.audio.bar_interpolation == BarInterpolation::Smooth;
 
@@ -2039,12 +2044,7 @@ impl VisualizerApp {
 // ═══════════════════════════════════════════════════════════════
 
 impl VisualizerApp {
-    fn help_text(&self, ui: &mut egui::Ui, text: &str) {
-        if self.config.show_help_text {
-            ui.label(egui::RichText::new(text).weak().small());
-        }
-    }
-
+    
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         let scale = self.config.settings_scale.clamp(0.75, 1.5);
         ui.style_mut().spacing.item_spacing *= scale;
@@ -2166,7 +2166,7 @@ impl VisualizerApp {
             reset_btn(ui, self.config.visualizer_direction != VisualizerDirection::Up,
                       || self.config.visualizer_direction = VisualizerDirection::Up);
         });
-        self.help_text(ui, "Direction bars grow from.");
+        help_text(ui, self.config.show_help_text, "Direction bars grow from.");
 
         section_header(ui, "Frequency Layout");
         ui.horizontal_wrapped(|ui| {
@@ -2176,7 +2176,7 @@ impl VisualizerApp {
             reset_btn(ui, self.config.frequency_direction != FrequencyDirection::LeftToRight,
                       || self.config.frequency_direction = FrequencyDirection::LeftToRight);
         });
-        self.help_text(ui, "How the frequency spectrum is laid out across the screen.");
+        help_text(ui, self.config.show_help_text, "How the frequency spectrum is laid out across the screen.");
 
         section_header(ui, "Bar Shape");
         ui.horizontal(|ui| {
@@ -2185,7 +2185,7 @@ impl VisualizerApp {
             reset_btn(ui, self.config.audio.bar_interpolation != BarInterpolation::Step,
                       || self.config.audio.bar_interpolation = BarInterpolation::Step);
         });
-        self.help_text(ui, self.config.audio.bar_interpolation.description());
+        help_text(ui, self.config.show_help_text, self.config.audio.bar_interpolation.description());
 
         section_header(ui, "Bars");
         slider_f32(ui, &mut self.config.bar_width, 1.0..=50.0, "Bar Width", DEFAULT_BAR_WIDTH);
@@ -2245,7 +2245,7 @@ impl VisualizerApp {
         if self.config.visualizer_outline_enabled {
             slider_f32(ui, &mut self.config.visualizer_outline_thickness, 0.5..=10.0, "Outline Thickness", cfg::default_visualizer_outline_thickness());
             color_edit_reset(ui, &mut self.config.visualizer_outline_color, "Outline Color", cfg::default_visualizer_outline_color());
-            self.help_text(ui, "Outlines follow the visualizer's shape. In Smooth mode, a single perimeter is drawn.");
+            help_text(ui, self.config.show_help_text, "Outlines follow the visualizer's shape. In Smooth mode, a single perimeter is drawn.");
         }
     }
 
@@ -2265,7 +2265,7 @@ impl VisualizerApp {
                 Self::draw_dynamic_palette_settings(ui, "ss", &mut 1u8, &mut 0u8, priority, false, false);
             }
             Self::draw_palette_preview(ui, &self.active_palettes.static_single_colors);
-            self.help_text(ui, "Single color picked from the album art using the selected priority.");
+            help_text(ui, self.config.show_help_text, "Single color picked from the album art using the selected priority.");
         } else {
             if let Some(colors) = self.config.static_single_source.static_colors_mut() {
                 if colors.is_empty() { colors.push([255, 255, 255]); }
@@ -2340,7 +2340,7 @@ impl VisualizerApp {
                 ui.radio_value(&mut self.config.vertical_color_style, VerticalColorStyle::Gradient, "Gradient");
                 ui.radio_value(&mut self.config.vertical_color_style, VerticalColorStyle::Blocks, "Blocks");
             });
-            self.help_text(ui, self.config.vertical_color_style.description());
+            help_text(ui, self.config.show_help_text, self.config.vertical_color_style.description());
         }
         ui.add_space(4.0);
         if is_dynamic {
@@ -2419,7 +2419,7 @@ impl VisualizerApp {
             }
         });
         slider_f32(ui, &mut self.config.gradient_angle, 0.0..=360.0, "Angle (°)", 0.0);
-        self.help_text(ui, "0° = horizontal, 90° = vertical, 45° = diagonal.");
+        help_text(ui, self.config.show_help_text, "0° = horizontal, 90° = vertical, 45° = diagonal.");
         if is_dynamic {
             if let GradientSource::Dynamic { palette_size, variants_per_color, priority } = &mut self.config.gradient_source {
                 Self::draw_dynamic_palette_settings(ui, "g", palette_size, variants_per_color, priority, true, true);
@@ -2591,148 +2591,151 @@ impl VisualizerApp {
     // ── Audio tab ────────────────────────────────────────────
 
     fn tab_audio(&mut self, ui: &mut egui::Ui) {
-        use cfg::*;
+    use cfg::*;
 
-        section_header(ui, "Presets");
-        self.draw_audio_preset_selector(ui);
+    // Capture the flag BEFORE the mutable borrow of self.config.audio.
+    let show_help = self.config.show_help_text;
 
-        let a = &mut self.config.audio;
+    section_header(ui, "Presets");
+    self.draw_audio_preset_selector(ui);
 
-        section_header(ui, "Signal Processing");
-        fft_size_combo(ui, a);
-        combo_reset_desc(ui, &mut a.window_function, WindowFunction::default(), "Window Function", "window_fn", 160.0,
-                    &WindowFunction::all(), WindowFunction::display_name, WindowFunction::description);
-        self.help_text(ui, "FFT windowing shape. Hann is a balanced default.");
-        combo_reset_desc(ui, &mut a.frequency_scaling, FrequencyScaling::default(), "Frequency Scaling", "freq_scaling", 160.0,
-                    &[FrequencyScaling::Linear, FrequencyScaling::Logarithmic], FrequencyScaling::display_name, FrequencyScaling::description);
-        combo_reset_desc(ui, &mut a.channel_mix, ChannelMixMode::default(), "Channel Mix", "channel_mix", 160.0,
-                    &ChannelMixMode::all(), ChannelMixMode::display_name, ChannelMixMode::description);
-        combo_reset_desc(ui, &mut a.weighting, WeightingCurve::default(), "Weighting Curve", "weighting", 180.0,
-                    &WeightingCurve::all(), WeightingCurve::display_name, WeightingCurve::description);
-        checkbox_reset(ui, &mut a.dc_block, "DC Block / High-Pass Filter", DEFAULT_DC_BLOCK);
-        self.help_text(ui, "Filters out DC offset and sub-10 Hz rumble before analysis.");
-        slider_f32(ui, &mut a.frequency_smoothing, 0.0..=1.0, "Frequency Smoothing", DEFAULT_FREQ_SMOOTHING);
-        self.help_text(ui, "Averages adjacent bars. Higher = fewer spiky, jittery bars.");
-        checkbox_reset(ui, &mut a.harmonic_emphasis, "Harmonic Emphasis", DEFAULT_HARMONIC_EMPHASIS);
-        self.help_text(ui, "Blooms local spectral peaks into wider blobs. Helps with solo piano and sparse material.");
+    let a = &mut self.config.audio;
 
-        ui.horizontal(|ui| {
-            ui.label("Min Frequency:");
-            let r = ui.add(egui::DragValue::new(&mut a.min_frequency_hz).speed(10.0).clamp_range(10.0..=1000.0).suffix(" Hz"));
-            if r.secondary_clicked() { a.min_frequency_hz = DEFAULT_MIN_FREQ; }
-            reset_btn(ui, (a.min_frequency_hz - DEFAULT_MIN_FREQ).abs() > 1e-3, || a.min_frequency_hz = DEFAULT_MIN_FREQ);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Max Frequency:");
-            let r = ui.add(egui::DragValue::new(&mut a.max_frequency_hz).speed(100.0).clamp_range(2000.0..=24000.0).suffix(" Hz"));
-            if r.secondary_clicked() { a.max_frequency_hz = DEFAULT_MAX_FREQ; }
-            reset_btn(ui, (a.max_frequency_hz - DEFAULT_MAX_FREQ).abs() > 1e-3, || a.max_frequency_hz = DEFAULT_MAX_FREQ);
-        });
+    section_header(ui, "Signal Processing");
+    fft_size_combo(ui, a);
+    combo_reset_desc(ui, &mut a.window_function, WindowFunction::default(), "Window Function", "window_fn", 160.0,
+                &WindowFunction::all(), WindowFunction::display_name, WindowFunction::description);
+    help_text(ui, show_help, "FFT windowing shape. Hann is a balanced default.");
+    combo_reset_desc(ui, &mut a.frequency_scaling, FrequencyScaling::default(), "Frequency Scaling", "freq_scaling", 160.0,
+                &[FrequencyScaling::Linear, FrequencyScaling::Logarithmic], FrequencyScaling::display_name, FrequencyScaling::description);
+    combo_reset_desc(ui, &mut a.channel_mix, ChannelMixMode::default(), "Channel Mix", "channel_mix", 160.0,
+                &ChannelMixMode::all(), ChannelMixMode::display_name, ChannelMixMode::description);
+    combo_reset_desc(ui, &mut a.weighting, WeightingCurve::default(), "Weighting Curve", "weighting", 180.0,
+                &WeightingCurve::all(), WeightingCurve::display_name, WeightingCurve::description);
+    checkbox_reset(ui, &mut a.dc_block, "DC Block / High-Pass Filter", DEFAULT_DC_BLOCK);
+    help_text(ui, show_help, "Filters out DC offset and sub-10 Hz rumble before analysis.");
+    slider_f32(ui, &mut a.frequency_smoothing, 0.0..=1.0, "Frequency Smoothing", DEFAULT_FREQ_SMOOTHING);
+    help_text(ui, show_help, "Averages adjacent bars. Higher = fewer spiky, jittery bars.");
+    checkbox_reset(ui, &mut a.harmonic_emphasis, "Harmonic Emphasis", DEFAULT_HARMONIC_EMPHASIS);
+    help_text(ui, show_help, "Blooms local spectral peaks into wider blobs. Helps with solo piano and sparse material.");
 
-        section_header(ui, "Amplitude");
-        slider_f32(ui, &mut a.sensitivity, 0.0..=100.0, "Sensitivity", DEFAULT_SENSITIVITY);
-        self.help_text(ui, "Primary reactivity slider. Drives raw input gain and lowers the noise floor.");
-        slider_f32(ui, &mut a.raw_gain, 0.25..=4.0, "Raw Gain", DEFAULT_RAW_GAIN);
-        self.help_text(ui, "Direct pre-analysis multiplier. Normally driven by Sensitivity.");
-        slider_f32(ui, &mut a.response_gamma, 0.5..=2.5, "Response Curve (γ)", DEFAULT_RESPONSE_GAMMA);
-        self.help_text(ui, "<1 lifts quiet passages; >1 emphasises peaks. Default 1.5 = balanced.");
-        slider_f32(ui, &mut a.noise_gate, 0.0..=0.5, "Noise Gate", DEFAULT_NOISE_GATE);
-        self.help_text(ui, "Bars below this threshold are snapped to 0. Removes 'hovering' bars during silence.");
-        ui.horizontal(|ui| {
-            ui.label("Min dB:");
-            let r = ui.add(egui::Slider::new(&mut a.min_decibels, -120.0..=-30.0).show_value(true));
-            if r.secondary_clicked() { a.min_decibels = DEFAULT_MIN_DB; }
-            reset_btn(ui, (a.min_decibels - DEFAULT_MIN_DB).abs() > 1e-3, || a.min_decibels = DEFAULT_MIN_DB);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Max dB:");
-            let r = ui.add(egui::Slider::new(&mut a.max_decibels, -60.0..=0.0).show_value(true));
-            if r.secondary_clicked() { a.max_decibels = DEFAULT_MAX_DB; }
-            reset_btn(ui, (a.max_decibels - DEFAULT_MAX_DB).abs() > 1e-3, || a.max_decibels = DEFAULT_MAX_DB);
-        });
-        if a.min_decibels >= a.max_decibels {
-            ui.colored_label(egui::Color32::RED, "⚠ Max dB must be greater than Min dB.");
-        }
-        slider_f32(ui, &mut a.target_dynamic_range_db, 20.0..=90.0, "Target Dynamic Range (dB)", DEFAULT_TARGET_RANGE);
-        self.help_text(ui, "Contrast between quiet and loud passages. Smaller = more compression/punch.");
-        checkbox_reset(ui, &mut a.per_frame_normalization, "Per-Frame Peak Normalization", DEFAULT_PER_FRAME_NORMALIZATION);
-        self.help_text(ui, "Scales each frame so the loudest bar hits the top. Makes quiet tracks visible.");
-        checkbox_reset(ui, &mut a.agc_enabled, "AGC / Peak Normalisation", DEFAULT_AGC_ENABLED);
-        self.help_text(ui, "Slowly normalises track loudness so quiet songs stay lively.");
-        if a.agc_enabled {
-            slider_f32(ui, &mut a.agc_attack, 0.01..=0.9, "AGC Attack", DEFAULT_AGC_ATTACK);
-            slider_f32(ui, &mut a.agc_release, 0.0001..=0.05, "AGC Release", DEFAULT_AGC_RELEASE);
-        }
+    ui.horizontal(|ui| {
+        ui.label("Min Frequency:");
+        let r = ui.add(egui::DragValue::new(&mut a.min_frequency_hz).speed(10.0).clamp_range(10.0..=1000.0).suffix(" Hz"));
+        if r.secondary_clicked() { a.min_frequency_hz = DEFAULT_MIN_FREQ; }
+        reset_btn(ui, (a.min_frequency_hz - DEFAULT_MIN_FREQ).abs() > 1e-3, || a.min_frequency_hz = DEFAULT_MIN_FREQ);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Max Frequency:");
+        let r = ui.add(egui::DragValue::new(&mut a.max_frequency_hz).speed(100.0).clamp_range(2000.0..=24000.0).suffix(" Hz"));
+        if r.secondary_clicked() { a.max_frequency_hz = DEFAULT_MAX_FREQ; }
+        reset_btn(ui, (a.max_frequency_hz - DEFAULT_MAX_FREQ).abs() > 1e-3, || a.max_frequency_hz = DEFAULT_MAX_FREQ);
+    });
 
-        section_header(ui, "Frequency Shaping");
-        slider_f32(ui, &mut a.eq_bass_db, -10.0..=10.0, "Bass EQ (< 250 Hz)", DEFAULT_EQ_BASS);
-        slider_f32(ui, &mut a.eq_mid_db, -10.0..=10.0, "Mid EQ (250–4k Hz)", DEFAULT_EQ_MID);
-        slider_f32(ui, &mut a.eq_treble_db, -10.0..=10.0, "Treble EQ (> 4k Hz)", DEFAULT_EQ_TREBLE);
-        slider_f32(ui, &mut a.spectrum_tilt, -6.0..=6.0, "Spectrum Tilt (dB/oct)", DEFAULT_SPECTRUM_TILT);
-        self.help_text(ui, "Balances bass and treble. Positive values boost highs and tame bass.");
-
-        section_header(ui, "Timing");
-        slider_f32(ui, &mut a.poll_rate_hz, 10.0..=120.0, "Poll Rate (Hz)", DEFAULT_POLL_RATE);
-        ui.horizontal(|ui| {
-            let mut n = a.average_size as i32;
-            let r = ui.add(egui::Slider::new(&mut n, 1..=16).text("Average Size (frames)"));
-            if r.secondary_clicked() { n = DEFAULT_AVERAGE_SIZE as i32; }
-            a.average_size = n.max(1) as usize;
-            reset_btn(ui, a.average_size != DEFAULT_AVERAGE_SIZE,
-                      || a.average_size = DEFAULT_AVERAGE_SIZE);
-        });
-
-        section_header(ui, "Ballistics");
-        if a.decay_mode != self.last_decay_mode {
-            let (atk, dec) = a.decay_mode.default_ballistics();
-            a.attack_time_ms = atk;
-            a.decay_time_ms = dec;
-            self.last_decay_mode = a.decay_mode;
-        }
-        combo_reset_desc(ui, &mut a.decay_mode, DecayMode::default(), "Decay Mode", "decay_mode", 160.0,
-                    &[DecayMode::Linear, DecayMode::Exponential, DecayMode::Gravity],
-                    DecayMode::display_name, DecayMode::description);
-        slider_f32(ui, &mut a.attack_time_ms, 0.0..=100.0, "Attack Time (ms)", DEFAULT_ATTACK_MS);
-        slider_f32(ui, &mut a.decay_time_ms, 50.0..=2000.0, "Decay Time (ms)", DEFAULT_DECAY_MS);
-        ui.horizontal(|ui| {
-            ui.label("Peak Hold (ms):");
-            let r = ui.add(egui::Slider::new(&mut a.peak_hold_ms, 0.0..=2000.0));
-            if r.secondary_clicked() { a.peak_hold_ms = DEFAULT_PEAK_HOLD_MS; }
-            reset_btn(ui, (a.peak_hold_ms - DEFAULT_PEAK_HOLD_MS).abs() > 1e-3, || a.peak_hold_ms = DEFAULT_PEAK_HOLD_MS);
-        });
-        if a.decay_mode == DecayMode::Gravity || a.peak_hold_ms > 0.0 {
-            slider_f32(ui, &mut a.gravity_coefficient, 0.1..=5.0, "Gravity Coefficient", DEFAULT_GRAVITY_COEFF);
-        }
-        checkbox_reset(ui, &mut a.per_band_ballistics, "Per-Band Ballistics", DEFAULT_PER_BAND_BALLISTICS);
-        self.help_text(ui, "Lets bass / mid / treble use different attack and decay times.");
-        if a.per_band_ballistics {
-            ui.label("Bass:");
-            slider_f32(ui, &mut a.bass_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
-            slider_f32(ui, &mut a.bass_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
-            ui.label("Mid:");
-            slider_f32(ui, &mut a.mid_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
-            slider_f32(ui, &mut a.mid_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
-            ui.label("Treble:");
-            slider_f32(ui, &mut a.treble_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
-            slider_f32(ui, &mut a.treble_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
-        }
-
-        section_header(ui, "Rhythm");
-        combo_reset_desc(ui, &mut a.beat_focus, BeatFocusMode::default(), "Beat Focus", "beat_focus", 160.0,
-                    &BeatFocusMode::all(), BeatFocusMode::display_name, BeatFocusMode::description);
-        slider_f32(ui, &mut a.beat_detection_sensitivity, 0.0..=1.0, "Beat Detection Sensitivity", DEFAULT_BEAT_SENS);
-        slider_f32(ui, &mut a.energy_threshold_multiplier, 1.0..=3.0, "Energy Threshold Multiplier", DEFAULT_ENERGY_THRESHOLD);
-        slider_f32(ui, &mut a.beat_envelope_decay_ms, 20.0..=500.0, "Beat Envelope Decay (ms)", DEFAULT_BEAT_ENVELOPE_DECAY_MS);
-        self.help_text(ui, "How quickly the beat 'flash' fades out after a detection.");
-        checkbox_reset(ui, &mut a.bpm_lock_enabled, "BPM Lock / Phase Smoothing", false);
-        if a.bpm_lock_enabled {
-            slider_f32(ui, &mut a.bpm_phase_smoothing, 0.0..=1.0, "Phase Smoothing", DEFAULT_BPM_PHASE_SMOOTHING);
-        }
-        if self.last_bpm > 0.0 {
-            ui.label(format!("Detected BPM: {:.1}", self.last_bpm));
-        }
+    section_header(ui, "Amplitude");
+    slider_f32(ui, &mut a.sensitivity, 0.0..=100.0, "Sensitivity", DEFAULT_SENSITIVITY);
+    help_text(ui, show_help, "Primary reactivity slider. Drives raw input gain and lowers the noise floor.");
+    slider_f32(ui, &mut a.raw_gain, 0.25..=4.0, "Raw Gain", DEFAULT_RAW_GAIN);
+    help_text(ui, show_help, "Direct pre-analysis multiplier. Normally driven by Sensitivity.");
+    slider_f32(ui, &mut a.response_gamma, 0.5..=2.5, "Response Curve (γ)", DEFAULT_RESPONSE_GAMMA);
+    help_text(ui, show_help, "<1 lifts quiet passages; >1 emphasises peaks. Default 1.5 = balanced.");
+    slider_f32(ui, &mut a.noise_gate, 0.0..=0.5, "Noise Gate", DEFAULT_NOISE_GATE);
+    help_text(ui, show_help, "Bars below this threshold are snapped to 0. Removes 'hovering' bars during silence.");
+    ui.horizontal(|ui| {
+        ui.label("Min dB:");
+        let r = ui.add(egui::Slider::new(&mut a.min_decibels, -120.0..=-30.0).show_value(true));
+        if r.secondary_clicked() { a.min_decibels = DEFAULT_MIN_DB; }
+        reset_btn(ui, (a.min_decibels - DEFAULT_MIN_DB).abs() > 1e-3, || a.min_decibels = DEFAULT_MIN_DB);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Max dB:");
+        let r = ui.add(egui::Slider::new(&mut a.max_decibels, -60.0..=0.0).show_value(true));
+        if r.secondary_clicked() { a.max_decibels = DEFAULT_MAX_DB; }
+        reset_btn(ui, (a.max_decibels - DEFAULT_MAX_DB).abs() > 1e-3, || a.max_decibels = DEFAULT_MAX_DB);
+    });
+    if a.min_decibels >= a.max_decibels {
+        ui.colored_label(egui::Color32::RED, "⚠ Max dB must be greater than Min dB.");
+    }
+    slider_f32(ui, &mut a.target_dynamic_range_db, 20.0..=90.0, "Target Dynamic Range (dB)", DEFAULT_TARGET_RANGE);
+    help_text(ui, show_help, "Contrast between quiet and loud passages. Smaller = more compression/punch.");
+    checkbox_reset(ui, &mut a.per_frame_normalization, "Per-Frame Peak Normalization", DEFAULT_PER_FRAME_NORMALIZATION);
+    help_text(ui, show_help, "Scales each frame so the loudest bar hits the top. Makes quiet tracks visible.");
+    checkbox_reset(ui, &mut a.agc_enabled, "AGC / Peak Normalisation", DEFAULT_AGC_ENABLED);
+    help_text(ui, show_help, "Slowly normalises track loudness so quiet songs stay lively.");
+    if a.agc_enabled {
+        slider_f32(ui, &mut a.agc_attack, 0.01..=0.9, "AGC Attack", DEFAULT_AGC_ATTACK);
+        slider_f32(ui, &mut a.agc_release, 0.0001..=0.05, "AGC Release", DEFAULT_AGC_RELEASE);
     }
 
+    section_header(ui, "Frequency Shaping");
+    slider_f32(ui, &mut a.eq_bass_db, -10.0..=10.0, "Bass EQ (< 250 Hz)", DEFAULT_EQ_BASS);
+    slider_f32(ui, &mut a.eq_mid_db, -10.0..=10.0, "Mid EQ (250–4k Hz)", DEFAULT_EQ_MID);
+    slider_f32(ui, &mut a.eq_treble_db, -10.0..=10.0, "Treble EQ (> 4k Hz)", DEFAULT_EQ_TREBLE);
+    slider_f32(ui, &mut a.spectrum_tilt, -6.0..=6.0, "Spectrum Tilt (dB/oct)", DEFAULT_SPECTRUM_TILT);
+    help_text(ui, show_help, "Balances bass and treble. Positive values boost highs and tame bass.");
+
+    section_header(ui, "Timing");
+    slider_f32(ui, &mut a.poll_rate_hz, 10.0..=120.0, "Poll Rate (Hz)", DEFAULT_POLL_RATE);
+    ui.horizontal(|ui| {
+        let mut n = a.average_size as i32;
+        let r = ui.add(egui::Slider::new(&mut n, 1..=16).text("Average Size (frames)"));
+        if r.secondary_clicked() { n = DEFAULT_AVERAGE_SIZE as i32; }
+        a.average_size = n.max(1) as usize;
+        reset_btn(ui, a.average_size != DEFAULT_AVERAGE_SIZE, || a.average_size = DEFAULT_AVERAGE_SIZE);
+    });
+
+    section_header(ui, "Ballistics");
+    if a.decay_mode != self.last_decay_mode {
+        let (atk, dec) = a.decay_mode.default_ballistics();
+        a.attack_time_ms = atk;
+        a.decay_time_ms = dec;
+        self.last_decay_mode = a.decay_mode;
+    }
+    combo_reset_desc(ui, &mut a.decay_mode, DecayMode::default(), "Decay Mode", "decay_mode", 160.0,
+                &[DecayMode::Linear, DecayMode::Exponential, DecayMode::Gravity],
+                DecayMode::display_name, DecayMode::description);
+    slider_f32(ui, &mut a.attack_time_ms, 0.0..=100.0, "Attack Time (ms)", DEFAULT_ATTACK_MS);
+    slider_f32(ui, &mut a.decay_time_ms, 50.0..=2000.0, "Decay Time (ms)", DEFAULT_DECAY_MS);
+    ui.horizontal(|ui| {
+        ui.label("Peak Hold (ms):");
+        let r = ui.add(egui::Slider::new(&mut a.peak_hold_ms, 0.0..=2000.0));
+        if r.secondary_clicked() { a.peak_hold_ms = DEFAULT_PEAK_HOLD_MS; }
+        reset_btn(ui, (a.peak_hold_ms - DEFAULT_PEAK_HOLD_MS).abs() > 1e-3, || a.peak_hold_ms = DEFAULT_PEAK_HOLD_MS);
+    });
+    if a.decay_mode == DecayMode::Gravity || a.peak_hold_ms > 0.0 {
+        slider_f32(ui, &mut a.gravity_coefficient, 0.1..=5.0, "Gravity Coefficient", DEFAULT_GRAVITY_COEFF);
+    }
+    checkbox_reset(ui, &mut a.per_band_ballistics, "Per-Band Ballistics", DEFAULT_PER_BAND_BALLISTICS);
+    help_text(ui, show_help, "Lets bass / mid / treble use different attack and decay times.");
+    if a.per_band_ballistics {
+        ui.label("Bass:");
+        slider_f32(ui, &mut a.bass_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
+        slider_f32(ui, &mut a.bass_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
+        ui.label("Mid:");
+        slider_f32(ui, &mut a.mid_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
+        slider_f32(ui, &mut a.mid_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
+        ui.label("Treble:");
+        slider_f32(ui, &mut a.treble_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
+        slider_f32(ui, &mut a.treble_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
+    }
+
+    section_header(ui, "Rhythm");
+    combo_reset_desc(ui, &mut a.beat_focus, BeatFocusMode::default(), "Beat Focus", "beat_focus", 160.0,
+                &BeatFocusMode::all(), BeatFocusMode::display_name, BeatFocusMode::description);
+    slider_f32(ui, &mut a.beat_detection_sensitivity, 0.0..=1.0, "Beat Detection Sensitivity", DEFAULT_BEAT_SENS);
+    slider_f32(ui, &mut a.energy_threshold_multiplier, 1.0..=3.0, "Energy Threshold Multiplier", DEFAULT_ENERGY_THRESHOLD);
+    slider_f32(ui, &mut a.beat_envelope_decay_ms, 20.0..=500.0, "Beat Envelope Decay (ms)", DEFAULT_BEAT_ENVELOPE_DECAY_MS);
+    help_text(ui, show_help, "How quickly the beat 'flash' fades out after a detection.");
+    checkbox_reset(ui, &mut a.bpm_lock_enabled, "BPM Lock / Phase Smoothing", false);
+    if a.bpm_lock_enabled {
+        slider_f32(ui, &mut a.bpm_phase_smoothing, 0.0..=1.0, "Phase Smoothing", DEFAULT_BPM_PHASE_SMOOTHING);
+    }
+    // Drop the borrow on `a` before reading `self.last_bpm`.
+    let _ = &a;
+    if self.last_bpm > 0.0 {
+        ui.label(format!("Detected BPM: {:.1}", self.last_bpm));
+    }
+}
     fn draw_audio_preset_selector(&mut self, ui: &mut egui::Ui) {
         let detected = AudioPreset::detect(&self.config.audio);
         let custom_match = self.config.custom_audio_presets.iter()
@@ -2839,7 +2842,7 @@ impl VisualizerApp {
                     ui.radio_value(&mut self.config.vertical_color_style, VerticalColorStyle::Gradient, "Gradient");
                     ui.radio_value(&mut self.config.vertical_color_style, VerticalColorStyle::Blocks, "Blocks");
                 });
-                self.help_text(ui, self.config.vertical_color_style.description());
+                help_text(ui, self.config.show_help_text, self.config.vertical_color_style.description());
             }
 
             section_header(ui, "Blend");
@@ -2847,7 +2850,7 @@ impl VisualizerApp {
                 ui.radio_value(&mut self.config.color_change_motion.blend, BlendMode::Smooth, "Smooth");
                 ui.radio_value(&mut self.config.color_change_motion.blend, BlendMode::Hard, "Hard");
             });
-            self.help_text(ui, "Smooth = gradients / soft fades. Hard = sharp on/off edges.");
+            help_text(ui, self.config.show_help_text, "Smooth = gradients / soft fades. Hard = sharp on/off edges.");
 
             section_header(ui, "Motion Speed");
             slider_f32(ui, &mut self.config.color_change_motion.speed, 0.0..=2.0, "Motion Speed", 1.0);
@@ -2869,7 +2872,7 @@ impl VisualizerApp {
             if shape.uses_intensity() {
                 color_edit_reset(ui, &mut self.config.color_change_motion.off_color, "Off Color", [0, 0, 0]);
                 slider_u8(ui, &mut self.config.color_change_motion.off_color_opacity, "Off-Color Opacity", 255);
-                self.help_text(ui, "Colour that 'off' pixels fade toward.");
+                help_text(ui, self.config.show_help_text, "Colour that 'off' pixels fade toward.");
             }
         });
     }
@@ -3010,11 +3013,11 @@ impl VisualizerApp {
         section_header(ui, "Background");
         color_edit_reset(ui, &mut self.config.bg_color, "Background Color", [0, 0, 0]);
         slider_u8(ui, &mut self.config.bg_opacity, "Background Opacity", DEFAULT_BG_OPACITY);
-        self.help_text(ui, "0 = fully transparent overlay.");
+        help_text(ui, self.config.show_help_text, "0 = fully transparent overlay.");
 
         section_header(ui, "Visualizer Opacity");
         slider_u8(ui, &mut self.config.visualizer_opacity, "Visualizer Opacity", DEFAULT_VISUALIZER_OPACITY);
-        self.help_text(ui, "0 = invisible, 255 = fully opaque. Applies to bars, peaks, and outlines.");
+        help_text(ui, self.config.show_help_text, "0 = invisible, 255 = fully opaque. Applies to bars, peaks, and outlines.");
 
         section_header(ui, "Menu");
         ui.horizontal(|ui| {
