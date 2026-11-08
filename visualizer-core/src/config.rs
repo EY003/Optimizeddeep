@@ -634,7 +634,6 @@ impl Default for AudioSettings {
             channel_mix: ChannelMixMode::default(), weighting: WeightingCurve::default(),
             dc_block: DEFAULT_DC_BLOCK, frequency_smoothing: DEFAULT_FREQ_SMOOTHING,
             harmonic_emphasis: DEFAULT_HARMONIC_EMPHASIS,
-            bar_interpolation: BarInterpolation::default(),
 
             sensitivity: DEFAULT_SENSITIVITY, raw_gain: DEFAULT_RAW_GAIN,
             response_gamma: DEFAULT_RESPONSE_GAMMA, noise_gate: DEFAULT_NOISE_GATE,
@@ -1131,6 +1130,7 @@ impl Default for AppConfig {
             visualizer_direction: VisualizerDirection::default(),
             frequency_direction: FrequencyDirection::default(),
             color_mode: ColorMode::StaticSingle,
+            bar_interpolation: BarInterpolation::default(),
             static_single_source: default_static_single_source(),
             static_multi_source: default_static_multi_source(),
             static_mode: StaticDistributionMode::Blocks,
