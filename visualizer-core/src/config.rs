@@ -900,8 +900,8 @@ fn default_gradient_stops() -> Vec<GradientStop> {
 }
 fn default_speed() -> f32 { 0.5 }
 fn default_sequential_bars_per_color() -> usize { 1 }
-fn default_visualizer_outline_thickness() -> f32 { 1.0 }
-fn default_visualizer_outline_color() -> [u8; 3] { [0, 0, 0] }
+pub fn default_visualizer_outline_thickness() -> f32 { 1.0 }
+pub fn default_visualizer_outline_color() -> [u8; 3] { [0, 0, 0] }
 
 fn default_static_single_source() -> ColorSource {
     ColorSource::Dynamic { palette_size: 1, variants_per_color: 0, priority: PalettePriority::MostCommon }
