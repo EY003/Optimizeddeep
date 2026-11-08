@@ -12,12 +12,12 @@ use visualizer_core::{
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BlendMode,
+        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
         ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
-        FrequencyDirection, GradientPreset, GradientSource, GradientStop,
+        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
         MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
         TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
-        VisualizerDirection,
+        VisualizerDirection, WeightingCurve, WindowFunction,
     },
     musicbee::{self, TrackInfo},
 };
@@ -30,6 +30,30 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     TrayIcon, TrayIconBuilder,
 };
+
+// ═══════════════════════════════════════════════════════════════
+// Custom Icon Loader
+// ═══════════════════════════════════════════════════════════════
+
+fn load_icon() -> (egui::IconData, tray_icon::Icon) {
+    // Requires `icon.png` to be placed in the src/ folder alongside main.rs
+    let icon_bytes = include_bytes!("icon.png");
+    let image = image::load_from_memory(icon_bytes).unwrap_or_else(|_| {
+        image::DynamicImage::new_rgba8(1, 1) // Fallback: 1x1 transparent
+    });
+    let rgba = image.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let raw = rgba.into_raw();
+    
+    let egui_icon = egui::IconData {
+        rgba: raw.clone(),
+        width: w,
+        height: h,
+    };
+    let tray = tray_icon::Icon::from_rgba(raw, w, h).unwrap();
+    
+    (egui_icon, tray)
+}
 
 // ═══════════════════════════════════════════════════════════════
 // Small utilities
@@ -277,7 +301,7 @@ struct ActivePalettes {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Fingerprint helpers (for palette caching)
+// Fingerprint helpers
 // ═══════════════════════════════════════════════════════════════
 
 fn hash_color_source<H: std::hash::Hasher>(s: &ColorSource, h: &mut H) {
@@ -315,7 +339,8 @@ fn hash_gradient_source<H: std::hash::Hasher>(s: &GradientSource, h: &mut H) {
 // Settings UI helpers
 // ═══════════════════════════════════════════════════════════════
 
-fn accent() -> egui::Color32 { egui::Color32::from_rgb(90, 170, 255) }
+// New accent color: #B7410E
+fn accent() -> egui::Color32 { egui::Color32::from_rgb(0xB7, 0x41, 0x0E) }
 
 fn section_header(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
@@ -325,18 +350,20 @@ fn section_header(ui: &mut egui::Ui, title: &str) {
     ui.add_space(2.0);
 }
 
+// Smaller, minimalist "Reset" text button
 fn reset_btn<F: FnOnce()>(ui: &mut egui::Ui, changed: bool, on_reset: F) {
-    if ui.add_enabled(changed, egui::Button::new("↺").small())
-        .on_hover_text("Reset to default")
-        .clicked()
-    {
+    let text = egui::RichText::new("Reset").size(11.0);
+    if ui.add_enabled(changed, egui::Button::new(text).small()).clicked() {
         on_reset();
     }
 }
 
+// Better, readable help text
 fn help_text(ui: &mut egui::Ui, show: bool, text: &str) {
     if show {
-        ui.label(egui::RichText::new(text).weak().small());
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(text).size(12.0).color(egui::Color32::from_gray(160)));
+        ui.add_space(6.0);
     }
 }
 
@@ -384,6 +411,7 @@ fn color_edit_reset(ui: &mut egui::Ui, value: &mut [u8; 3], label: &str, default
     });
 }
 
+// We remove `combo_reset_desc` entirely and use standard `combo_reset` + `help_text` for consistency.
 fn combo_reset<T: PartialEq + Copy + 'static>(
     ui: &mut egui::Ui,
     value: &mut T,
@@ -408,39 +436,13 @@ fn combo_reset<T: PartialEq + Copy + 'static>(
     });
 }
 
-fn combo_reset_desc<T: PartialEq + Copy + 'static>(
-    ui: &mut egui::Ui,
-    value: &mut T,
-    default: T,
-    label: &str,
-    id: &str,
-    width: f32,
-    options: &[T],
-    name: fn(T) -> &'static str,
-    desc: fn(T) -> &'static str,
-) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        egui::ComboBox::from_id_source(id)
-            .selected_text(name(*value))
-            .width(width)
-            .show_ui(ui, |ui| {
-                for &opt in options {
-                    ui.selectable_value(value, opt, name(opt)).on_hover_text(desc(opt));
-                }
-            });
-        reset_btn(ui, *value != default, || *value = default);
-        ui.label("ℹ").on_hover_text(desc(*value));
-    });
-}
-
 // ═══════════════════════════════════════════════════════════════
 // Settings tabs
 // ═══════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
-    Visualizer, Colors, Audio, Motion, TrackInfo, Appearance, Performance,
+    Visualizer, Colors, Audio, TrackInfo, Appearance, Performance,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -448,12 +450,11 @@ enum ColorSubTab {
     Single, Multi, Gradient, Animated,
 }
 
-// A tiny search index for the sidebar.
 const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
     (SettingsTab::Visualizer,  "Direction",          &["direction", "up", "down", "left", "right"]),
     (SettingsTab::Visualizer,  "Frequency Layout",   &["frequency", "mirrored", "layout", "scale"]),
     (SettingsTab::Visualizer,  "Bar Shape",          &["bar", "shape", "step", "smooth", "interpolation"]),
-    (SettingsTab::Visualizer,  "Bars & Position",    &["bar", "width", "gap", "radius", "height", "offset", "position"]),
+    (SettingsTab::Visualizer,  "Bars & Position",    &["bar", "width", "gap", "height", "offset", "position"]),
     (SettingsTab::Colors,      "Color Source",       &["color", "palette", "album", "dynamic"]),
     (SettingsTab::Colors,      "Distribution",       &["blocks", "sequential", "random", "vertical"]),
     (SettingsTab::Colors,      "Gradient",           &["gradient", "stops", "angle"]),
@@ -465,15 +466,11 @@ const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
     (SettingsTab::Audio,       "Equalizer",          &["eq", "bass", "mid", "treble", "tilt", "spectrum"]),
     (SettingsTab::Audio,       "Ballistics",         &["attack", "decay", "ballistic", "gravity", "peak", "average"]),
     (SettingsTab::Audio,       "Rhythm",             &["beat", "bpm", "rhythm", "tempo", "phase"]),
-    (SettingsTab::Motion,      "Shape",              &["shape", "motion"]),
-    (SettingsTab::Motion,      "Blend",              &["blend", "smooth", "hard"]),
-    (SettingsTab::Motion,      "Motion Speed",       &["speed", "velocity", "trail"]),
     (SettingsTab::TrackInfo,   "Cover Art",          &["cover", "art", "album", "opacity"]),
     (SettingsTab::TrackInfo,   "Text",               &["title", "artist", "font", "text", "spacing"]),
     (SettingsTab::TrackInfo,   "Shadow",             &["shadow", "glow", "blur"]),
     (SettingsTab::TrackInfo,   "Outline",            &["outline", "border"]),
     (SettingsTab::Appearance,  "Background",         &["background", "bg", "color", "opacity"]),
-    (SettingsTab::Appearance,  "Opacity",            &["opacity", "transparency", "visualizer"]),
     (SettingsTab::Appearance,  "UI",                 &["scale", "size", "help", "launch"]),
     (SettingsTab::Performance, "Performance",        &["fps", "vsync", "performance", "frame"]),
 ];
@@ -516,6 +513,8 @@ struct VisualizerApp {
     settings_tab: SettingsTab,
     color_subtab: ColorSubTab,
     settings_search: String,
+    pending_audio_preset_delete: Option<usize>,
+    settings_icon: egui::IconData,
 
     // system
     _tray_icon: TrayIcon,
@@ -535,15 +534,16 @@ impl VisualizerApp {
         let smtc_session_count = Arc::new(AtomicUsize::new(0));
         musicbee::spawn_smtc_listener(track_tx, should_quit.clone(), smtc_session_count.clone());
 
+        let (egui_icon, tray_icon_img) = load_icon();
+
         let tray_menu = Menu::new();
         let settings_item = MenuItem::new("Open Settings", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
         tray_menu.append_items(&[&settings_item, &quit_item]).unwrap();
-        let icon = make_tray_icon();
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
             .with_tooltip("Rust Music Visualizer")
-            .with_icon(icon)
+            .with_icon(tray_icon_img)
             .build()
             .unwrap();
 
@@ -588,6 +588,8 @@ impl VisualizerApp {
             settings_tab: SettingsTab::Visualizer,
             color_subtab: ColorSubTab::Single,
             settings_search: String::new(),
+            pending_audio_preset_delete: None,
+            settings_icon: egui_icon,
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             settings_menu_id: settings_item.id().clone(),
@@ -749,7 +751,6 @@ impl VisualizerApp {
         }
     }
 
-    /// Apply the visualizer-opacity setting to a bar color.
     #[inline]
     fn apply_vis(&self, c: egui::Color32) -> egui::Color32 {
         let a = (c.a() as u32 * self.config.visualizer_opacity as u32 / 255) as u8;
@@ -1061,7 +1062,6 @@ impl VisualizerApp {
                 let art_x = rect.right() - margin - art_size + cfg.cover_x_offset;
                 let art_y = rect.top() + margin + cfg.cover_y_offset;
                 let art_rect = egui::Rect::from_min_size(egui::pos2(art_x, art_y), egui::vec2(art_size, art_size));
-                // Cover opacity via tint alpha:
                 let tint = egui::Color32::from_white_alpha(cfg.cover_opacity);
                 painter.image(tex.id(), art_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
             }
@@ -2044,31 +2044,30 @@ impl VisualizerApp {
 // ═══════════════════════════════════════════════════════════════
 
 impl VisualizerApp {
-    
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         let scale = self.config.settings_scale.clamp(0.75, 1.5);
-        ui.style_mut().spacing.item_spacing *= scale;
-        ui.style_mut().spacing.button_padding *= scale;
-        ui.style_mut().spacing.slider_width *= scale;
-        ui.style_mut().spacing.combo_width *= scale;
-        for (_, font) in ui.style_mut().text_styles.iter_mut() {
-            font.size *= scale;
-        }
-
-        let sidebar_w = 160.0 * scale;
+        
+        // Sidebar (fixed width, not scaled)
         egui::SidePanel::left("settings_nav")
             .resizable(false)
-            .exact_width(sidebar_w)
-            .frame(egui::Frame::none()
-                .fill(egui::Color32::from_rgb(22, 22, 22))
-                .inner_margin(egui::Margin::same(8.0)))
+            .exact_width(130.0)
+            .frame(egui::Frame::none().fill(egui::Color32::BLACK).inner_margin(egui::Margin::same(8.0)))
             .show_inside(ui, |ui| {
                 self.draw_sidebar(ui);
             });
 
+        // Central panel (scaled, pure black)
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().inner_margin(egui::Margin::same(12.0)))
+            .frame(egui::Frame::none().fill(egui::Color32::BLACK).inner_margin(egui::Margin::same(12.0)))
             .show_inside(ui, |ui| {
+                ui.style_mut().spacing.item_spacing *= scale;
+                ui.style_mut().spacing.button_padding *= scale;
+                ui.style_mut().spacing.slider_width *= scale;
+                ui.style_mut().spacing.combo_width *= scale;
+                for (_, font) in ui.style_mut().text_styles.iter_mut() {
+                    font.size *= scale;
+                }
+
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -2076,7 +2075,6 @@ impl VisualizerApp {
                             SettingsTab::Visualizer  => self.tab_visualizer(ui),
                             SettingsTab::Colors      => self.tab_colors(ui),
                             SettingsTab::Audio       => self.tab_audio(ui),
-                            SettingsTab::Motion      => self.tab_motion(ui),
                             SettingsTab::TrackInfo   => self.tab_track_info(ui),
                             SettingsTab::Appearance  => self.tab_appearance(ui),
                             SettingsTab::Performance => self.tab_performance(ui),
@@ -2087,14 +2085,14 @@ impl VisualizerApp {
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("⚙  Settings").size(16.0).strong().color(accent()));
-        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Settings").size(16.0).strong().color(accent()));
+        ui.add_space(8.0);
 
         // Search box
         ui.add(egui::TextEdit::singleline(&mut self.settings_search)
             .hint_text("Search…")
             .desired_width(f32::INFINITY));
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
         let query = self.settings_search.trim().to_lowercase();
         if !query.is_empty() {
@@ -2119,13 +2117,12 @@ impl VisualizerApp {
 
         ui.add_space(4.0);
         let tabs = [
-            (SettingsTab::Visualizer,  "🎵 Visualizer"),
-            (SettingsTab::Colors,      "🌈 Colors"),
-            (SettingsTab::Audio,       "🔊 Audio"),
-            (SettingsTab::Motion,      "✨ Motion"),
-            (SettingsTab::TrackInfo,   "📝 Track Info"),
-            (SettingsTab::Appearance,  "🖥 Appearance"),
-            (SettingsTab::Performance, "⚡ Performance"),
+            (SettingsTab::Visualizer,  "Visualizer"),
+            (SettingsTab::Colors,      "Colors"),
+            (SettingsTab::Audio,       "Audio"),
+            (SettingsTab::TrackInfo,   "Track Info"),
+            (SettingsTab::Appearance,  "Appearance"),
+            (SettingsTab::Performance, "Performance"),
         ];
         for (tab, label) in tabs {
             let selected = self.settings_tab == tab;
@@ -2137,17 +2134,21 @@ impl VisualizerApp {
             }
         }
 
-        // Bottom buttons
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-            ui.add_space(4.0);
-            if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("↺ Reset All")).clicked() {
+        // Bottom buttons (minimalist)
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(8.0);
+            if ui.add_sized([ui.available_width(), 24.0], 
+                egui::Button::new(egui::RichText::new("Close").size(13.0)).frame(false)).clicked() 
+            {
+                self.show_settings = false;
+                self.config.save();
+            }
+            if ui.add_sized([ui.available_width(), 24.0], 
+                egui::Button::new(egui::RichText::new("Reset All").size(13.0).color(egui::Color32::from_rgb(255, 100, 100))).frame(false)).clicked() 
+            {
                 self.config = AppConfig::default();
                 self.last_palette_hash = 0;
                 self.loaded_font_path = Some("__reset__".to_string());
-            }
-            if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("✖ Close")).clicked() {
-                self.show_settings = false;
-                self.config.save();
             }
         });
     }
@@ -2170,9 +2171,9 @@ impl VisualizerApp {
 
         section_header(ui, "Frequency Layout");
         ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::LeftToRight, "Left → Right");
-            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::RightToLeft, "Right → Left");
-            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::Mirrored, "Mirrored");
+            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::LeftToRight, "Left to Right");
+            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::RightToLeft, "Right to Left");
+            ui.radio_value(&mut self.config.frequency_direction, FrequencyDirection::Mirrored, "Mirrored (Symmetrical)");
             reset_btn(ui, self.config.frequency_direction != FrequencyDirection::LeftToRight,
                       || self.config.frequency_direction = FrequencyDirection::LeftToRight);
         });
@@ -2190,7 +2191,6 @@ impl VisualizerApp {
         section_header(ui, "Bars");
         slider_f32(ui, &mut self.config.bar_width, 1.0..=50.0, "Bar Width", DEFAULT_BAR_WIDTH);
         slider_f32(ui, &mut self.config.bar_gap, 0.0..=20.0, "Bar Gap", DEFAULT_BAR_GAP);
-        slider_f32(ui, &mut self.config.bar_radius, 0.0..=20.0, "Corner Radius", DEFAULT_BAR_RADIUS);
         ui.horizontal(|ui| {
             let mut n = self.config.audio.num_bars as i32;
             let r = ui.add(egui::Slider::new(&mut n, 16..=256).text("Bar Count"));
@@ -2204,6 +2204,10 @@ impl VisualizerApp {
         section_header(ui, "Position");
         slider_f32(ui, &mut self.config.x_offset, -1000.0..=1000.0, "Horizontal Offset", DEFAULT_X_OFFSET);
         slider_f32(ui, &mut self.config.y_offset, -1000.0..=1000.0, "Vertical Offset", DEFAULT_Y_OFFSET);
+
+        section_header(ui, "Appearance");
+        slider_u8(ui, &mut self.config.visualizer_opacity, "Visualizer Opacity", DEFAULT_VISUALIZER_OPACITY);
+        help_text(ui, self.config.show_help_text, "0 = invisible, 255 = fully opaque. Applies to bars, peaks, and outlines.");
     }
 
     // ── Colors tab ───────────────────────────────────────────
@@ -2211,7 +2215,6 @@ impl VisualizerApp {
     fn tab_colors(&mut self, ui: &mut egui::Ui) {
         use cfg::*;
 
-        // Sub-tab row
         ui.horizontal_wrapped(|ui| {
             let subtabs = [
                 (ColorSubTab::Single,   "Single",   ColorMode::StaticSingle),
@@ -2243,8 +2246,8 @@ impl VisualizerApp {
         section_header(ui, "Visualizer Outlines");
         checkbox_reset(ui, &mut self.config.visualizer_outline_enabled, "Enable Outlines", false);
         if self.config.visualizer_outline_enabled {
-            slider_f32(ui, &mut self.config.visualizer_outline_thickness, 0.5..=10.0, "Outline Thickness", cfg::default_visualizer_outline_thickness());
-            color_edit_reset(ui, &mut self.config.visualizer_outline_color, "Outline Color", cfg::default_visualizer_outline_color());
+            slider_f32(ui, &mut self.config.visualizer_outline_thickness, 0.5..=10.0, "Outline Thickness", default_visualizer_outline_thickness());
+            color_edit_reset(ui, &mut self.config.visualizer_outline_color, "Outline Color", default_visualizer_outline_color());
             help_text(ui, self.config.show_help_text, "Outlines follow the visualizer's shape. In Smooth mode, a single perimeter is drawn.");
         }
     }
@@ -2325,13 +2328,13 @@ impl VisualizerApp {
             ui.radio_value(&mut self.config.static_mode, StaticDistributionMode::Vertical, "Vertical");
         });
         if self.config.static_mode == StaticDistributionMode::Sequential {
-           ui.horizontal(|ui| {
-               let mut n = self.config.sequential_bars_per_color as i32;
-               let r = ui.add(egui::Slider::new(&mut n, 1..=20).text("Bars per Color"));
-               if r.secondary_clicked() { n = 1; }
-               self.config.sequential_bars_per_color = n.max(1) as usize;
-               reset_btn(ui, self.config.sequential_bars_per_color != 1,
-                         || self.config.sequential_bars_per_color = 1);
+            ui.horizontal(|ui| {
+                let mut n = self.config.sequential_bars_per_color as i32;
+                let r = ui.add(egui::Slider::new(&mut n, 1..=20).text("Bars per Color"));
+                if r.secondary_clicked() { n = 1; }
+                self.config.sequential_bars_per_color = n.max(1) as usize;
+                reset_btn(ui, self.config.sequential_bars_per_color != 1,
+                          || self.config.sequential_bars_per_color = 1);
             });
         }
         if self.config.static_mode == StaticDistributionMode::Vertical {
@@ -2375,7 +2378,10 @@ impl VisualizerApp {
                     self.new_preset_name.clear();
                 }
             });
-            ui.label("Presets (left-click = colors only, right-click = full preset):");
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Apply Preset:").strong());
+                ui.label(egui::RichText::new("Left-Click: Colors only  |  Right-Click: All settings").small().weak());
+            });
             let mut apply_colors: Option<usize> = None;
             let mut apply_full: Option<usize> = None;
             let mut remove_idx: Option<usize> = None;
@@ -2492,7 +2498,10 @@ impl VisualizerApp {
                     self.new_preset_name.clear();
                 }
             });
-            ui.label("Presets (left-click = colors only, right-click = full preset):");
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Apply Preset:").strong());
+                ui.label(egui::RichText::new("Left-Click: Colors only  |  Right-Click: All settings").small().weak());
+            });
             let mut apply_colors: Option<usize> = None;
             let mut apply_full: Option<usize> = None;
             let mut remove_idx: Option<usize> = None;
@@ -2561,7 +2570,10 @@ impl VisualizerApp {
                     self.new_preset_name.clear();
                 }
             });
-            ui.label("Presets (left-click = colors only, right-click = full preset):");
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Apply Preset:").strong());
+                ui.label(egui::RichText::new("Left-Click: Colors only  |  Right-Click: All settings").small().weak());
+            });
             let mut apply_colors: Option<usize> = None;
             let mut apply_full: Option<usize> = None;
             let mut remove_idx: Option<usize> = None;
@@ -2586,156 +2598,214 @@ impl VisualizerApp {
             if let Some(i) = remove_idx { if !self.config.color_change_presets[i].is_premade { self.config.color_change_presets.remove(i); } }
         }
         slider_f32_scale(ui, &mut self.config.color_change_speed, 0.0..=1.0, "Speed", 0.5);
+        
+        // Moved Motion settings here
+        section_header(ui, "Motion Shape");
+        combo_reset(ui, &mut self.config.color_change_motion.shape, MotionShape::default(),
+                    "Shape", "motion_shape", 180.0,
+                    &MotionShape::all(), MotionShape::display_name);
+        if self.config.color_change_motion.shape.uses_vertical_axis() {
+            ui.horizontal(|ui| {
+                ui.label("Color Style:");
+                ui.radio_value(&mut self.config.vertical_color_style, VerticalColorStyle::Gradient, "Gradient");
+                ui.radio_value(&mut self.config.vertical_color_style, VerticalColorStyle::Blocks, "Blocks");
+            });
+            help_text(ui, self.config.show_help_text, self.config.vertical_color_style.description());
+        }
+
+        section_header(ui, "Blend");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.config.color_change_motion.blend, BlendMode::Smooth, "Smooth");
+            ui.radio_value(&mut self.config.color_change_motion.blend, BlendMode::Hard, "Hard");
+        });
+        help_text(ui, self.config.show_help_text, "Smooth = gradients / soft fades. Hard = sharp on/off edges.");
+
+        section_header(ui, "Motion Speed");
+        slider_f32(ui, &mut self.config.color_change_motion.speed, 0.0..=2.0, "Motion Speed", 1.0);
+
+        let shape = self.config.color_change_motion.shape;
+        let hard = self.config.color_change_motion.blend == BlendMode::Hard;
+        if matches!(shape, MotionShape::SineWave | MotionShape::TriangleWave | MotionShape::SquareWave | MotionShape::SawtoothWave | MotionShape::WaveInterference) {
+            slider_f32(ui, &mut self.config.color_change_motion.wave_frequency, 0.5..=8.0, "Wave Frequency", 2.0);
+        }
+        if matches!(shape, MotionShape::Comet | MotionShape::BouncingBall | MotionShape::Sinelon) {
+            slider_f32(ui, &mut self.config.color_change_motion.trail_length, 0.05..=0.9, "Trail Length", 0.25);
+        }
+        if matches!(shape, MotionShape::Stutter | MotionShape::Sparkle | MotionShape::Confetti) {
+            slider_f32(ui, &mut self.config.color_change_motion.stutter_intensity, 0.0..=1.0, "Event Intensity", 0.3);
+        }
+        if matches!(shape, MotionShape::HorizontalWipe | MotionShape::VerticalWipe | MotionShape::DiagonalWipe | MotionShape::RadialWipe) && !hard {
+            slider_f32(ui, &mut self.config.color_change_motion.wipe_softness, 0.01..=0.5, "Wipe Softness", 0.1);
+        }
+        if shape.uses_intensity() {
+            color_edit_reset(ui, &mut self.config.color_change_motion.off_color, "Off Color", [0, 0, 0]);
+            slider_u8(ui, &mut self.config.color_change_motion.off_color_opacity, "Off-Color Opacity", 255);
+            help_text(ui, self.config.show_help_text, "Colour that 'off' pixels fade toward.");
+        }
     }
 
     // ── Audio tab ────────────────────────────────────────────
 
     fn tab_audio(&mut self, ui: &mut egui::Ui) {
-    use cfg::*;
+        use cfg::*;
+        let show_help = self.config.show_help_text;
 
-    // Capture the flag BEFORE the mutable borrow of self.config.audio.
-    let show_help = self.config.show_help_text;
+        section_header(ui, "Presets");
+        self.draw_audio_preset_selector(ui);
 
-    section_header(ui, "Presets");
-    self.draw_audio_preset_selector(ui);
+        let a = &mut self.config.audio;
 
-    let a = &mut self.config.audio;
+        section_header(ui, "Signal Processing");
+        fft_size_combo(ui, a);
+        
+        combo_reset(ui, &mut a.window_function, WindowFunction::default(), "Window Function", "window_fn", 160.0, &WindowFunction::all(), WindowFunction::display_name);
+        help_text(ui, show_help, a.window_function.description());
 
-    section_header(ui, "Signal Processing");
-    fft_size_combo(ui, a);
-    combo_reset_desc(ui, &mut a.window_function, WindowFunction::default(), "Window Function", "window_fn", 160.0,
-                &WindowFunction::all(), WindowFunction::display_name, WindowFunction::description);
-    help_text(ui, show_help, "FFT windowing shape. Hann is a balanced default.");
-    combo_reset_desc(ui, &mut a.frequency_scaling, FrequencyScaling::default(), "Frequency Scaling", "freq_scaling", 160.0,
-                &[FrequencyScaling::Linear, FrequencyScaling::Logarithmic], FrequencyScaling::display_name, FrequencyScaling::description);
-    combo_reset_desc(ui, &mut a.channel_mix, ChannelMixMode::default(), "Channel Mix", "channel_mix", 160.0,
-                &ChannelMixMode::all(), ChannelMixMode::display_name, ChannelMixMode::description);
-    combo_reset_desc(ui, &mut a.weighting, WeightingCurve::default(), "Weighting Curve", "weighting", 180.0,
-                &WeightingCurve::all(), WeightingCurve::display_name, WeightingCurve::description);
-    checkbox_reset(ui, &mut a.dc_block, "DC Block / High-Pass Filter", DEFAULT_DC_BLOCK);
-    help_text(ui, show_help, "Filters out DC offset and sub-10 Hz rumble before analysis.");
-    slider_f32(ui, &mut a.frequency_smoothing, 0.0..=1.0, "Frequency Smoothing", DEFAULT_FREQ_SMOOTHING);
-    help_text(ui, show_help, "Averages adjacent bars. Higher = fewer spiky, jittery bars.");
-    checkbox_reset(ui, &mut a.harmonic_emphasis, "Harmonic Emphasis", DEFAULT_HARMONIC_EMPHASIS);
-    help_text(ui, show_help, "Blooms local spectral peaks into wider blobs. Helps with solo piano and sparse material.");
+        combo_reset(ui, &mut a.frequency_scaling, FrequencyScaling::default(), "Frequency Scaling", "freq_scaling", 160.0, &[FrequencyScaling::Linear, FrequencyScaling::Logarithmic], FrequencyScaling::display_name);
+        help_text(ui, show_help, a.frequency_scaling.description());
 
-    ui.horizontal(|ui| {
-        ui.label("Min Frequency:");
-        let r = ui.add(egui::DragValue::new(&mut a.min_frequency_hz).speed(10.0).clamp_range(10.0..=1000.0).suffix(" Hz"));
-        if r.secondary_clicked() { a.min_frequency_hz = DEFAULT_MIN_FREQ; }
-        reset_btn(ui, (a.min_frequency_hz - DEFAULT_MIN_FREQ).abs() > 1e-3, || a.min_frequency_hz = DEFAULT_MIN_FREQ);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Max Frequency:");
-        let r = ui.add(egui::DragValue::new(&mut a.max_frequency_hz).speed(100.0).clamp_range(2000.0..=24000.0).suffix(" Hz"));
-        if r.secondary_clicked() { a.max_frequency_hz = DEFAULT_MAX_FREQ; }
-        reset_btn(ui, (a.max_frequency_hz - DEFAULT_MAX_FREQ).abs() > 1e-3, || a.max_frequency_hz = DEFAULT_MAX_FREQ);
-    });
+        combo_reset(ui, &mut a.channel_mix, ChannelMixMode::default(), "Channel Mix", "channel_mix", 160.0, &ChannelMixMode::all(), ChannelMixMode::display_name);
+        help_text(ui, show_help, a.channel_mix.description());
 
-    section_header(ui, "Amplitude");
-    slider_f32(ui, &mut a.sensitivity, 0.0..=100.0, "Sensitivity", DEFAULT_SENSITIVITY);
-    help_text(ui, show_help, "Primary reactivity slider. Drives raw input gain and lowers the noise floor.");
-    slider_f32(ui, &mut a.raw_gain, 0.25..=4.0, "Raw Gain", DEFAULT_RAW_GAIN);
-    help_text(ui, show_help, "Direct pre-analysis multiplier. Normally driven by Sensitivity.");
-    slider_f32(ui, &mut a.response_gamma, 0.5..=2.5, "Response Curve (γ)", DEFAULT_RESPONSE_GAMMA);
-    help_text(ui, show_help, "<1 lifts quiet passages; >1 emphasises peaks. Default 1.5 = balanced.");
-    slider_f32(ui, &mut a.noise_gate, 0.0..=0.5, "Noise Gate", DEFAULT_NOISE_GATE);
-    help_text(ui, show_help, "Bars below this threshold are snapped to 0. Removes 'hovering' bars during silence.");
-    ui.horizontal(|ui| {
-        ui.label("Min dB:");
-        let r = ui.add(egui::Slider::new(&mut a.min_decibels, -120.0..=-30.0).show_value(true));
-        if r.secondary_clicked() { a.min_decibels = DEFAULT_MIN_DB; }
-        reset_btn(ui, (a.min_decibels - DEFAULT_MIN_DB).abs() > 1e-3, || a.min_decibels = DEFAULT_MIN_DB);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Max dB:");
-        let r = ui.add(egui::Slider::new(&mut a.max_decibels, -60.0..=0.0).show_value(true));
-        if r.secondary_clicked() { a.max_decibels = DEFAULT_MAX_DB; }
-        reset_btn(ui, (a.max_decibels - DEFAULT_MAX_DB).abs() > 1e-3, || a.max_decibels = DEFAULT_MAX_DB);
-    });
-    if a.min_decibels >= a.max_decibels {
-        ui.colored_label(egui::Color32::RED, "⚠ Max dB must be greater than Min dB.");
+        combo_reset(ui, &mut a.weighting, WeightingCurve::default(), "Weighting Curve", "weighting", 180.0, &WeightingCurve::all(), WeightingCurve::display_name);
+        help_text(ui, show_help, a.weighting.description());
+
+        checkbox_reset(ui, &mut a.dc_block, "DC Block / High-Pass Filter", DEFAULT_DC_BLOCK);
+        help_text(ui, show_help, "Filters out DC offset and sub-10 Hz rumble before analysis.");
+
+        slider_f32(ui, &mut a.frequency_smoothing, 0.0..=1.0, "Frequency Smoothing", DEFAULT_FREQ_SMOOTHING);
+        help_text(ui, show_help, "Averages adjacent bars. Higher = fewer spiky, jittery bars.");
+
+        checkbox_reset(ui, &mut a.harmonic_emphasis, "Harmonic Emphasis", DEFAULT_HARMONIC_EMPHASIS);
+        help_text(ui, show_help, "Blooms local spectral peaks into wider blobs. Helps with solo piano and sparse material.");
+
+        ui.horizontal(|ui| {
+            ui.label("Min Frequency:");
+            let r = ui.add(egui::DragValue::new(&mut a.min_frequency_hz).speed(10.0).clamp_range(10.0..=1000.0).suffix(" Hz"));
+            if r.secondary_clicked() { a.min_frequency_hz = DEFAULT_MIN_FREQ; }
+            reset_btn(ui, (a.min_frequency_hz - DEFAULT_MIN_FREQ).abs() > 1e-3, || a.min_frequency_hz = DEFAULT_MIN_FREQ);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Max Frequency:");
+            let r = ui.add(egui::DragValue::new(&mut a.max_frequency_hz).speed(100.0).clamp_range(2000.0..=24000.0).suffix(" Hz"));
+            if r.secondary_clicked() { a.max_frequency_hz = DEFAULT_MAX_FREQ; }
+            reset_btn(ui, (a.max_frequency_hz - DEFAULT_MAX_FREQ).abs() > 1e-3, || a.max_frequency_hz = DEFAULT_MAX_FREQ);
+        });
+
+        section_header(ui, "Amplitude");
+        slider_f32(ui, &mut a.sensitivity, 0.0..=100.0, "Sensitivity", DEFAULT_SENSITIVITY);
+        help_text(ui, show_help, "Primary reactivity slider. Drives raw input gain and lowers the noise floor.");
+
+        slider_f32(ui, &mut a.raw_gain, 0.25..=4.0, "Raw Gain", DEFAULT_RAW_GAIN);
+        help_text(ui, show_help, "Direct pre-analysis multiplier. Normally driven by Sensitivity.");
+
+        slider_f32(ui, &mut a.response_gamma, 0.5..=2.5, "Response Curve (γ)", DEFAULT_RESPONSE_GAMMA);
+        help_text(ui, show_help, "<1 lifts quiet passages; >1 emphasises peaks. Default 1.5 = balanced.");
+
+        slider_f32(ui, &mut a.noise_gate, 0.0..=0.5, "Noise Gate", DEFAULT_NOISE_GATE);
+        help_text(ui, show_help, "Bars below this threshold are snapped to 0. Removes 'hovering' bars during silence.");
+
+        ui.horizontal(|ui| {
+            ui.label("Min dB:");
+            let r = ui.add(egui::Slider::new(&mut a.min_decibels, -120.0..=-30.0).show_value(true));
+            if r.secondary_clicked() { a.min_decibels = DEFAULT_MIN_DB; }
+            reset_btn(ui, (a.min_decibels - DEFAULT_MIN_DB).abs() > 1e-3, || a.min_decibels = DEFAULT_MIN_DB);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Max dB:");
+            let r = ui.add(egui::Slider::new(&mut a.max_decibels, -60.0..=0.0).show_value(true));
+            if r.secondary_clicked() { a.max_decibels = DEFAULT_MAX_DB; }
+            reset_btn(ui, (a.max_decibels - DEFAULT_MAX_DB).abs() > 1e-3, || a.max_decibels = DEFAULT_MAX_DB);
+        });
+        if a.min_decibels >= a.max_decibels {
+            ui.colored_label(egui::Color32::RED, "⚠ Max dB must be greater than Min dB.");
+        }
+        slider_f32(ui, &mut a.target_dynamic_range_db, 20.0..=90.0, "Target Dynamic Range (dB)", DEFAULT_TARGET_RANGE);
+        help_text(ui, show_help, "Contrast between quiet and loud passages. Smaller = more compression/punch.");
+
+        checkbox_reset(ui, &mut a.per_frame_normalization, "Per-Frame Peak Normalization", DEFAULT_PER_FRAME_NORMALIZATION);
+        help_text(ui, show_help, "Scales each frame so the loudest bar hits the top. Makes quiet tracks visible.");
+
+        checkbox_reset(ui, &mut a.agc_enabled, "AGC / Peak Normalisation", DEFAULT_AGC_ENABLED);
+        help_text(ui, show_help, "Slowly normalises track loudness so quiet songs stay lively.");
+        if a.agc_enabled {
+            slider_f32(ui, &mut a.agc_attack, 0.01..=0.9, "AGC Attack", DEFAULT_AGC_ATTACK);
+            slider_f32(ui, &mut a.agc_release, 0.0001..=0.05, "AGC Release", DEFAULT_AGC_RELEASE);
+        }
+
+        section_header(ui, "Frequency Shaping");
+        slider_f32(ui, &mut a.eq_bass_db, -10.0..=10.0, "Bass EQ (< 250 Hz)", DEFAULT_EQ_BASS);
+        slider_f32(ui, &mut a.eq_mid_db, -10.0..=10.0, "Mid EQ (250–4k Hz)", DEFAULT_EQ_MID);
+        slider_f32(ui, &mut a.eq_treble_db, -10.0..=10.0, "Treble EQ (> 4k Hz)", DEFAULT_EQ_TREBLE);
+        slider_f32(ui, &mut a.spectrum_tilt, -6.0..=6.0, "Spectrum Tilt (dB/oct)", DEFAULT_SPECTRUM_TILT);
+        help_text(ui, show_help, "Balances bass and treble. Positive values boost highs and tame bass.");
+
+        section_header(ui, "Timing");
+        slider_f32(ui, &mut a.poll_rate_hz, 10.0..=120.0, "Poll Rate (Hz)", DEFAULT_POLL_RATE);
+        
+        ui.horizontal(|ui| {
+            let mut n = a.average_size as i32;
+            let r = ui.add(egui::Slider::new(&mut n, 1..=16).text("Average Size (frames)"));
+            if r.secondary_clicked() { n = DEFAULT_AVERAGE_SIZE as i32; }
+            a.average_size = n.max(1) as usize;
+            reset_btn(ui, a.average_size != DEFAULT_AVERAGE_SIZE, || a.average_size = DEFAULT_AVERAGE_SIZE);
+        });
+
+        section_header(ui, "Ballistics");
+        if a.decay_mode != self.last_decay_mode {
+            let (atk, dec) = a.decay_mode.default_ballistics();
+            a.attack_time_ms = atk;
+            a.decay_time_ms = dec;
+            self.last_decay_mode = a.decay_mode;
+        }
+        combo_reset(ui, &mut a.decay_mode, DecayMode::default(), "Decay Mode", "decay_mode", 160.0, &[DecayMode::Linear, DecayMode::Exponential, DecayMode::Gravity], DecayMode::display_name);
+        help_text(ui, show_help, a.decay_mode.description());
+        
+        slider_f32(ui, &mut a.attack_time_ms, 0.0..=100.0, "Attack Time (ms)", DEFAULT_ATTACK_MS);
+        slider_f32(ui, &mut a.decay_time_ms, 50.0..=2000.0, "Decay Time (ms)", DEFAULT_DECAY_MS);
+        ui.horizontal(|ui| {
+            ui.label("Peak Hold (ms):");
+            let r = ui.add(egui::Slider::new(&mut a.peak_hold_ms, 0.0..=2000.0));
+            if r.secondary_clicked() { a.peak_hold_ms = DEFAULT_PEAK_HOLD_MS; }
+            reset_btn(ui, (a.peak_hold_ms - DEFAULT_PEAK_HOLD_MS).abs() > 1e-3, || a.peak_hold_ms = DEFAULT_PEAK_HOLD_MS);
+        });
+        if a.decay_mode == DecayMode::Gravity || a.peak_hold_ms > 0.0 {
+            slider_f32(ui, &mut a.gravity_coefficient, 0.1..=5.0, "Gravity Coefficient", DEFAULT_GRAVITY_COEFF);
+        }
+        checkbox_reset(ui, &mut a.per_band_ballistics, "Per-Band Ballistics", DEFAULT_PER_BAND_BALLISTICS);
+        help_text(ui, show_help, "Lets bass / mid / treble use different attack and decay times.");
+        if a.per_band_ballistics {
+            ui.label("Bass:");
+            slider_f32(ui, &mut a.bass_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
+            slider_f32(ui, &mut a.bass_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
+            ui.label("Mid:");
+            slider_f32(ui, &mut a.mid_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
+            slider_f32(ui, &mut a.mid_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
+            ui.label("Treble:");
+            slider_f32(ui, &mut a.treble_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
+            slider_f32(ui, &mut a.treble_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
+        }
+
+        section_header(ui, "Rhythm");
+        combo_reset(ui, &mut a.beat_focus, BeatFocusMode::default(), "Beat Focus", "beat_focus", 160.0, &BeatFocusMode::all(), BeatFocusMode::display_name);
+        help_text(ui, show_help, a.beat_focus.description());
+        
+        slider_f32(ui, &mut a.beat_detection_sensitivity, 0.0..=1.0, "Beat Detection Sensitivity", DEFAULT_BEAT_SENS);
+        slider_f32(ui, &mut a.energy_threshold_multiplier, 1.0..=3.0, "Energy Threshold Multiplier", DEFAULT_ENERGY_THRESHOLD);
+        slider_f32(ui, &mut a.beat_envelope_decay_ms, 20.0..=500.0, "Beat Envelope Decay (ms)", DEFAULT_BEAT_ENVELOPE_DECAY_MS);
+        help_text(ui, show_help, "How quickly the beat 'flash' fades out after a detection.");
+        
+        checkbox_reset(ui, &mut a.bpm_lock_enabled, "BPM Lock / Phase Smoothing", false);
+        if a.bpm_lock_enabled {
+            slider_f32(ui, &mut a.bpm_phase_smoothing, 0.0..=1.0, "Phase Smoothing", DEFAULT_BPM_PHASE_SMOOTHING);
+        }
+        
+        let _ = &a;
+        if self.last_bpm > 0.0 {
+            ui.label(format!("Detected BPM: {:.1}", self.last_bpm));
+        }
     }
-    slider_f32(ui, &mut a.target_dynamic_range_db, 20.0..=90.0, "Target Dynamic Range (dB)", DEFAULT_TARGET_RANGE);
-    help_text(ui, show_help, "Contrast between quiet and loud passages. Smaller = more compression/punch.");
-    checkbox_reset(ui, &mut a.per_frame_normalization, "Per-Frame Peak Normalization", DEFAULT_PER_FRAME_NORMALIZATION);
-    help_text(ui, show_help, "Scales each frame so the loudest bar hits the top. Makes quiet tracks visible.");
-    checkbox_reset(ui, &mut a.agc_enabled, "AGC / Peak Normalisation", DEFAULT_AGC_ENABLED);
-    help_text(ui, show_help, "Slowly normalises track loudness so quiet songs stay lively.");
-    if a.agc_enabled {
-        slider_f32(ui, &mut a.agc_attack, 0.01..=0.9, "AGC Attack", DEFAULT_AGC_ATTACK);
-        slider_f32(ui, &mut a.agc_release, 0.0001..=0.05, "AGC Release", DEFAULT_AGC_RELEASE);
-    }
 
-    section_header(ui, "Frequency Shaping");
-    slider_f32(ui, &mut a.eq_bass_db, -10.0..=10.0, "Bass EQ (< 250 Hz)", DEFAULT_EQ_BASS);
-    slider_f32(ui, &mut a.eq_mid_db, -10.0..=10.0, "Mid EQ (250–4k Hz)", DEFAULT_EQ_MID);
-    slider_f32(ui, &mut a.eq_treble_db, -10.0..=10.0, "Treble EQ (> 4k Hz)", DEFAULT_EQ_TREBLE);
-    slider_f32(ui, &mut a.spectrum_tilt, -6.0..=6.0, "Spectrum Tilt (dB/oct)", DEFAULT_SPECTRUM_TILT);
-    help_text(ui, show_help, "Balances bass and treble. Positive values boost highs and tame bass.");
-
-    section_header(ui, "Timing");
-    slider_f32(ui, &mut a.poll_rate_hz, 10.0..=120.0, "Poll Rate (Hz)", DEFAULT_POLL_RATE);
-    ui.horizontal(|ui| {
-        let mut n = a.average_size as i32;
-        let r = ui.add(egui::Slider::new(&mut n, 1..=16).text("Average Size (frames)"));
-        if r.secondary_clicked() { n = DEFAULT_AVERAGE_SIZE as i32; }
-        a.average_size = n.max(1) as usize;
-        reset_btn(ui, a.average_size != DEFAULT_AVERAGE_SIZE, || a.average_size = DEFAULT_AVERAGE_SIZE);
-    });
-
-    section_header(ui, "Ballistics");
-    if a.decay_mode != self.last_decay_mode {
-        let (atk, dec) = a.decay_mode.default_ballistics();
-        a.attack_time_ms = atk;
-        a.decay_time_ms = dec;
-        self.last_decay_mode = a.decay_mode;
-    }
-    combo_reset_desc(ui, &mut a.decay_mode, DecayMode::default(), "Decay Mode", "decay_mode", 160.0,
-                &[DecayMode::Linear, DecayMode::Exponential, DecayMode::Gravity],
-                DecayMode::display_name, DecayMode::description);
-    slider_f32(ui, &mut a.attack_time_ms, 0.0..=100.0, "Attack Time (ms)", DEFAULT_ATTACK_MS);
-    slider_f32(ui, &mut a.decay_time_ms, 50.0..=2000.0, "Decay Time (ms)", DEFAULT_DECAY_MS);
-    ui.horizontal(|ui| {
-        ui.label("Peak Hold (ms):");
-        let r = ui.add(egui::Slider::new(&mut a.peak_hold_ms, 0.0..=2000.0));
-        if r.secondary_clicked() { a.peak_hold_ms = DEFAULT_PEAK_HOLD_MS; }
-        reset_btn(ui, (a.peak_hold_ms - DEFAULT_PEAK_HOLD_MS).abs() > 1e-3, || a.peak_hold_ms = DEFAULT_PEAK_HOLD_MS);
-    });
-    if a.decay_mode == DecayMode::Gravity || a.peak_hold_ms > 0.0 {
-        slider_f32(ui, &mut a.gravity_coefficient, 0.1..=5.0, "Gravity Coefficient", DEFAULT_GRAVITY_COEFF);
-    }
-    checkbox_reset(ui, &mut a.per_band_ballistics, "Per-Band Ballistics", DEFAULT_PER_BAND_BALLISTICS);
-    help_text(ui, show_help, "Lets bass / mid / treble use different attack and decay times.");
-    if a.per_band_ballistics {
-        ui.label("Bass:");
-        slider_f32(ui, &mut a.bass_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
-        slider_f32(ui, &mut a.bass_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
-        ui.label("Mid:");
-        slider_f32(ui, &mut a.mid_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
-        slider_f32(ui, &mut a.mid_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
-        ui.label("Treble:");
-        slider_f32(ui, &mut a.treble_attack_ms, 0.0..=100.0, "  Attack (ms)", DEFAULT_ATTACK_MS);
-        slider_f32(ui, &mut a.treble_decay_ms, 50.0..=2000.0, "  Decay (ms)", DEFAULT_DECAY_MS);
-    }
-
-    section_header(ui, "Rhythm");
-    combo_reset_desc(ui, &mut a.beat_focus, BeatFocusMode::default(), "Beat Focus", "beat_focus", 160.0,
-                &BeatFocusMode::all(), BeatFocusMode::display_name, BeatFocusMode::description);
-    slider_f32(ui, &mut a.beat_detection_sensitivity, 0.0..=1.0, "Beat Detection Sensitivity", DEFAULT_BEAT_SENS);
-    slider_f32(ui, &mut a.energy_threshold_multiplier, 1.0..=3.0, "Energy Threshold Multiplier", DEFAULT_ENERGY_THRESHOLD);
-    slider_f32(ui, &mut a.beat_envelope_decay_ms, 20.0..=500.0, "Beat Envelope Decay (ms)", DEFAULT_BEAT_ENVELOPE_DECAY_MS);
-    help_text(ui, show_help, "How quickly the beat 'flash' fades out after a detection.");
-    checkbox_reset(ui, &mut a.bpm_lock_enabled, "BPM Lock / Phase Smoothing", false);
-    if a.bpm_lock_enabled {
-        slider_f32(ui, &mut a.bpm_phase_smoothing, 0.0..=1.0, "Phase Smoothing", DEFAULT_BPM_PHASE_SMOOTHING);
-    }
-    // Drop the borrow on `a` before reading `self.last_bpm`.
-    let _ = &a;
-    if self.last_bpm > 0.0 {
-        ui.label(format!("Detected BPM: {:.1}", self.last_bpm));
-    }
-}
     fn draw_audio_preset_selector(&mut self, ui: &mut egui::Ui) {
         let detected = AudioPreset::detect(&self.config.audio);
         let custom_match = self.config.custom_audio_presets.iter()
@@ -2818,65 +2888,7 @@ impl VisualizerApp {
                 if ui.small_button("✖").clicked() { to_remove = Some(*i); }
             }
         });
-        if let Some(i) = to_remove { self.config.custom_audio_presets.remove(i); }
-    }
-
-    // ── Motion tab ───────────────────────────────────────────
-
-    fn tab_motion(&mut self, ui: &mut egui::Ui) {
-        use cfg::*;
-
-        let enabled = self.config.color_mode == ColorMode::Animated;
-        if !enabled {
-            ui.label(egui::RichText::new("⚠  Motion effects require Color Mode → Animated.")
-                .color(egui::Color32::YELLOW));
-            ui.add_space(6.0);
-        }
-
-        ui.add_enabled_ui(enabled, |ui| {
-            section_header(ui, "Motion Shape");
-            combo_reset(ui, &mut self.config.color_change_motion.shape, MotionShape::default(),
-                        "Shape", "motion_shape", 180.0,
-                        &MotionShape::all(), MotionShape::display_name);
-            if self.config.color_change_motion.shape.uses_vertical_axis() {
-                ui.horizontal(|ui| {
-                    ui.label("Color Style:");
-                    ui.radio_value(&mut self.config.vertical_color_style, VerticalColorStyle::Gradient, "Gradient");
-                    ui.radio_value(&mut self.config.vertical_color_style, VerticalColorStyle::Blocks, "Blocks");
-                });
-                help_text(ui, self.config.show_help_text, self.config.vertical_color_style.description());
-            }
-
-            section_header(ui, "Blend");
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut self.config.color_change_motion.blend, BlendMode::Smooth, "Smooth");
-                ui.radio_value(&mut self.config.color_change_motion.blend, BlendMode::Hard, "Hard");
-            });
-            help_text(ui, self.config.show_help_text, "Smooth = gradients / soft fades. Hard = sharp on/off edges.");
-
-            section_header(ui, "Motion Speed");
-            slider_f32(ui, &mut self.config.color_change_motion.speed, 0.0..=2.0, "Motion Speed", 1.0);
-
-            let shape = self.config.color_change_motion.shape;
-            let hard = self.config.color_change_motion.blend == BlendMode::Hard;
-            if matches!(shape, MotionShape::SineWave | MotionShape::TriangleWave | MotionShape::SquareWave | MotionShape::SawtoothWave | MotionShape::WaveInterference) {
-                slider_f32(ui, &mut self.config.color_change_motion.wave_frequency, 0.5..=8.0, "Wave Frequency", 2.0);
-            }
-            if matches!(shape, MotionShape::Comet | MotionShape::BouncingBall | MotionShape::Sinelon) {
-                slider_f32(ui, &mut self.config.color_change_motion.trail_length, 0.05..=0.9, "Trail Length", 0.25);
-            }
-            if matches!(shape, MotionShape::Stutter | MotionShape::Sparkle | MotionShape::Confetti) {
-                slider_f32(ui, &mut self.config.color_change_motion.stutter_intensity, 0.0..=1.0, "Event Intensity", 0.3);
-            }
-            if matches!(shape, MotionShape::HorizontalWipe | MotionShape::VerticalWipe | MotionShape::DiagonalWipe | MotionShape::RadialWipe) && !hard {
-                slider_f32(ui, &mut self.config.color_change_motion.wipe_softness, 0.01..=0.5, "Wipe Softness", 0.1);
-            }
-            if shape.uses_intensity() {
-                color_edit_reset(ui, &mut self.config.color_change_motion.off_color, "Off Color", [0, 0, 0]);
-                slider_u8(ui, &mut self.config.color_change_motion.off_color_opacity, "Off-Color Opacity", 255);
-                help_text(ui, self.config.show_help_text, "Colour that 'off' pixels fade toward.");
-            }
-        });
+        if let Some(i) = to_remove { self.pending_audio_preset_delete = Some(i); }
     }
 
     // ── Track Info tab ───────────────────────────────────────
@@ -2885,6 +2897,7 @@ impl VisualizerApp {
         use cfg::*;
         let system_fonts = self.system_fonts.clone();
         let cfg = &mut self.config.track_info;
+        let show_help = self.config.show_help_text;
 
         section_header(ui, "Cover Art");
         checkbox_reset(ui, &mut cfg.show_cover_art, "Show Cover Art", true);
@@ -3011,24 +3024,29 @@ impl VisualizerApp {
 
     fn tab_appearance(&mut self, ui: &mut egui::Ui) {
         use cfg::*;
+        let show_help = self.config.show_help_text;
 
         section_header(ui, "Background");
         color_edit_reset(ui, &mut self.config.bg_color, "Background Color", [0, 0, 0]);
         slider_u8(ui, &mut self.config.bg_opacity, "Background Opacity", DEFAULT_BG_OPACITY);
-        help_text(ui, self.config.show_help_text, "0 = fully transparent overlay.");
-
-        section_header(ui, "Visualizer Opacity");
-        slider_u8(ui, &mut self.config.visualizer_opacity, "Visualizer Opacity", DEFAULT_VISUALIZER_OPACITY);
-        help_text(ui, self.config.show_help_text, "0 = invisible, 255 = fully opaque. Applies to bars, peaks, and outlines.");
+        help_text(ui, show_help, "0 = fully transparent overlay.");
 
         section_header(ui, "Menu");
         ui.horizontal(|ui| {
-            let mut v = self.config.settings_scale;
-            let r = ui.add(egui::Slider::new(&mut v, 0.75..=1.5).text("Menu Scale"));
-            if v != self.config.settings_scale { self.config.settings_scale = v; }
-            if r.secondary_clicked() { self.config.settings_scale = DEFAULT_SETTINGS_SCALE; }
-            reset_btn(ui, (self.config.settings_scale - DEFAULT_SETTINGS_SCALE).abs() > 1e-3,
-                      || self.config.settings_scale = DEFAULT_SETTINGS_SCALE);
+            ui.label("Menu Scale:");
+            let mut current_scale = self.config.settings_scale;
+            egui::ComboBox::from_id_source("menu_scale")
+                .selected_text(format!("{:.0}%", current_scale * 100.0))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut current_scale, 0.75, "75%");
+                    ui.selectable_value(&mut current_scale, 1.00, "100%");
+                    ui.selectable_value(&mut current_scale, 1.25, "125%");
+                    ui.selectable_value(&mut current_scale, 1.50, "150%");
+                });
+            if current_scale != self.config.settings_scale {
+                self.config.settings_scale = current_scale;
+            }
+            reset_btn(ui, (self.config.settings_scale - 1.0).abs() > 1e-3, || self.config.settings_scale = 1.0);
         });
         checkbox_reset(ui, &mut self.config.open_settings_on_launch, "Open Settings on Launch", DEFAULT_OPEN_SETTINGS_ON_LAUNCH);
         checkbox_reset(ui, &mut self.config.show_help_text, "Show Inline Help Text", DEFAULT_SHOW_HELP_TEXT);
@@ -3063,7 +3081,7 @@ impl VisualizerApp {
                 let mut v = *palette_size as i32;
                 let r = ui.add(egui::Slider::new(&mut v, 1..=3).text("Colors from Cover"));
                 if r.secondary_clicked() { v = 1; }
-               *palette_size = v.clamp(1, 3) as u8;
+                *palette_size = v.clamp(1, 3) as u8;
             }
             if show_variants {
                 let mut v = *variants as i32;
@@ -3085,8 +3103,6 @@ impl VisualizerApp {
     }
 }
 
-// ── tiny helpers defined outside the impl to avoid borrow issues ──
-
 fn fft_size_combo(ui: &mut egui::Ui, a: &mut visualizer_core::config::AudioSettings) {
     ui.horizontal(|ui| {
         ui.label("FFT Size:");
@@ -3099,33 +3115,6 @@ fn fft_size_combo(ui: &mut egui::Ui, a: &mut visualizer_core::config::AudioSetti
             });
         reset_btn(ui, a.fft_size != 2048, || a.fft_size = 2048);
     });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Tray icon
-// ═══════════════════════════════════════════════════════════════
-
-fn make_tray_icon() -> tray_icon::Icon {
-    let size = 16u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    let bars: [u32; 6] = [4, 8, 12, 10, 7, 3];
-    let bar_w: u32 = 2;
-    let start_x: u32 = 2;
-    let accent = [90u8, 170, 255];
-    for (i, &h) in bars.iter().enumerate() {
-        let x0 = start_x + i as u32 * (bar_w + 0);
-        for xx in x0..(x0 + bar_w) {
-            if xx >= size { break; }
-            for y in (size - h)..size {
-                let idx = ((y * size + xx) * 4) as usize;
-                rgba[idx]     = accent[0];
-                rgba[idx + 1] = accent[1];
-                rgba[idx + 2] = accent[2];
-                rgba[idx + 3] = 255;
-            }
-        }
-    }
-    tray_icon::Icon::from_rgba(rgba, size, size).unwrap()
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3147,7 +3136,6 @@ impl eframe::App for VisualizerApp {
 
         self.poll_track_updates(ctx);
 
-        // Palette cache
         let new_hash = self.palette_fingerprint();
         if new_hash != self.last_palette_hash {
             self.update_palettes();
@@ -3158,7 +3146,6 @@ impl eframe::App for VisualizerApp {
             self.reload_custom_font(ctx);
         }
 
-        // Audio settings cache (skip if unchanged)
         if self.config.audio != *self.audio_settings.load_full() {
             self.audio_settings.store(Arc::new(self.config.audio.clone()));
         }
@@ -3222,12 +3209,18 @@ impl eframe::App for VisualizerApp {
         });
 
         if self.show_settings {
-            let settings_builder = egui::ViewportBuilder::default()
+            let scale = self.config.settings_scale.clamp(0.75, 1.5);
+            let mut settings_builder = egui::ViewportBuilder::default()
                 .with_title("Rust Visualizer — Settings")
-                .with_inner_size([560.0, 720.0])
+                .with_inner_size([560.0 * scale, 720.0 * scale])
                 .with_decorations(true)
                 .with_resizable(true)
                 .with_always_on_top();
+                
+            if self.settings_icon.width > 0 {
+                settings_builder = settings_builder.with_icon(self.settings_icon.clone());
+            }
+
             let mut close_window = false;
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("settings"),
@@ -3235,10 +3228,30 @@ impl eframe::App for VisualizerApp {
                 |ctx, _class| {
                     if ctx.input(|i| i.viewport().close_requested()) { close_window = true; }
                     egui::CentralPanel::default()
-                        .frame(egui::Frame::none().fill(egui::Color32::from_rgb(25, 25, 25)))
+                        .frame(egui::Frame::none().fill(egui::Color32::BLACK))
                         .show(ctx, |ui| {
                             self.draw_settings_ui(ui);
                         });
+                        
+                    if let Some(idx) = self.pending_audio_preset_delete {
+                        egui::Window::new("Confirm Delete")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                            .show(ctx, |ui| {
+                                ui.label(format!("Delete preset '{}'?", self.config.custom_audio_presets[idx].name));
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Yes").clicked() {
+                                        self.config.custom_audio_presets.remove(idx);
+                                        self.pending_audio_preset_delete = None;
+                                    }
+                                    if ui.button("No").clicked() {
+                                        self.pending_audio_preset_delete = None;
+                                    }
+                                });
+                            });
+                    }
                 });
             if close_window {
                 self.show_settings = false;
@@ -3247,8 +3260,6 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        // Lower FPS when settings is open (main viewport is a live preview).
-        // Always run at the configured target FPS, whether or not settings are open.
         let target_duration = Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0));
         ctx.request_repaint_after(target_duration);
     }
@@ -3262,12 +3273,15 @@ impl eframe::App for VisualizerApp {
 
 fn main() -> eframe::Result<()> {
     let config = AppConfig::load();
+    let (egui_icon, _) = load_icon(); // Loads the icon for the main window options
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_transparent(true)
             .with_decorations(false)
             .with_always_on_top()
-            .with_maximized(true),
+            .with_maximized(true)
+            .with_icon(egui_icon),
         vsync: config.use_vsync,
         ..Default::default()
     };
