@@ -544,7 +544,6 @@ pub struct AudioSettings {
     #[serde(default = "default_dc_block")]             pub dc_block: bool,
     #[serde(default = "default_freq_smoothing")]       pub frequency_smoothing: f32,
     #[serde(default = "default_harmonic_emphasis")]    pub harmonic_emphasis: bool,
-    #[serde(default)]                                  pub bar_interpolation: BarInterpolation,
 
     // Amplitude / dynamics
     #[serde(default = "default_sensitivity")]          pub sensitivity: f32,
@@ -1069,6 +1068,7 @@ pub struct AppConfig {
     #[serde(default)] pub visualizer_direction: VisualizerDirection,
     #[serde(default)] pub frequency_direction: FrequencyDirection,
     #[serde(default)] pub color_mode: ColorMode,
+    #[serde(default)] pub bar_interpolation: BarInterpolation,
     #[serde(default = "default_static_single_source")] pub static_single_source: ColorSource,
     #[serde(default = "default_static_multi_source")]  pub static_multi_source: ColorSource,
     #[serde(default)] pub static_mode: StaticDistributionMode,
