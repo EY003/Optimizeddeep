@@ -36,7 +36,6 @@ use tray_icon::{
 // ═══════════════════════════════════════════════════════════════
 
 fn load_icon() -> (egui::IconData, tray_icon::Icon) {
-    // Requires `icon.png` to be placed in the src/ folder alongside main.rs
     let icon_bytes = include_bytes!("icon.png");
     let image = image::load_from_memory(icon_bytes).unwrap_or_else(|_| {
         image::DynamicImage::new_rgba8(1, 1) // Fallback: 1x1 transparent
@@ -339,30 +338,32 @@ fn hash_gradient_source<H: std::hash::Hasher>(s: &GradientSource, h: &mut H) {
 // Settings UI helpers
 // ═══════════════════════════════════════════════════════════════
 
-// New accent color: #B7410E
 fn accent() -> egui::Color32 { egui::Color32::from_rgb(0xB7, 0x41, 0x0E) }
 
 fn section_header(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
-    ui.label(egui::RichText::new(title).size(14.0).strong().color(accent()));
-    ui.add_space(1.0);
-    ui.separator();
+    ui.label(egui::RichText::new(title).size(16.0).strong().color(accent()));
     ui.add_space(2.0);
+    ui.separator();
+    ui.add_space(4.0);
 }
 
-// Smaller, minimalist "Reset" text button
 fn reset_btn<F: FnOnce()>(ui: &mut egui::Ui, changed: bool, on_reset: F) {
-    let text = egui::RichText::new("Reset").size(11.0);
+    let text = egui::RichText::new("Reset").size(12.0);
     if ui.add_enabled(changed, egui::Button::new(text).small()).clicked() {
         on_reset();
     }
 }
 
-// Better, readable help text
 fn help_text(ui: &mut egui::Ui, show: bool, text: &str) {
     if show {
         ui.add_space(2.0);
-        ui.label(egui::RichText::new(text).size(12.0).color(egui::Color32::from_gray(160)));
+        ui.label(
+            egui::RichText::new(format!("ℹ {}", text))
+                .size(12.0)
+                .color(egui::Color32::from_gray(150))
+                .italics()
+        );
         ui.add_space(6.0);
     }
 }
@@ -411,7 +412,6 @@ fn color_edit_reset(ui: &mut egui::Ui, value: &mut [u8; 3], label: &str, default
     });
 }
 
-// We remove `combo_reset_desc` entirely and use standard `combo_reset` + `help_text` for consistency.
 fn combo_reset<T: PartialEq + Copy + 'static>(
     ui: &mut egui::Ui,
     value: &mut T,
@@ -455,11 +455,11 @@ const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
     (SettingsTab::Visualizer,  "Frequency Layout",   &["frequency", "mirrored", "layout", "scale"]),
     (SettingsTab::Visualizer,  "Bar Shape",          &["bar", "shape", "step", "smooth", "interpolation"]),
     (SettingsTab::Visualizer,  "Bars & Position",    &["bar", "width", "gap", "height", "offset", "position"]),
+    (SettingsTab::Visualizer,  "Outlines",           &["outline", "border", "stroke"]),
     (SettingsTab::Colors,      "Color Source",       &["color", "palette", "album", "dynamic"]),
     (SettingsTab::Colors,      "Distribution",       &["blocks", "sequential", "random", "vertical"]),
     (SettingsTab::Colors,      "Gradient",           &["gradient", "stops", "angle"]),
     (SettingsTab::Colors,      "Motion",             &["motion", "animated", "shape"]),
-    (SettingsTab::Colors,      "Outlines",           &["outline", "border", "stroke"]),
     (SettingsTab::Audio,       "Presets",            &["preset", "audio", "custom"]),
     (SettingsTab::Audio,       "Signal Processing",  &["fft", "window", "frequency", "channel", "weighting", "smoothing", "dc", "harmonic"]),
     (SettingsTab::Audio,       "Amplitude",          &["sensitivity", "gain", "gamma", "noise", "gate", "db", "dynamic", "agc"]),
@@ -515,6 +515,7 @@ struct VisualizerApp {
     settings_search: String,
     pending_audio_preset_delete: Option<usize>,
     settings_icon: egui::IconData,
+    old_settings_scale: f32,
 
     // system
     _tray_icon: TrayIcon,
@@ -555,6 +556,7 @@ impl VisualizerApp {
         let num_bars = config.audio.num_bars;
         let last_decay_mode = config.audio.decay_mode;
         let show_settings = config.open_settings_on_launch;
+        let old_settings_scale = config.settings_scale;
 
         Self {
             current_bars: vec![0.0; num_bars],
@@ -590,6 +592,7 @@ impl VisualizerApp {
             settings_search: String::new(),
             pending_audio_preset_delete: None,
             settings_icon: egui_icon,
+            old_settings_scale,
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             settings_menu_id: settings_item.id().clone(),
@@ -1126,7 +1129,7 @@ impl VisualizerApp {
         let freq_dir = self.config.frequency_direction;
         let dir = self.config.visualizer_direction;
         let is_blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
-        let is_smooth = self.config.audio.bar_interpolation == BarInterpolation::Smooth;
+        let is_smooth = self.config.bar_interpolation == BarInterpolation::Smooth;
         let colors = &self.active_palettes.static_multi_colors;
         if colors.is_empty() { return; }
         let n_colors = colors.len();
@@ -1293,7 +1296,7 @@ impl VisualizerApp {
         let freq_dir = self.config.frequency_direction;
         let dir = self.config.visualizer_direction;
         let is_blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
-        let is_smooth = self.config.audio.bar_interpolation == BarInterpolation::Smooth;
+        let is_smooth = self.config.bar_interpolation == BarInterpolation::Smooth;
         let palette_len = self.active_palettes.animated_colors.len().max(1);
         let n_segments: usize = if is_blocks { palette_len.clamp(6, 16) } else { 24 };
 
@@ -1485,7 +1488,7 @@ impl VisualizerApp {
         let total_size = visual_num_bars as f32 * stride - gap;
         let max_h = self.config.max_bar_height;
         let freq_dir = self.config.frequency_direction;
-        let is_smooth = self.config.audio.bar_interpolation == BarInterpolation::Smooth;
+        let is_smooth = self.config.bar_interpolation == BarInterpolation::Smooth;
 
         let mut max_val: f32 = 0.0;
         for i in 0..base_num_bars { max_val = max_val.max(self.current_bars[i]); }
@@ -2050,7 +2053,7 @@ impl VisualizerApp {
         // Sidebar (fixed width, not scaled)
         egui::SidePanel::left("settings_nav")
             .resizable(false)
-            .exact_width(130.0)
+            .exact_width(140.0)
             .frame(egui::Frame::none().fill(egui::Color32::BLACK).inner_margin(egui::Margin::same(8.0)))
             .show_inside(ui, |ui| {
                 self.draw_sidebar(ui);
@@ -2060,10 +2063,17 @@ impl VisualizerApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::BLACK).inner_margin(egui::Margin::same(12.0)))
             .show_inside(ui, |ui| {
+                // Scale text sizes first for larger base readability
+                ui.style_mut().text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+                ui.style_mut().text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+                ui.style_mut().text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+                ui.style_mut().text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+
                 ui.style_mut().spacing.item_spacing *= scale;
                 ui.style_mut().spacing.button_padding *= scale;
                 ui.style_mut().spacing.slider_width *= scale;
                 ui.style_mut().spacing.combo_width *= scale;
+                
                 for (_, font) in ui.style_mut().text_styles.iter_mut() {
                     font.size *= scale;
                 }
@@ -2181,12 +2191,12 @@ impl VisualizerApp {
 
         section_header(ui, "Bar Shape");
         ui.horizontal(|ui| {
-            ui.radio_value(&mut self.config.audio.bar_interpolation, BarInterpolation::Step, "Step");
-            ui.radio_value(&mut self.config.audio.bar_interpolation, BarInterpolation::Smooth, "Smooth");
-            reset_btn(ui, self.config.audio.bar_interpolation != BarInterpolation::Step,
-                      || self.config.audio.bar_interpolation = BarInterpolation::Step);
+            ui.radio_value(&mut self.config.bar_interpolation, BarInterpolation::Step, "Step");
+            ui.radio_value(&mut self.config.bar_interpolation, BarInterpolation::Smooth, "Smooth");
+            reset_btn(ui, self.config.bar_interpolation != BarInterpolation::Step,
+                      || self.config.bar_interpolation = BarInterpolation::Step);
         });
-        help_text(ui, self.config.show_help_text, self.config.audio.bar_interpolation.description());
+        help_text(ui, self.config.show_help_text, self.config.bar_interpolation.description());
 
         section_header(ui, "Bars");
         slider_f32(ui, &mut self.config.bar_width, 1.0..=50.0, "Bar Width", DEFAULT_BAR_WIDTH);
@@ -2208,6 +2218,13 @@ impl VisualizerApp {
         section_header(ui, "Appearance");
         slider_u8(ui, &mut self.config.visualizer_opacity, "Visualizer Opacity", DEFAULT_VISUALIZER_OPACITY);
         help_text(ui, self.config.show_help_text, "0 = invisible, 255 = fully opaque. Applies to bars, peaks, and outlines.");
+
+        checkbox_reset(ui, &mut self.config.visualizer_outline_enabled, "Enable Outlines", false);
+        if self.config.visualizer_outline_enabled {
+            slider_f32(ui, &mut self.config.visualizer_outline_thickness, 0.5..=10.0, "Outline Thickness", default_visualizer_outline_thickness());
+            color_edit_reset(ui, &mut self.config.visualizer_outline_color, "Outline Color", default_visualizer_outline_color());
+            help_text(ui, self.config.show_help_text, "Outlines follow the visualizer's shape. In Smooth mode, a single perimeter is drawn.");
+        }
     }
 
     // ── Colors tab ───────────────────────────────────────────
@@ -2242,14 +2259,6 @@ impl VisualizerApp {
             ColorSubTab::Gradient => self.color_sub_gradient(ui),
             ColorSubTab::Animated => self.color_sub_animated(ui),
         }
-
-        section_header(ui, "Visualizer Outlines");
-        checkbox_reset(ui, &mut self.config.visualizer_outline_enabled, "Enable Outlines", false);
-        if self.config.visualizer_outline_enabled {
-            slider_f32(ui, &mut self.config.visualizer_outline_thickness, 0.5..=10.0, "Outline Thickness", default_visualizer_outline_thickness());
-            color_edit_reset(ui, &mut self.config.visualizer_outline_color, "Outline Color", default_visualizer_outline_color());
-            help_text(ui, self.config.show_help_text, "Outlines follow the visualizer's shape. In Smooth mode, a single perimeter is drawn.");
-        }
     }
 
     fn color_sub_single(&mut self, ui: &mut egui::Ui) {
@@ -2281,17 +2290,18 @@ impl VisualizerApp {
                 ui.horizontal(|ui| {
                     for (i, preset) in chunk.iter().enumerate() {
                         let global_i = chunk_idx * 12 + i;
-                        ui.horizontal(|ui| {
-                            let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-                            if ui.is_rect_visible(rect) {
-                                let color = egui::Color32::from_rgb(preset.color[0], preset.color[1], preset.color[2]);
-                                ui.painter().rect_filled(rect, 4.0, color);
-                                if response.clicked() { chosen = Some(preset.color); }
-                            }
-                            if !preset.is_premade {
-                                if ui.small_button("✖").clicked() { to_remove = Some(global_i); }
-                            }
-                        });
+                        let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                        if ui.is_rect_visible(rect) {
+                            let color = egui::Color32::from_rgb(preset.color[0], preset.color[1], preset.color[2]);
+                            ui.painter().rect_filled(rect, 4.0, color);
+                            if response.clicked() { chosen = Some(preset.color); }
+                        }
+                        if !preset.is_premade {
+                            // Overlay the delete button to avoid breaking row alignment
+                            let btn_rect = egui::Rect::from_center_size(rect.right_top() + egui::vec2(-2.0, 2.0), egui::vec2(16.0, 16.0));
+                            let btn = ui.put(btn_rect, egui::Button::new("✖").frame(false).small());
+                            if btn.clicked() { to_remove = Some(global_i); }
+                        }
                     }
                 });
             }
@@ -2378,10 +2388,20 @@ impl VisualizerApp {
                     self.new_preset_name.clear();
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Apply Preset:").strong());
-                ui.label(egui::RichText::new("Left-Click: Colors only  |  Right-Click: All settings").small().weak());
-            });
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(30, 30, 30))
+                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                .rounding(4.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Left-Click").strong().color(accent()));
+                        ui.label("= Colors only  |  ");
+                        ui.label(egui::RichText::new("Right-Click").strong().color(accent()));
+                        ui.label("= All settings");
+                    });
+                });
+            ui.add_space(4.0);
+            
             let mut apply_colors: Option<usize> = None;
             let mut apply_full: Option<usize> = None;
             let mut remove_idx: Option<usize> = None;
@@ -2498,10 +2518,20 @@ impl VisualizerApp {
                     self.new_preset_name.clear();
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Apply Preset:").strong());
-                ui.label(egui::RichText::new("Left-Click: Colors only  |  Right-Click: All settings").small().weak());
-            });
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(30, 30, 30))
+                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                .rounding(4.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Left-Click").strong().color(accent()));
+                        ui.label("= Colors only  |  ");
+                        ui.label(egui::RichText::new("Right-Click").strong().color(accent()));
+                        ui.label("= All settings");
+                    });
+                });
+            ui.add_space(4.0);
+
             let mut apply_colors: Option<usize> = None;
             let mut apply_full: Option<usize> = None;
             let mut remove_idx: Option<usize> = None;
@@ -2570,10 +2600,20 @@ impl VisualizerApp {
                     self.new_preset_name.clear();
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Apply Preset:").strong());
-                ui.label(egui::RichText::new("Left-Click: Colors only  |  Right-Click: All settings").small().weak());
-            });
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(30, 30, 30))
+                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                .rounding(4.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Left-Click").strong().color(accent()));
+                        ui.label("= Colors only  |  ");
+                        ui.label(egui::RichText::new("Right-Click").strong().color(accent()));
+                        ui.label("= All settings");
+                    });
+                });
+            ui.add_space(4.0);
+
             let mut apply_colors: Option<usize> = None;
             let mut apply_full: Option<usize> = None;
             let mut remove_idx: Option<usize> = None;
@@ -2599,7 +2639,6 @@ impl VisualizerApp {
         }
         slider_f32_scale(ui, &mut self.config.color_change_speed, 0.0..=1.0, "Speed", 0.5);
         
-        // Moved Motion settings here
         section_header(ui, "Motion Shape");
         combo_reset(ui, &mut self.config.color_change_motion.shape, MotionShape::default(),
                     "Shape", "motion_shape", 180.0,
@@ -3210,6 +3249,16 @@ impl eframe::App for VisualizerApp {
 
         if self.show_settings {
             let scale = self.config.settings_scale.clamp(0.75, 1.5);
+            
+            // Resize the window when the scale changes
+            if (self.config.settings_scale - self.old_settings_scale).abs() > 0.01 {
+                self.old_settings_scale = self.config.settings_scale;
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::from_hash_of("settings"),
+                    egui::ViewportCommand::InnerSize(egui::vec2(560.0 * scale, 720.0 * scale))
+                );
+            }
+
             let mut settings_builder = egui::ViewportBuilder::default()
                 .with_title("Rust Visualizer — Settings")
                 .with_inner_size([560.0 * scale, 720.0 * scale])
@@ -3273,7 +3322,7 @@ impl eframe::App for VisualizerApp {
 
 fn main() -> eframe::Result<()> {
     let config = AppConfig::load();
-    let (egui_icon, _) = load_icon(); // Loads the icon for the main window options
+    let (egui_icon, _) = load_icon();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
