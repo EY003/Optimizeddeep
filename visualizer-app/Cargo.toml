@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 visualizer-core = { path = "../visualizer-core" }
-eframe = "0.27"
+eframe = { version = "0.27", features = ["wgpu"] }
 egui = "0.27"
 tokio = { version = "1", features = ["full"] }
 tray-icon = "0.11"
