@@ -522,7 +522,12 @@ impl AudioProcessor {
             }
         }
 
-        self.update_ballistics(&self.smoothed, s, dt);
+        // --- FIX: Temporarily take ownership of `smoothed` to avoid mutable/immutable borrow overlap ---
+        let smoothed = std::mem::take(&mut self.smoothed);
+        self.update_ballistics(&smoothed, s, dt);
+        self.smoothed = smoothed;
+        // ---------------------------------------------------------------------------------------------
+
         let (beat, phase) = self.detect_rhythm(s, dt);
 
         Some(BarFrame {
