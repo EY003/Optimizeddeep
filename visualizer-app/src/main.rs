@@ -2786,7 +2786,7 @@ impl VisualizerApp {
             self.config.audio = self.config.custom_audio_presets[i].settings.clone();
             self.last_decay_mode = self.config.audio.decay_mode;
         }
-        if let Some(p) = detected { self.help_text(ui, p.description()); }
+        if let Some(p) = detected { help_text(ui, p.description()); }
 
         ui.horizontal(|ui| {
             ui.text_edit_singleline(&mut self.new_audio_preset_name);
