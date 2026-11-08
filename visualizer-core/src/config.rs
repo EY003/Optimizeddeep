@@ -1,6 +1,33 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// ─────────────────────────────────────────────────────────────
+// Default value constants (single source of truth)
+// ─────────────────────────────────────────────────────────────
+
+pub const DEFAULT_BAR_WIDTH:       f32 = 11.0;
+pub const DEFAULT_BAR_GAP:         f32 = 1.0;
+pub const DEFAULT_BAR_RADIUS:      f32 = 2.0;
+pub const DEFAULT_HEIGHT_SCALE:    f32 = 0.65;
+pub const DEFAULT_NUM_BARS:        usize = 80;
+pub const DEFAULT_MAX_BAR_HEIGHT:  f32 = 0.0;
+pub const DEFAULT_X_OFFSET:        f32 = 0.0;
+pub const DEFAULT_Y_OFFSET:        f32 = 0.0;
+pub const DEFAULT_BG_OPACITY:      u8 = 0;
+pub const DEFAULT_VISUALIZER_OPACITY: u8 = 255;
+pub const DEFAULT_COVER_OPACITY:   u8 = 255;
+pub const DEFAULT_TARGET_FPS:      f32 = 60.0;
+pub const DEFAULT_SETTINGS_SCALE:  f32 = 1.0;
+pub const DEFAULT_OPEN_SETTINGS_ON_LAUNCH: bool = true;
+pub const DEFAULT_SHOW_HELP_TEXT:  bool = true;
+pub const DEFAULT_TITLE_FONT_SIZE:  f32 = 24.0;
+pub const DEFAULT_ARTIST_FONT_SIZE: f32 = 30.0;
+pub const DEFAULT_COVER_SIZE:       f32 = 190.0;
+
+// ─────────────────────────────────────────────────────────────
+// Visualizer primitives
+// ─────────────────────────────────────────────────────────────
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VisualizerDirection { Up, Down, Left, Right }
 impl Default for VisualizerDirection { fn default() -> Self { VisualizerDirection::Up } }
@@ -11,7 +38,9 @@ impl Default for FrequencyDirection { fn default() -> Self { FrequencyDirection:
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColorMode {
-    Dynamic, StaticSingle, StaticMultiple, Gradient,
+    #[serde(alias = "Dynamic")] StaticSingle,
+    StaticMultiple,
+    Gradient,
     #[serde(alias = "ColorChanging")] Animated,
 }
 impl Default for ColorMode { fn default() -> Self { ColorMode::StaticSingle } }
@@ -41,32 +70,32 @@ impl VerticalColorStyle {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GradientStop { pub color: [u8; 3], pub position: f32 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ColorPreset {
     pub color: [u8; 3],
     #[serde(default)] pub is_premade: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct StaticMultiPreset {
     pub name: String, pub colors: Vec<[u8; 3]>,
     pub mode: StaticDistributionMode,
     #[serde(default = "default_sequential_bars_per_color")] pub bars_per_color: usize,
     #[serde(default)] pub is_premade: bool,
 }
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GradientPreset {
     pub name: String, pub stops: Vec<GradientStop>, pub angle: f32,
     #[serde(default)] pub is_premade: bool,
 }
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ColorChangePreset {
     pub name: String, pub colors: Vec<[u8; 3]>, pub speed: f32,
     #[serde(default)] pub is_premade: bool,
     #[serde(default)] pub motion: MotionSettings,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum PalettePriority { MostCommon, MostCommonLight, Vivid }
 impl Default for PalettePriority { fn default() -> Self { PalettePriority::MostCommon } }
 impl PalettePriority {
@@ -136,6 +165,10 @@ impl GradientSource {
     }
 }
 fn default_palette_size() -> u8 { 1 }
+
+// ─────────────────────────────────────────────────────────────
+// Motion
+// ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MotionShape {
@@ -222,7 +255,7 @@ impl MotionShape {
 pub enum BlendMode { Smooth, Hard }
 impl Default for BlendMode { fn default() -> Self { BlendMode::Smooth } }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct MotionSettings {
     pub shape: MotionShape, pub blend: BlendMode, pub speed: f32,
     pub trail_length: f32, pub stutter_intensity: f32,
@@ -242,6 +275,10 @@ impl Default for MotionSettings {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Track info
+// ─────────────────────────────────────────────────────────────
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrackTextColorMode { Static, Visualizer }
 impl Default for TrackTextColorMode { fn default() -> Self { TrackTextColorMode::Static } }
@@ -250,10 +287,11 @@ impl Default for TrackTextColorMode { fn default() -> Self { TrackTextColorMode:
 pub enum TrackTextAlign { Left, Center, Right }
 impl Default for TrackTextAlign { fn default() -> Self { TrackTextAlign::Right } }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TrackInfoConfig {
     pub show_cover_art: bool, pub cover_size: f32,
     pub cover_x_offset: f32, pub cover_y_offset: f32,
+    #[serde(default = "default_cover_opacity")] pub cover_opacity: u8,
     pub show_title: bool, pub show_artist: bool,
     pub title_font_size: f32, pub artist_font_size: f32,
     #[serde(default, alias = "custom_font_path")] pub font_path: Option<String>,
@@ -264,11 +302,17 @@ pub struct TrackInfoConfig {
     pub shadow_blur: f32, pub shadow_color: [u8; 3],
     pub outline_enabled: bool, pub outline_thickness: f32, pub outline_color: [u8; 3],
 }
+fn default_cover_opacity() -> u8 { DEFAULT_COVER_OPACITY }
 impl Default for TrackInfoConfig {
     fn default() -> Self {
         Self {
-            show_cover_art: true, cover_size: 190.0, cover_x_offset: 0.0, cover_y_offset: 0.0,
-            show_title: true, show_artist: true, title_font_size: 21.0, artist_font_size: 30.0,
+            show_cover_art: true,
+            cover_size: DEFAULT_COVER_SIZE,
+            cover_x_offset: 0.0, cover_y_offset: 0.0,
+            cover_opacity: DEFAULT_COVER_OPACITY,
+            show_title: true, show_artist: true,
+            title_font_size: DEFAULT_TITLE_FONT_SIZE,
+            artist_font_size: DEFAULT_ARTIST_FONT_SIZE,
             font_path: None, color_mode: TrackTextColorMode::Static,
             static_color: [220, 220, 220], opacity: 255,
             letter_spacing: 0.0, line_height: 1.3, alignment: TrackTextAlign::Right,
@@ -279,6 +323,10 @@ impl Default for TrackInfoConfig {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+// Audio: window, scaling, decay, channel, beat
+// ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowFunction { Hann, Hamming, BlackmanHarris, FlatTop, Rectangular }
@@ -423,28 +471,69 @@ impl BarInterpolation {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WeightingCurve { None, AWeighting, KWeighting }
+impl Default for WeightingCurve { fn default() -> Self { WeightingCurve::None } }
+impl WeightingCurve {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            WeightingCurve::None => "Flat (None)",
+            WeightingCurve::AWeighting => "A-Weighting (Perceptual)",
+            WeightingCurve::KWeighting => "K-Weighting (Broadcast)",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            WeightingCurve::None => "No weighting. Every frequency is treated equally.",
+            WeightingCurve::AWeighting => "Standard A-weighting curve. Rolls off deep bass and boosts presence. Sounds more natural.",
+            WeightingCurve::KWeighting => "ITU-R BS.1770 K-weighting. Broadcast-style high-shelf and high-pass. Good for speech.",
+        }
+    }
+    pub fn all() -> [WeightingCurve; 3] {
+        [WeightingCurve::None, WeightingCurve::AWeighting, WeightingCurve::KWeighting]
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Audio settings
+// ─────────────────────────────────────────────────────────────
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AudioSettings {
+    // Signal processing
     #[serde(default = "default_fft_size")]             pub fft_size: usize,
     #[serde(default)]                                  pub window_function: WindowFunction,
     #[serde(default = "default_num_bars")]             pub num_bars: usize,
     #[serde(default)]                                  pub frequency_scaling: FrequencyScaling,
     #[serde(default = "default_min_freq")]             pub min_frequency_hz: f32,
     #[serde(default = "default_max_freq")]             pub max_frequency_hz: f32,
-    #[serde(default = "default_min_db")]               pub min_decibels: f32,
-    #[serde(default = "default_max_db")]               pub max_decibels: f32,
-    #[serde(default = "default_target_range")]         pub target_dynamic_range_db: f32,
+    #[serde(default)]                                  pub channel_mix: ChannelMixMode,
+    #[serde(default)]                                  pub weighting: WeightingCurve,
+    #[serde(default = "default_dc_block")]             pub dc_block: bool,
+    #[serde(default = "default_freq_smoothing")]       pub frequency_smoothing: f32,
+    #[serde(default = "default_harmonic_emphasis")]    pub harmonic_emphasis: bool,
+    #[serde(default)]                                  pub bar_interpolation: BarInterpolation,
+
+    // Amplitude / dynamics
     #[serde(default = "default_sensitivity")]          pub sensitivity: f32,
     #[serde(default = "default_raw_gain")]             pub raw_gain: f32,
     #[serde(default = "default_response_gamma")]       pub response_gamma: f32,
+    #[serde(default = "default_noise_gate")]           pub noise_gate: f32,
+    #[serde(default = "default_min_db")]               pub min_decibels: f32,
+    #[serde(default = "default_max_db")]               pub max_decibels: f32,
+    #[serde(default = "default_target_range")]         pub target_dynamic_range_db: f32,
+    #[serde(default = "default_per_frame_normalization")] pub per_frame_normalization: bool,
+    #[serde(default = "default_agc_enabled")]          pub agc_enabled: bool,
+    #[serde(default = "default_agc_attack")]           pub agc_attack: f32,
+    #[serde(default = "default_agc_release")]          pub agc_release: f32,
+
+    // Frequency shaping
     #[serde(default = "default_spectrum_tilt")]        pub spectrum_tilt: f32,
     #[serde(default = "default_eq_bass")]              pub eq_bass_db: f32,
     #[serde(default = "default_eq_mid")]               pub eq_mid_db: f32,
     #[serde(default = "default_eq_treble")]            pub eq_treble_db: f32,
-    #[serde(default = "default_noise_gate")]           pub noise_gate: f32,
-    #[serde(default = "default_agc_enabled")]          pub agc_enabled: bool,
-    #[serde(default = "default_agc_attack")]           pub agc_attack: f32,
-    #[serde(default = "default_agc_release")]          pub agc_release: f32,
+
+    // Timing
     #[serde(default = "default_poll_rate_hz")]         pub poll_rate_hz: f32,
     #[serde(default = "default_attack_ms")]            pub attack_time_ms: f32,
     #[serde(default = "default_decay_ms")]             pub decay_time_ms: f32,
@@ -452,78 +541,118 @@ pub struct AudioSettings {
     #[serde(default = "default_average_size")]         pub average_size: usize,
     #[serde(default = "default_peak_hold_ms")]         pub peak_hold_ms: f32,
     #[serde(default = "default_gravity_coeff")]        pub gravity_coefficient: f32,
-    #[serde(default)]                                  pub channel_mix: ChannelMixMode,
+
+    // Per-band ballistics
+    #[serde(default = "default_per_band_ballistics")]  pub per_band_ballistics: bool,
+    #[serde(default = "default_attack_ms")]            pub bass_attack_ms: f32,
+    #[serde(default = "default_decay_ms")]             pub bass_decay_ms: f32,
+    #[serde(default = "default_attack_ms")]            pub mid_attack_ms: f32,
+    #[serde(default = "default_decay_ms")]             pub mid_decay_ms: f32,
+    #[serde(default = "default_attack_ms")]            pub treble_attack_ms: f32,
+    #[serde(default = "default_decay_ms")]             pub treble_decay_ms: f32,
+
+    // Rhythm
     #[serde(default)]                                  pub beat_focus: BeatFocusMode,
-    #[serde(default)]                                  pub bar_interpolation: BarInterpolation,
     #[serde(default = "default_beat_sensitivity")]     pub beat_detection_sensitivity: f32,
     #[serde(default = "default_energy_threshold")]     pub energy_threshold_multiplier: f32,
     #[serde(default)]                                  pub bpm_lock_enabled: bool,
     #[serde(default = "default_bpm_phase_smoothing")]  pub bpm_phase_smoothing: f32,
+    #[serde(default = "default_beat_envelope_decay")]  pub beat_envelope_decay_ms: f32,
 }
 
-fn default_fft_size() -> usize { 2048 }
-fn default_num_bars() -> usize { 86 }
-fn default_min_freq() -> f32 { 20.0 }
-fn default_max_freq() -> f32 { 20000.0 }
-fn default_min_db() -> f32 { -85.0 }
-fn default_max_db() -> f32 { -20.0 }
-fn default_target_range() -> f32 { 60.0 }
-fn default_sensitivity() -> f32 { 50.0 }
-fn default_raw_gain() -> f32 { 1.0 }
-fn default_response_gamma() -> f32 { 1.5 }
-fn default_spectrum_tilt() -> f32 { 3.0 }
-fn default_eq_bass() -> f32 { 0.0 }
-fn default_eq_mid() -> f32 { 0.0 }
-fn default_eq_treble() -> f32 { 0.0 }
-fn default_noise_gate() -> f32 { 0.0 }
-fn default_agc_enabled() -> bool { true }
-fn default_agc_attack() -> f32 { 0.15 }
-fn default_agc_release() -> f32 { 0.005 }
-fn default_poll_rate_hz() -> f32 { 60.0 }
-fn default_attack_ms() -> f32 { 5.0 }
-fn default_decay_ms() -> f32 { 300.0 }
-fn default_average_size() -> usize { 1 }
-fn default_peak_hold_ms() -> f32 { 0.0 }
-fn default_gravity_coeff() -> f32 { 1.0 }
-fn default_beat_sensitivity() -> f32 { 0.5 }
-fn default_energy_threshold() -> f32 { 1.5 }
-fn default_bpm_phase_smoothing() -> f32 { 0.3 }
+fn default_fft_size() -> usize { DEFAULT_FFT_SIZE }
+fn default_num_bars() -> usize { DEFAULT_NUM_BARS }
+fn default_min_freq() -> f32 { DEFAULT_MIN_FREQ }
+fn default_max_freq() -> f32 { DEFAULT_MAX_FREQ }
+fn default_min_db() -> f32 { DEFAULT_MIN_DB }
+fn default_max_db() -> f32 { DEFAULT_MAX_DB }
+fn default_target_range() -> f32 { DEFAULT_TARGET_RANGE }
+fn default_sensitivity() -> f32 { DEFAULT_SENSITIVITY }
+fn default_raw_gain() -> f32 { DEFAULT_RAW_GAIN }
+fn default_response_gamma() -> f32 { DEFAULT_RESPONSE_GAMMA }
+fn default_spectrum_tilt() -> f32 { DEFAULT_SPECTRUM_TILT }
+fn default_eq_bass() -> f32 { DEFAULT_EQ_BASS }
+fn default_eq_mid() -> f32 { DEFAULT_EQ_MID }
+fn default_eq_treble() -> f32 { DEFAULT_EQ_TREBLE }
+fn default_noise_gate() -> f32 { DEFAULT_NOISE_GATE }
+fn default_agc_enabled() -> bool { DEFAULT_AGC_ENABLED }
+fn default_agc_attack() -> f32 { DEFAULT_AGC_ATTACK }
+fn default_agc_release() -> f32 { DEFAULT_AGC_RELEASE }
+fn default_poll_rate_hz() -> f32 { DEFAULT_POLL_RATE }
+fn default_attack_ms() -> f32 { DEFAULT_ATTACK_MS }
+fn default_decay_ms() -> f32 { DEFAULT_DECAY_MS }
+fn default_average_size() -> usize { DEFAULT_AVERAGE_SIZE }
+fn default_peak_hold_ms() -> f32 { DEFAULT_PEAK_HOLD_MS }
+fn default_gravity_coeff() -> f32 { DEFAULT_GRAVITY_COEFF }
+fn default_beat_sensitivity() -> f32 { DEFAULT_BEAT_SENS }
+fn default_energy_threshold() -> f32 { DEFAULT_ENERGY_THRESHOLD }
+fn default_bpm_phase_smoothing() -> f32 { DEFAULT_BPM_PHASE_SMOOTHING }
+fn default_freq_smoothing() -> f32 { DEFAULT_FREQ_SMOOTHING }
+fn default_dc_block() -> bool { DEFAULT_DC_BLOCK }
+fn default_per_band_ballistics() -> bool { DEFAULT_PER_BAND_BALLISTICS }
+fn default_per_frame_normalization() -> bool { DEFAULT_PER_FRAME_NORMALIZATION }
+fn default_beat_envelope_decay() -> f32 { DEFAULT_BEAT_ENVELOPE_DECAY_MS }
+fn default_harmonic_emphasis() -> bool { DEFAULT_HARMONIC_EMPHASIS }
 
 impl Default for AudioSettings {
     fn default() -> Self {
         Self {
-            fft_size: default_fft_size(), window_function: WindowFunction::default(),
-            num_bars: default_num_bars(), frequency_scaling: FrequencyScaling::default(),
-            min_frequency_hz: default_min_freq(), max_frequency_hz: default_max_freq(),
-            min_decibels: default_min_db(), max_decibels: default_max_db(),
-            target_dynamic_range_db: default_target_range(), sensitivity: default_sensitivity(),
-            raw_gain: default_raw_gain(), response_gamma: default_response_gamma(),
-            spectrum_tilt: default_spectrum_tilt(), eq_bass_db: default_eq_bass(),
-            eq_mid_db: default_eq_mid(), eq_treble_db: default_eq_treble(),
-            noise_gate: default_noise_gate(), agc_enabled: default_agc_enabled(),
-            agc_attack: default_agc_attack(), agc_release: default_agc_release(),
-            poll_rate_hz: default_poll_rate_hz(), attack_time_ms: default_attack_ms(),
-            decay_time_ms: default_decay_ms(), decay_mode: DecayMode::default(),
-            average_size: default_average_size(), peak_hold_ms: default_peak_hold_ms(),
-            gravity_coefficient: default_gravity_coeff(), channel_mix: ChannelMixMode::default(),
-            beat_focus: BeatFocusMode::default(), bar_interpolation: BarInterpolation::default(),
-            beat_detection_sensitivity: default_beat_sensitivity(),
-            energy_threshold_multiplier: default_energy_threshold(),
-            bpm_lock_enabled: false, bpm_phase_smoothing: default_bpm_phase_smoothing(),
+            fft_size: DEFAULT_FFT_SIZE, window_function: WindowFunction::default(),
+            num_bars: DEFAULT_NUM_BARS, frequency_scaling: FrequencyScaling::default(),
+            min_frequency_hz: DEFAULT_MIN_FREQ, max_frequency_hz: DEFAULT_MAX_FREQ,
+            channel_mix: ChannelMixMode::default(), weighting: WeightingCurve::default(),
+            dc_block: DEFAULT_DC_BLOCK, frequency_smoothing: DEFAULT_FREQ_SMOOTHING,
+            harmonic_emphasis: DEFAULT_HARMONIC_EMPHASIS,
+            bar_interpolation: BarInterpolation::default(),
+
+            sensitivity: DEFAULT_SENSITIVITY, raw_gain: DEFAULT_RAW_GAIN,
+            response_gamma: DEFAULT_RESPONSE_GAMMA, noise_gate: DEFAULT_NOISE_GATE,
+            min_decibels: DEFAULT_MIN_DB, max_decibels: DEFAULT_MAX_DB,
+            target_dynamic_range_db: DEFAULT_TARGET_RANGE,
+            per_frame_normalization: DEFAULT_PER_FRAME_NORMALIZATION,
+            agc_enabled: DEFAULT_AGC_ENABLED, agc_attack: DEFAULT_AGC_ATTACK,
+            agc_release: DEFAULT_AGC_RELEASE,
+
+            spectrum_tilt: DEFAULT_SPECTRUM_TILT, eq_bass_db: DEFAULT_EQ_BASS,
+            eq_mid_db: DEFAULT_EQ_MID, eq_treble_db: DEFAULT_EQ_TREBLE,
+
+            poll_rate_hz: DEFAULT_POLL_RATE, attack_time_ms: DEFAULT_ATTACK_MS,
+            decay_time_ms: DEFAULT_DECAY_MS, decay_mode: DecayMode::default(),
+            average_size: DEFAULT_AVERAGE_SIZE, peak_hold_ms: DEFAULT_PEAK_HOLD_MS,
+            gravity_coefficient: DEFAULT_GRAVITY_COEFF,
+
+            per_band_ballistics: DEFAULT_PER_BAND_BALLISTICS,
+            bass_attack_ms: DEFAULT_ATTACK_MS, bass_decay_ms: DEFAULT_DECAY_MS,
+            mid_attack_ms: DEFAULT_ATTACK_MS, mid_decay_ms: DEFAULT_DECAY_MS,
+            treble_attack_ms: DEFAULT_ATTACK_MS, treble_decay_ms: DEFAULT_DECAY_MS,
+
+            beat_focus: BeatFocusMode::default(),
+            beat_detection_sensitivity: DEFAULT_BEAT_SENS,
+            energy_threshold_multiplier: DEFAULT_ENERGY_THRESHOLD,
+            bpm_lock_enabled: false, bpm_phase_smoothing: DEFAULT_BPM_PHASE_SMOOTHING,
+            beat_envelope_decay_ms: DEFAULT_BEAT_ENVELOPE_DECAY_MS,
         }
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Audio presets (built-in + custom)
+// ─────────────────────────────────────────────────────────────
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AudioPreset {
     Universal, Pop, Rock, Electronic, HipHop, Classical, Piano, Jazz, Ambient,
+    LoFi, Metal, Country, RnB, Vocal, Podcast,
 }
+
 impl AudioPreset {
-    pub fn all() -> [AudioPreset; 9] {
+    pub fn all() -> [AudioPreset; 15] {
         [
             AudioPreset::Universal, AudioPreset::Pop, AudioPreset::Rock,
             AudioPreset::Electronic, AudioPreset::HipHop, AudioPreset::Classical,
             AudioPreset::Piano, AudioPreset::Jazz, AudioPreset::Ambient,
+            AudioPreset::LoFi, AudioPreset::Metal, AudioPreset::Country,
+            AudioPreset::RnB, AudioPreset::Vocal, AudioPreset::Podcast,
         ]
     }
     pub fn display_name(self) -> &'static str {
@@ -537,6 +666,12 @@ impl AudioPreset {
             AudioPreset::Piano => "Piano",
             AudioPreset::Jazz => "Jazz",
             AudioPreset::Ambient => "Ambient",
+            AudioPreset::LoFi => "Lo-Fi",
+            AudioPreset::Metal => "Metal",
+            AudioPreset::Country => "Country",
+            AudioPreset::RnB => "R&B / Soul",
+            AudioPreset::Vocal => "Vocal / Acapella",
+            AudioPreset::Podcast => "Podcast / Voice",
         }
     }
     pub fn description(self) -> &'static str {
@@ -550,12 +685,19 @@ impl AudioPreset {
             AudioPreset::Piano => "Clean tone with sustain — good for solo piano and acoustic material.",
             AudioPreset::Jazz => "Warm and smooth — gentler response curve and longer decay.",
             AudioPreset::Ambient => "Slow and flowing — heavy smoothing, no peak-hold, soft attack.",
+            AudioPreset::LoFi => "Soft, warm, and slow. Long smoothing window and rolled-off highs for a mellow look.",
+            AudioPreset::Metal => "Aggressive and punchy. Fast attack, wide dynamic range, mid-forward.",
+            AudioPreset::Country => "Clean and dynamic. Balanced mids with moderate smoothing.",
+            AudioPreset::RnB => "Smooth bass emphasis with vocal presence. Sweet spot between Pop and Hip-hop.",
+            AudioPreset::Vocal => "Mid-focused and voice-oriented. Narrow band, longer decay, gentle comp.",
+            AudioPreset::Podcast => "Narrow speech band with heavy smoothing. No peak-hold — clean and steady.",
         }
     }
     pub fn settings(self) -> AudioSettings {
         let d = AudioSettings::default();
         match self {
             AudioPreset::Universal => d,
+
             AudioPreset::Pop => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hann,
                 sensitivity: 55.0, response_gamma: 1.8, spectrum_tilt: 1.5,
@@ -606,6 +748,7 @@ impl AudioPreset {
                 attack_time_ms: 5.0, decay_time_ms: 600.0, decay_mode: DecayMode::Exponential,
                 average_size: 2, beat_detection_sensitivity: 0.35,
                 max_frequency_hz: 5000.0, eq_mid_db: 1.0,
+                harmonic_emphasis: true,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
             AudioPreset::Jazz => AudioSettings {
@@ -620,7 +763,65 @@ impl AudioPreset {
                 min_decibels: -95.0, max_decibels: -25.0, target_dynamic_range_db: 70.0,
                 sensitivity: 70.0, response_gamma: 1.2, spectrum_tilt: 4.5,
                 attack_time_ms: 40.0, decay_time_ms: 800.0, decay_mode: DecayMode::Exponential,
-                average_size: 8, beat_detection_sensitivity: 0.3, ..d
+                average_size: 6, beat_detection_sensitivity: 0.3, ..d
+            },
+
+            AudioPreset::LoFi => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                min_decibels: -80.0, max_decibels: -22.0, target_dynamic_range_db: 55.0,
+                sensitivity: 60.0, response_gamma: 1.4, spectrum_tilt: 2.0,
+                attack_time_ms: 8.0, decay_time_ms: 400.0,
+                decay_mode: DecayMode::Exponential,
+                average_size: 4, beat_detection_sensitivity: 0.35,
+                energy_threshold_multiplier: 1.8, eq_treble_db: -1.0,
+                beat_focus: BeatFocusMode::Bass, ..d
+            },
+            AudioPreset::Metal => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hamming,
+                min_decibels: -85.0, max_decibels: -18.0, target_dynamic_range_db: 55.0,
+                sensitivity: 60.0, response_gamma: 1.9, spectrum_tilt: 1.0,
+                attack_time_ms: 1.0, decay_time_ms: 180.0,
+                decay_mode: DecayMode::Exponential,
+                average_size: 1, beat_detection_sensitivity: 0.7,
+                energy_threshold_multiplier: 1.4, eq_mid_db: 2.5, eq_treble_db: 1.0,
+                beat_focus: BeatFocusMode::Mid, ..d
+            },
+            AudioPreset::Country => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.0,
+                attack_time_ms: 6.0, decay_time_ms: 300.0,
+                average_size: 2, beat_detection_sensitivity: 0.5,
+                eq_mid_db: 1.0, beat_focus: BeatFocusMode::Mid, ..d
+            },
+            AudioPreset::RnB => AudioSettings {
+                fft_size: 2048, window_function: WindowFunction::Hann,
+                sensitivity: 58.0, response_gamma: 1.6, spectrum_tilt: 1.5,
+                attack_time_ms: 4.0, decay_time_ms: 320.0,
+                decay_mode: DecayMode::Exponential,
+                average_size: 2, beat_detection_sensitivity: 0.5,
+                eq_bass_db: 1.5, eq_mid_db: 1.0,
+                beat_focus: BeatFocusMode::Bass, ..d
+            },
+            AudioPreset::Vocal => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::Hann,
+                min_frequency_hz: 80.0, max_frequency_hz: 12000.0,
+                min_decibels: -90.0, max_decibels: -20.0, target_dynamic_range_db: 65.0,
+                sensitivity: 60.0, response_gamma: 1.3, spectrum_tilt: 3.5,
+                attack_time_ms: 10.0, decay_time_ms: 400.0,
+                average_size: 3, beat_detection_sensitivity: 0.3,
+                eq_bass_db: -3.0, eq_mid_db: 2.0,
+                beat_focus: BeatFocusMode::Mid, ..d
+            },
+            AudioPreset::Podcast => AudioSettings {
+                fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
+                min_frequency_hz: 100.0, max_frequency_hz: 6000.0,
+                min_decibels: -95.0, max_decibels: -20.0, target_dynamic_range_db: 70.0,
+                sensitivity: 65.0, response_gamma: 1.2, spectrum_tilt: 4.0,
+                attack_time_ms: 20.0, decay_time_ms: 600.0,
+                decay_mode: DecayMode::Exponential,
+                average_size: 4, beat_detection_sensitivity: 0.25,
+                eq_bass_db: -4.0, eq_mid_db: 2.5, eq_treble_db: -1.0,
+                beat_focus: BeatFocusMode::Mid, ..d
             },
         }
     }
@@ -633,16 +834,23 @@ impl AudioPreset {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CustomAudioPreset {
+    pub name: String,
+    pub settings: AudioSettings,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Preset factory helpers
+// ─────────────────────────────────────────────────────────────
+
 fn smp(name: &str, colors: Vec<[u8; 3]>, mode: StaticDistributionMode, bars: usize) -> StaticMultiPreset {
     StaticMultiPreset { name: name.into(), colors, mode, bars_per_color: bars, is_premade: true }
 }
-
 fn gp(name: &str, stops: Vec<GradientStop>, angle: f32) -> GradientPreset {
     GradientPreset { name: name.into(), stops, angle, is_premade: true }
 }
-
 fn gs(color: [u8; 3], position: f32) -> GradientStop { GradientStop { color, position } }
-
 fn ccms(shape: MotionShape, blend: BlendMode, speed: f32, trail: f32, stutter: f32, wave: f32, wipe: f32, off: [u8; 3], off_a: u8) -> MotionSettings {
     MotionSettings {
         shape, blend, speed, trail_length: trail, stutter_intensity: stutter,
@@ -650,7 +858,6 @@ fn ccms(shape: MotionShape, blend: BlendMode, speed: f32, trail: f32, stutter: f
         off_color: off, off_color_opacity: off_a,
     }
 }
-
 fn ccp(name: &str, colors: Vec<[u8; 3]>, speed: f32, motion: MotionSettings) -> ColorChangePreset {
     ColorChangePreset { name: name.into(), colors, speed, is_premade: true, motion }
 }
@@ -663,7 +870,6 @@ fn default_speed() -> f32 { 0.5 }
 fn default_sequential_bars_per_color() -> usize { 1 }
 fn default_visualizer_outline_thickness() -> f32 { 1.0 }
 fn default_visualizer_outline_color() -> [u8; 3] { [0, 0, 0] }
-fn default_height_scale() -> f32 { 0.5 }
 
 fn default_static_single_source() -> ColorSource {
     ColorSource::Dynamic { palette_size: 1, variants_per_color: 0, priority: PalettePriority::MostCommon }
@@ -802,25 +1008,32 @@ where D: serde::Deserializer<'de> {
     }).collect())
 }
 
+// ─────────────────────────────────────────────────────────────
+// App config
+// ─────────────────────────────────────────────────────────────
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
+    // Layout
     pub bar_width: f32, pub bar_gap: f32, pub bar_radius: f32,
-    pub dynamic_colors: bool, pub text_border: bool, pub font_path: Option<String>,
     pub bg_opacity: u8,
     #[serde(default)] pub bg_color: [u8; 3],
-    #[serde(default = "default_color_presets", deserialize_with = "deserialize_color_presets")] pub color_presets: Vec<ColorPreset>,
     pub x_offset: f32, pub y_offset: f32,
-
-    #[serde(default, alias = "bar_outline_enabled")]
-    pub visualizer_outline_enabled: bool,
-    #[serde(default = "default_visualizer_outline_thickness", alias = "bar_outline_thickness")]
-    pub visualizer_outline_thickness: f32,
-    #[serde(default = "default_visualizer_outline_color", alias = "bar_outline_color")]
-    pub visualizer_outline_color: [u8; 3],
-
     pub max_bar_height: f32, pub target_fps: f32, pub show_fps: bool, pub use_vsync: bool,
     #[serde(default = "default_height_scale")] pub height_scale: f32,
 
+    // Opacity / menu
+    #[serde(default = "default_visualizer_opacity")] pub visualizer_opacity: u8,
+    #[serde(default = "default_settings_scale")] pub settings_scale: f32,
+    #[serde(default = "default_open_settings_on_launch")] pub open_settings_on_launch: bool,
+    #[serde(default = "default_show_help_text")] pub show_help_text: bool,
+
+    // Outlines
+    #[serde(default, alias = "bar_outline_enabled")]   pub visualizer_outline_enabled: bool,
+    #[serde(default = "default_visualizer_outline_thickness", alias = "bar_outline_thickness")] pub visualizer_outline_thickness: f32,
+    #[serde(default = "default_visualizer_outline_color", alias = "bar_outline_color")]        pub visualizer_outline_color: [u8; 3],
+
+    // Visualizer behavior
     #[serde(default)] pub visualizer_direction: VisualizerDirection,
     #[serde(default)] pub frequency_direction: FrequencyDirection,
     #[serde(default)] pub color_mode: ColorMode,
@@ -829,20 +1042,28 @@ pub struct AppConfig {
     #[serde(default)] pub static_mode: StaticDistributionMode,
     #[serde(default = "default_sequential_bars_per_color")] pub sequential_bars_per_color: usize,
     #[serde(default = "default_static_multi_presets")] pub static_multi_presets: Vec<StaticMultiPreset>,
-
     #[serde(default)] pub vertical_color_style: VerticalColorStyle,
 
+    // Gradients
     #[serde(default = "default_gradient_source")] pub gradient_source: GradientSource,
     #[serde(default)] pub gradient_angle: f32,
     #[serde(default = "default_gradient_presets")] pub gradient_presets: Vec<GradientPreset>,
 
+    // Animated
     #[serde(default = "default_animated_source")] pub animated_source: ColorSource,
     #[serde(default = "default_speed")] pub color_change_speed: f32,
     #[serde(default = "default_color_change_presets")] pub color_change_presets: Vec<ColorChangePreset>,
     #[serde(default)] pub color_change_motion: MotionSettings,
+
+    // Presets
+    #[serde(default = "default_color_presets", deserialize_with = "deserialize_color_presets")] pub color_presets: Vec<ColorPreset>,
+
+    // Track info / audio
     #[serde(default)] pub track_info: TrackInfoConfig,
     #[serde(default)] pub audio: AudioSettings,
+    #[serde(default)] pub custom_audio_presets: Vec<CustomAudioPreset>,
 
+    // Legacy migration fields (kept for old configs; consumed during load())
     #[serde(default, skip_serializing_if = "Option::is_none")] pub num_bars: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub fft_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub audio_update_ms: Option<u64>,
@@ -853,19 +1074,28 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub color_change_colors: Option<Vec<[u8; 3]>>,
 }
 
+fn default_height_scale() -> f32 { DEFAULT_HEIGHT_SCALE }
+fn default_visualizer_opacity() -> u8 { DEFAULT_VISUALIZER_OPACITY }
+fn default_settings_scale() -> f32 { DEFAULT_SETTINGS_SCALE }
+fn default_open_settings_on_launch() -> bool { DEFAULT_OPEN_SETTINGS_ON_LAUNCH }
+fn default_show_help_text() -> bool { DEFAULT_SHOW_HELP_TEXT }
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            bar_width: 9.0, bar_gap: 1.0, bar_radius: 2.0,
-            dynamic_colors: true, text_border: false, font_path: None,
-            bg_opacity: 0, bg_color: [0, 0, 0],
-            color_presets: default_color_presets(),
-            x_offset: 0.0, y_offset: 0.0,
+            bar_width: DEFAULT_BAR_WIDTH, bar_gap: DEFAULT_BAR_GAP, bar_radius: DEFAULT_BAR_RADIUS,
+            bg_opacity: DEFAULT_BG_OPACITY, bg_color: [0, 0, 0],
+            x_offset: DEFAULT_X_OFFSET, y_offset: DEFAULT_Y_OFFSET,
+            max_bar_height: DEFAULT_MAX_BAR_HEIGHT,
+            target_fps: DEFAULT_TARGET_FPS, show_fps: false, use_vsync: false,
+            height_scale: DEFAULT_HEIGHT_SCALE,
+            visualizer_opacity: DEFAULT_VISUALIZER_OPACITY,
+            settings_scale: DEFAULT_SETTINGS_SCALE,
+            open_settings_on_launch: DEFAULT_OPEN_SETTINGS_ON_LAUNCH,
+            show_help_text: DEFAULT_SHOW_HELP_TEXT,
             visualizer_outline_enabled: false,
-            visualizer_outline_thickness: 1.0,
-            visualizer_outline_color: [0, 0, 0],
-            max_bar_height: 0.0, target_fps: 60.0, show_fps: false, use_vsync: false,
-            height_scale: default_height_scale(),
+            visualizer_outline_thickness: default_visualizer_outline_thickness(),
+            visualizer_outline_color: default_visualizer_outline_color(),
             visualizer_direction: VisualizerDirection::default(),
             frequency_direction: FrequencyDirection::default(),
             color_mode: ColorMode::StaticSingle,
@@ -882,8 +1112,10 @@ impl Default for AppConfig {
             color_change_speed: default_speed(),
             color_change_presets: default_color_change_presets(),
             color_change_motion: MotionSettings::default(),
+            color_presets: default_color_presets(),
             track_info: TrackInfoConfig::default(),
             audio: AudioSettings::default(),
+            custom_audio_presets: Vec::new(),
             num_bars: None, fft_size: None, audio_update_ms: None, sensitivity: None,
             bar_color: None, static_colors: None, gradient_stops: None, color_change_colors: None,
         }
@@ -901,7 +1133,7 @@ impl AppConfig {
             || self.gradient_presets.iter().any(|p| p.is_premade)
             || self.color_change_presets.iter().any(|p| p.is_premade)
             || self.color_presets.iter().any(|p| p.is_premade);
-        
+
         if !has_any_premade {
             self.color_presets = default_color_presets();
             self.static_multi_presets = default_static_multi_presets();
@@ -936,20 +1168,26 @@ impl AppConfig {
         let path = Self::get_path();
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(mut config) = toml::from_str::<AppConfig>(&content) {
-                if let Some(c) = config.bar_color.take() { config.static_single_source = ColorSource::Static(vec![c]); }
-                if let Some(c) = config.static_colors.take() { config.static_multi_source = ColorSource::Static(c); }
-                if let Some(s) = config.gradient_stops.take() { config.gradient_source = GradientSource::Static(s); }
-                if let Some(c) = config.color_change_colors.take() { config.animated_source = ColorSource::Static(c); }
-                if config.color_mode == ColorMode::Dynamic {
-                    config.color_mode = ColorMode::StaticSingle;
-                    config.static_single_source = ColorSource::Dynamic { palette_size: 1, variants_per_color: 0, priority: PalettePriority::MostCommon };
+                if let Some(c) = config.bar_color.take() {
+                    config.static_single_source = ColorSource::Static(vec![c]);
+                }
+                if let Some(c) = config.static_colors.take() {
+                    config.static_multi_source = ColorSource::Static(c);
+                }
+                if let Some(s) = config.gradient_stops.take() {
+                    config.gradient_source = GradientSource::Static(s);
+                }
+                if let Some(c) = config.color_change_colors.take() {
+                    config.animated_source = ColorSource::Static(c);
                 }
                 if let Some(n) = config.num_bars.take() { config.audio.num_bars = n; }
                 if let Some(f) = config.fft_size.take() { config.audio.fft_size = f; }
                 if let Some(ms) = config.audio_update_ms.take() {
                     if ms > 0 { config.audio.poll_rate_hz = 1000.0 / ms as f32; }
                 }
-                if let Some(s) = config.sensitivity.take() { config.audio.sensitivity = s.clamp(0.0, 100.0); }
+                if let Some(s) = config.sensitivity.take() {
+                    config.audio.sensitivity = s.clamp(0.0, 100.0);
+                }
 
                 config.refresh_premade_presets();
                 return config;
