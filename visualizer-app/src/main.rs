@@ -2742,7 +2742,7 @@ impl VisualizerApp {
         help_text(ui, show_help, "<1 lifts quiet passages; >1 emphasises peaks. Default 1.5 = balanced.");
 
         slider_f32(ui, &mut a.noise_gate, 0.0..=0.5, "Noise Gate", DEFAULT_NOISE_GATE);
-        help_text(ui, show_help, "Bars below this threshold are snapped to 0. Removes 'hovering' bars during silence.");
+        help_text(ui, show_help, "Bars below this threshold are snapped to 0. Removes hovering bars during silence.");
 
         ui.horizontal(|ui| {
             ui.label("Min dB:");
@@ -2832,7 +2832,7 @@ impl VisualizerApp {
         slider_f32(ui, &mut a.beat_detection_sensitivity, 0.0..=1.0, "Beat Detection Sensitivity", DEFAULT_BEAT_SENS);
         slider_f32(ui, &mut a.energy_threshold_multiplier, 1.0..=3.0, "Energy Threshold Multiplier", DEFAULT_ENERGY_THRESHOLD);
         slider_f32(ui, &mut a.beat_envelope_decay_ms, 20.0..=500.0, "Beat Envelope Decay (ms)", DEFAULT_BEAT_ENVELOPE_DECAY_MS);
-        help_text(ui, show_help, "How quickly the beat 'flash' fades out after a detection.");
+        help_text(ui, show_help, "How quickly the beat flash fades out after a detection.");
         
         checkbox_reset(ui, &mut a.bpm_lock_enabled, "BPM Lock / Phase Smoothing", false);
         if a.bpm_lock_enabled {
