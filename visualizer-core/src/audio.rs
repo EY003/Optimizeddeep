@@ -62,7 +62,7 @@ impl AudioEngine {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Capture thread (unchanged apart from channel mix read)
+// Capture thread (unchanged)
 // ─────────────────────────────────────────────────────────────
 
 fn capture_loop(
@@ -201,6 +201,7 @@ fn analysis_loop(
         let current = settings.load_full();
         let poll_period = Duration::from_secs_f32(1.0 / current.poll_rate_hz.max(1.0));
 
+        // ── Drain incoming samples ───────────────────────────────
         while let Ok(mut chunk) = sample_rx.try_recv() {
             if current.dc_block {
                 for s in chunk.iter_mut() {
@@ -213,12 +214,16 @@ fn analysis_loop(
             history.extend_from_slice(&chunk);
         }
 
+        // Cap history buffer.
         let cap = (current.fft_size * 4).max(8192);
         if history.len() > cap {
             let drop_n = history.len() - cap;
             history.drain(0..drop_n);
         }
 
+        // ── Frame timing ─────────────────────────────────────────
+        // `last_tick` records when processing started. It's used both for
+        // the ballistics dt and for the monotonic deadline below.
         let dt = last_tick.elapsed().as_secs_f32().clamp(0.001, 0.2);
         last_tick = Instant::now();
 
@@ -226,10 +231,21 @@ fn analysis_loop(
             let _ = frame_tx.try_send(frame);
         }
 
-        let elapsed = last_tick.elapsed();
-        if elapsed < poll_period {
-            spin_sleep::sleep(poll_period - elapsed);
+        // ── Scheduling ───────────────────────────────────────────
+        //
+        // Monotonic deadline (last_tick + poll_period) — no drift
+        // accumulation even if a particular frame was slow.
+        //
+        // std::thread::sleep() is fine here because timeBeginPeriod(1)
+        // was called in main(), giving us 1 ms sleep accuracy. No spin
+        // loop, no spin_sleep dependency, 0 % idle CPU from this thread.
+        let deadline = last_tick + poll_period;
+        let now = Instant::now();
+        if now < deadline {
+            thread::sleep(deadline - now);
         }
+        // If we're behind schedule (now >= deadline), don't sleep — process
+        // the next frame immediately with the real dt we just measured.
     }
 }
 
@@ -252,7 +268,7 @@ struct AudioProcessor {
     cached_min_freq: f32,
     cached_max_freq: f32,
     bin_ranges: Vec<(usize, usize)>,
-    bin_centers_hz: Vec<f32>,  // precomputed centre frequency for each bar
+    bin_centers_hz: Vec<f32>,
 
     bar_values: Vec<f32>,
     bar_peaks: Vec<f32>,
@@ -405,7 +421,6 @@ impl AudioProcessor {
         let nyquist = n_fft / 2;
         let norm = 1.0 / (n_fft as f32 / 2.0) * user_gain;
 
-        // ── raw per-bar magnitudes (linear) ───────────────────────
         let mut raw_bars = vec![0.0f32; num_bars];
         for (i, range) in self.bin_ranges.iter().enumerate().take(num_bars) {
             let (start, end) = *range;
@@ -418,7 +433,6 @@ impl AudioProcessor {
             raw_bars[i] = (mag * norm + 1e-9).max(1e-9);
         }
 
-        // ── frequency-domain smoothing (linear space) ─────────────
         if s.frequency_smoothing > 0.0 {
             let alpha = s.frequency_smoothing.clamp(0.0, 1.0);
             let mut tmp = raw_bars.clone();
@@ -431,7 +445,6 @@ impl AudioProcessor {
             raw_bars = tmp;
         }
 
-        // ── harmonic emphasis (peak smearing) ─────────────────────
         if s.harmonic_emphasis && num_bars >= 5 {
             let mut bloom = raw_bars.clone();
             for i in 2..num_bars - 2 {
@@ -440,7 +453,6 @@ impl AudioProcessor {
                 let r1 = raw_bars[i + 1];
                 let l2 = raw_bars[i - 2];
                 let r2 = raw_bars[i + 2];
-                // Only bloom true local maxima above a floor
                 if c > l1 && c > r1 && c > l2 && c > r2 && c > 0.005 {
                     let spread = c * 0.15;
                     bloom[i - 1] = bloom[i - 1].max(spread * 0.7);
@@ -452,7 +464,6 @@ impl AudioProcessor {
             raw_bars = bloom;
         }
 
-        // ── dB mapping with tilt / EQ / weighting ─────────────────
         let sens_norm = (s.sensitivity / 100.0).clamp(0.0, 1.0);
         let min_db_effective = s.min_decibels - (sens_norm - 0.5) * 20.0;
         let db_span = (s.max_decibels - min_db_effective).max(1.0);
@@ -490,7 +501,6 @@ impl AudioProcessor {
             mapped[i] = n01.powf(gamma);
         }
 
-        // ── time-domain smoothing (average_size) ──────────────────
         let avg = s.average_size.max(1);
         while self.frame_history.len() >= avg { self.frame_history.pop_front(); }
         self.frame_history.push_back(mapped);
@@ -508,7 +518,6 @@ impl AudioProcessor {
             out
         };
 
-        // ── per-frame peak normalization ──────────────────────────
         if s.per_frame_normalization {
             let peak = smoothed.iter().cloned().fold(0.0f32, f32::max);
             if peak > 0.001 {
@@ -534,7 +543,6 @@ impl AudioProcessor {
         let peak_hold_s = s.peak_hold_ms / 1000.0;
 
         for i in 0..n {
-            // Per-bar ballistics selection
             let (atk_ms, dec_ms) = if s.per_band_ballistics {
                 let f = self.bin_centers_hz.get(i).copied().unwrap_or(1000.0);
                 if f < 250.0 {
@@ -636,7 +644,6 @@ impl AudioProcessor {
             self.recompute_bpm();
         }
 
-        // Beat envelope (fast attack to 1.0, exponential release)
         if is_beat {
             self.beat_envelope = 1.0;
         } else if self.beat_envelope > 0.0 {
@@ -670,7 +677,7 @@ impl AudioProcessor {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Helpers
+// Helpers (unchanged)
 // ─────────────────────────────────────────────────────────────
 
 fn make_window(kind: WindowFunction, n: usize) -> Vec<f32> {
@@ -744,7 +751,6 @@ fn centers_from_ranges(ranges: &[(usize, usize)], fft_size: usize, sample_rate: 
     }).collect()
 }
 
-/// Standard A-weighting in dB (IEC 61672:2003).
 fn a_weighting_db(f: f32) -> f32 {
     let f = f.max(10.0);
     let f2 = f * f;
@@ -756,7 +762,6 @@ fn a_weighting_db(f: f32) -> f32 {
     20.0 * ra.log10() + 2.0
 }
 
-/// Simplified K-weighting (ITU-R BS.1770) — high-shelf + gentle high-pass.
 fn k_weighting_db(f: f32) -> f32 {
     let f = f.max(10.0);
     let shelf = 4.0 * (1.0 - 1.0 / (1.0 + (f / 1500.0).powi(4)));
