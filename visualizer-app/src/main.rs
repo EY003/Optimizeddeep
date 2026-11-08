@@ -12,12 +12,12 @@ use visualizer_core::{
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
+        AppConfig, AudioPreset, BarInterpolation, BlendMode,
         ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
-        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
+        FrequencyDirection, GradientPreset, GradientSource, GradientStop,
         MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
         TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
-        VisualizerDirection, WeightingCurve, WindowFunction,
+        VisualizerDirection,
     },
     musicbee::{self, TrackInfo},
 };
@@ -1001,7 +1001,7 @@ impl VisualizerApp {
                 let k = (base_t * TAU * 0.5).sin() * 0.5 + 0.5;
                 MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
-            MotionSample::FlipFlop => {
+            MotionShape::FlipFlop => {
                 let k = if (base_t * 2.0).fract() < 0.5 { 1.0 } else { 0.0 };
                 MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
@@ -2957,7 +2957,6 @@ impl VisualizerApp {
         use cfg::*;
         let system_fonts = self.system_fonts.clone();
         let cfg = &mut self.config.track_info;
-        let show_help = self.config.show_help_text;
 
         section_header(ui, "Cover Art");
         checkbox_reset(ui, &mut cfg.show_cover_art, "Show Cover Art", true);
@@ -3406,7 +3405,7 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_always_on_top()
             .with_maximized(true)
-            .with_skip_taskbar(true) // <--- Added: lowers OS window message overhead
+            .with_taskbar(true) // <--- Added: lowers OS window message overhead
             .with_icon(egui_icon),
         vsync: config.use_vsync,
         renderer: eframe::Renderer::Wgpu, // <--- THE BIG ONE: bypasses DWM OpenGL bottleneck
