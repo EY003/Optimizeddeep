@@ -7,6 +7,10 @@ edition = "2021"
 visualizer-core = { path = "../visualizer-core" }
 eframe = { version = "0.27", features = ["wgpu"] }
 egui = "0.27"
+egui-wgpu = "0.27"
+wgpu = "0.19"
+bytemuck = { version = "1.14", features = ["derive"] }
+realfft = "3.3"
 tokio = { version = "1", features = ["full"] }
 tray-icon = "0.11"
 global-hotkey = "0.4"
