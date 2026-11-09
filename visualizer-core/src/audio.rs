@@ -26,6 +26,7 @@ pub struct BarFrame {
     pub beat_envelope: f32,
     pub bpm: f32,
     pub phase: f32,
+    pub is_silent: bool,
 }
 
 pub struct AudioEngine {
@@ -268,6 +269,11 @@ struct AudioProcessor {
     phase: f32,
     beat_envelope: f32,
     time_elapsed: f64,
+
+    // Pre-allocated buffers for performance
+    raw_bars: Vec<f32>,
+    mapped: Vec<f32>,
+    smoothed: Vec<f32>,
 }
 
 impl AudioProcessor {
@@ -312,6 +318,9 @@ impl AudioProcessor {
             phase: 0.0,
             beat_envelope: 0.0,
             time_elapsed: 0.0,
+            raw_bars: vec![0.0; 80],
+            mapped: vec![0.0; 80],
+            smoothed: vec![0.0; 80],
         }
     }
 
@@ -354,6 +363,9 @@ impl AudioProcessor {
         self.bar_peaks.resize(n, 0.0);
         self.bar_velocities.resize(n, 0.0);
         self.peak_hold_remaining.resize(n, 0.0);
+        self.raw_bars.resize(n, 0.0);
+        self.mapped.resize(n, 0.0);
+        self.smoothed.resize(n, 0.0);
         for f in self.frame_history.iter_mut() { f.resize(n, 0.0); }
     }
 
@@ -370,6 +382,7 @@ impl AudioProcessor {
                 beat_envelope: self.beat_envelope,
                 bpm: self.bpm,
                 phase: self.phase,
+                is_silent: true,
             });
         }
         let window_slice = &history[history.len() - n_fft..];
@@ -379,7 +392,10 @@ impl AudioProcessor {
             let sum_sq: f32 = window_slice.iter().map(|x| x * x).sum();
             (sum_sq / n_fft as f32).sqrt()
         };
-        if s.agc_enabled {
+        
+        let is_silent = raw_rms < 1e-5;
+
+        if s.agc_enabled && !is_silent {
             let desired = 0.08 / raw_rms.max(1e-6);
             let coeff = if desired < self.agc_envelope {
                 s.agc_attack.clamp(0.0001, 1.0)
@@ -387,137 +403,145 @@ impl AudioProcessor {
                 s.agc_release.clamp(0.0001, 1.0)
             };
             self.agc_envelope += (desired - self.agc_envelope) * coeff;
-        } else {
+        } else if !s.agc_enabled {
             self.agc_envelope = 1.0;
         }
-        let agc_gain = self.agc_envelope.clamp(0.01, 20.0);
-        let user_gain = s.raw_gain.max(0.01) * agc_gain;
-
-        self.input_buffer.copy_from_slice(window_slice);
-        for i in 0..n_fft {
-            self.input_buffer[i] *= self.window[i];
-        }
-        if self.fft.process_with_scratch(&mut self.input_buffer, &mut self.output_buffer, &mut self.scratch_buffer).is_err() {
-            return None;
-        }
-
+        
         let num_bars = self.cached_num_bars;
-        let nyquist = n_fft / 2;
-        let norm = 1.0 / (n_fft as f32 / 2.0) * user_gain;
 
-        // ── raw per-bar magnitudes (linear) ───────────────────────
-        let mut raw_bars = vec![0.0f32; num_bars];
-        for (i, range) in self.bin_ranges.iter().enumerate().take(num_bars) {
-            let (start, end) = *range;
-            let end = end.min(nyquist).max(start + 1);
-            let mut mag = 0.0f32;
-            for bin in start..end {
-                mag += self.output_buffer[bin].norm();
-            }
-            mag /= (end - start) as f32;
-            raw_bars[i] = (mag * norm + 1e-9).max(1e-9);
-        }
-
-        // ── frequency-domain smoothing (linear space) ─────────────
-        if s.frequency_smoothing > 0.0 {
-            let alpha = s.frequency_smoothing.clamp(0.0, 1.0);
-            let mut tmp = raw_bars.clone();
+        if is_silent {
             for i in 0..num_bars {
-                let lo = i.saturating_sub(1);
-                let hi = (i + 1).min(num_bars - 1);
-                let avg = (raw_bars[lo] + raw_bars[i] * 2.0 + raw_bars[hi]) * 0.25;
-                tmp[i] = raw_bars[i] * (1.0 - alpha) + avg * alpha;
+                self.mapped[i] = 0.0;
             }
-            raw_bars = tmp;
-        }
+            self.beat_envelope = (self.beat_envelope * 0.9).max(0.0); // Decay beat envelope
+        } else {
+            let agc_gain = self.agc_envelope.clamp(0.01, 20.0);
+            let user_gain = s.raw_gain.max(0.01) * agc_gain;
 
-        // ── harmonic emphasis (peak smearing) ─────────────────────
-        if s.harmonic_emphasis && num_bars >= 5 {
-            let mut bloom = raw_bars.clone();
-            for i in 2..num_bars - 2 {
-                let c = raw_bars[i];
-                let l1 = raw_bars[i - 1];
-                let r1 = raw_bars[i + 1];
-                let l2 = raw_bars[i - 2];
-                let r2 = raw_bars[i + 2];
-                // Only bloom true local maxima above a floor
-                if c > l1 && c > r1 && c > l2 && c > r2 && c > 0.005 {
-                    let spread = c * 0.15;
-                    bloom[i - 1] = bloom[i - 1].max(spread * 0.7);
-                    bloom[i + 1] = bloom[i + 1].max(spread * 0.7);
-                    bloom[i - 2] = bloom[i - 2].max(spread * 0.3);
-                    bloom[i + 2] = bloom[i + 2].max(spread * 0.3);
+            self.input_buffer.copy_from_slice(window_slice);
+            for i in 0..n_fft {
+                self.input_buffer[i] *= self.window[i];
+            }
+            if self.fft.process_with_scratch(&mut self.input_buffer, &mut self.output_buffer, &mut self.scratch_buffer).is_err() {
+                return None;
+            }
+
+            let nyquist = n_fft / 2;
+            let norm = 1.0 / (n_fft as f32 / 2.0) * user_gain;
+
+            // ── raw per-bar magnitudes (linear) ───────────────────────
+            for (i, range) in self.bin_ranges.iter().enumerate().take(num_bars) {
+                let (start, end) = *range;
+                let end = end.min(nyquist).max(start + 1);
+                let mut mag = 0.0f32;
+                for bin in start..end {
+                    mag += self.output_buffer[bin].norm();
                 }
+                mag /= (end - start) as f32;
+                self.raw_bars[i] = (mag * norm + 1e-9).max(1e-9);
             }
-            raw_bars = bloom;
-        }
 
-        // ── dB mapping with tilt / EQ / weighting ─────────────────
-        let sens_norm = (s.sensitivity / 100.0).clamp(0.0, 1.0);
-        let min_db_effective = s.min_decibels - (sens_norm - 0.5) * 20.0;
-        let db_span = (s.max_decibels - min_db_effective).max(1.0);
-        let target_ratio = db_span / s.target_dynamic_range_db.max(1.0);
-        let gamma = s.response_gamma.max(0.1) * target_ratio;
-
-        let mut mapped = vec![0.0f32; num_bars];
-        for i in 0..num_bars {
-            let db = 20.0 * raw_bars[i].log10();
-            let center_freq = self.bin_centers_hz.get(i).copied().unwrap_or(1000.0);
-
-            let octaves_from_1k = (center_freq / 1000.0).log2();
-            let tilt_db = s.spectrum_tilt * octaves_from_1k;
-
-            let eq_db = if center_freq < 250.0 {
-                s.eq_bass_db
-            } else if center_freq < 4000.0 {
-                s.eq_mid_db
-            } else {
-                s.eq_treble_db
-            };
-
-            let weight_db = match s.weighting {
-                WeightingCurve::None => 0.0,
-                WeightingCurve::AWeighting => a_weighting_db(center_freq),
-                WeightingCurve::KWeighting => k_weighting_db(center_freq),
-            };
-
-            let tilted_db = db + tilt_db + eq_db + weight_db;
-            let mut n01 = ((tilted_db - min_db_effective) / db_span).clamp(0.0, 1.0);
-
-            if n01 < s.noise_gate {
-                n01 = 0.0;
+            // ── frequency-domain smoothing (linear space) ─────────────
+            if s.frequency_smoothing > 0.0 {
+                let alpha = s.frequency_smoothing.clamp(0.0, 1.0);
+                let mut tmp = self.raw_bars.clone();
+                for i in 0..num_bars {
+                    let lo = i.saturating_sub(1);
+                    let hi = (i + 1).min(num_bars - 1);
+                    let avg = (self.raw_bars[lo] + self.raw_bars[i] * 2.0 + self.raw_bars[hi]) * 0.25;
+                    tmp[i] = self.raw_bars[i] * (1.0 - alpha) + avg * alpha;
+                }
+                self.raw_bars.copy_from_slice(&tmp);
             }
-            mapped[i] = n01.powf(gamma);
+
+            // ── harmonic emphasis (peak smearing) ─────────────────────
+            if s.harmonic_emphasis && num_bars >= 5 {
+                let mut bloom = self.raw_bars.clone();
+                for i in 2..num_bars - 2 {
+                    let c = self.raw_bars[i];
+                    let l1 = self.raw_bars[i - 1];
+                    let r1 = self.raw_bars[i + 1];
+                    let l2 = self.raw_bars[i - 2];
+                    let r2 = self.raw_bars[i + 2];
+                    // Only bloom true local maxima above a floor
+                    if c > l1 && c > r1 && c > l2 && c > r2 && c > 0.005 {
+                        let spread = c * 0.15;
+                        bloom[i - 1] = bloom[i - 1].max(spread * 0.7);
+                        bloom[i + 1] = bloom[i + 1].max(spread * 0.7);
+                        bloom[i - 2] = bloom[i - 2].max(spread * 0.3);
+                        bloom[i + 2] = bloom[i + 2].max(spread * 0.3);
+                    }
+                }
+                self.raw_bars.copy_from_slice(&bloom);
+            }
+
+            // ── dB mapping with tilt / EQ / weighting ─────────────────
+            let sens_norm = (s.sensitivity / 100.0).clamp(0.0, 1.0);
+            let min_db_effective = s.min_decibels - (sens_norm - 0.5) * 20.0;
+            let db_span = (s.max_decibels - min_db_effective).max(1.0);
+            let target_ratio = db_span / s.target_dynamic_range_db.max(1.0);
+            let gamma = s.response_gamma.max(0.1) * target_ratio;
+
+            for i in 0..num_bars {
+                let db = 20.0 * self.raw_bars[i].log10();
+                let center_freq = self.bin_centers_hz.get(i).copied().unwrap_or(1000.0);
+
+                let octaves_from_1k = (center_freq / 1000.0).log2();
+                let tilt_db = s.spectrum_tilt * octaves_from_1k;
+
+                let eq_db = if center_freq < 250.0 {
+                    s.eq_bass_db
+                } else if center_freq < 4000.0 {
+                    s.eq_mid_db
+                } else {
+                    s.eq_treble_db
+                };
+
+                let weight_db = match s.weighting {
+                    WeightingCurve::None => 0.0,
+                    WeightingCurve::AWeighting => a_weighting_db(center_freq),
+                    WeightingCurve::KWeighting => k_weighting_db(center_freq),
+                };
+
+                let tilted_db = db + tilt_db + eq_db + weight_db;
+                let mut n01 = ((tilted_db - min_db_effective) / db_span).clamp(0.0, 1.0);
+
+                if n01 < s.noise_gate {
+                    n01 = 0.0;
+                }
+                self.mapped[i] = n01.powf(gamma);
+            }
         }
 
         // ── time-domain smoothing (average_size) ──────────────────
         let avg = s.average_size.max(1);
         while self.frame_history.len() >= avg { self.frame_history.pop_front(); }
-        self.frame_history.push_back(mapped);
+        self.frame_history.push_back(self.mapped.clone());
 
-        let mut smoothed: Vec<f32> = {
-            let n = num_bars;
-            let count = self.frame_history.len() as f32;
-            let mut out = vec![0.0f32; n];
-            for frame in &self.frame_history {
-                for i in 0..n.min(frame.len()) {
-                    out[i] += frame[i];
-                }
+        let count = self.frame_history.len() as f32;
+        for x in self.smoothed.iter_mut() { *x = 0.0; }
+        for frame in &self.frame_history {
+            for i in 0..num_bars.min(frame.len()) {
+                self.smoothed[i] += frame[i];
             }
-            for x in &mut out { *x /= count.max(1.0); }
-            out
-        };
+        }
+        for x in &mut self.smoothed { *x /= count.max(1.0); }
 
         // ── per-frame peak normalization ──────────────────────────
-        if s.per_frame_normalization {
-            let peak = smoothed.iter().cloned().fold(0.0f32, f32::max);
+        if s.per_frame_normalization && !is_silent {
+            let peak = self.smoothed.iter().cloned().fold(0.0f32, f32::max);
             if peak > 0.001 {
-                for v in smoothed.iter_mut() { *v /= peak; }
+                for v in self.smoothed.iter_mut() { *v /= peak; }
             }
         }
 
-        self.update_ballistics(&smoothed, s, dt);
-        let (beat, phase) = self.detect_rhythm(s, dt);
+        self.update_ballistics(&self.smoothed, s, dt);
+        
+        let (beat, phase) = if !is_silent {
+            self.detect_rhythm(s, dt)
+        } else {
+            (false, self.phase)
+        };
 
         Some(BarFrame {
             values: self.bar_values.clone(),
@@ -526,6 +550,7 @@ impl AudioProcessor {
             beat_envelope: self.beat_envelope,
             bpm: self.bpm,
             phase,
+            is_silent,
         })
     }
 
