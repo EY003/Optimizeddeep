@@ -1214,6 +1214,7 @@ fn draw_spaced(ctx: &egui::Context, painter: &egui::Painter, text: &str, pos: eg
 // GPU bar drawing
 // ═══════════════════════════════════════════════════════════════
 
+   impl VisualizerApp {
     fn draw_bars_gpu(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 { return; }
@@ -1313,6 +1314,7 @@ fn draw_spaced(ctx: &egui::Context, painter: &egui::Painter, text: &str, pos: eg
         );
         ui.painter().add(callback);
     }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // Settings UI (unchanged - identical to previous version)
@@ -2644,7 +2646,7 @@ fn main() {
     #[cfg(windows)]
     unsafe { timeBeginPeriod(1); }
 
-    let config = AppConfig::load();
+    let _config = AppConfig::load();
     let (egui_icon, _) = load_icon();
 
     let options = eframe::NativeOptions {
