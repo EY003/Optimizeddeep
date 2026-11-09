@@ -66,13 +66,10 @@ impl Default for MotionSample {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct GpuBar {
-    pub height: f32,            // offset 0
-    pub peak_height: f32,       // offset 4
-    pub _pad0: [f32; 2],        // offset 8..16 (aligns color_top to 16)
-    pub color_top: [f32; 4],    // offset 16
-    pub color_bottom: [f32; 4], // offset 32
-    pub show_peak: f32,         // offset 48
-    pub _pad1: [f32; 3],        // offset 52..64 (struct size = 64)
+    pub height: f32,
+    pub peak_height: f32,
+    pub show_peak: f32,
+    pub _pad0: f32,
 }
 
 #[repr(C)]
@@ -80,6 +77,7 @@ pub struct GpuBar {
 pub struct ShaderUniforms {
     pub dims: [f32; 4],          // num_bars, is_vertical, is_smooth, is_mirrored
     pub layout: [f32; 4],        // bar_width, bar_gap, screen_width, screen_height
+    pub transform: [f32; 4],     // x_offset, y_offset, height_scale, max_bar_height
     pub outline_color: [f32; 4], // r, g, b, a
     pub extras: [f32; 4],        // outline_thickness, bar_radius, opacity, direction
 }
@@ -88,11 +86,13 @@ pub struct VisualizerResources {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
     pub bar_buffer: wgpu::Buffer,
+    pub color_buffer: wgpu::Buffer,
     pub uniform_buffer: wgpu::Buffer,
 }
 
 pub struct VisualizerCallback {
     pub bars: Vec<GpuBar>,
+    pub colors: Vec<[f32; 4]>,
     pub uniforms: ShaderUniforms,
 }
 
@@ -107,6 +107,7 @@ impl CallbackTrait for VisualizerCallback {
     ) -> Vec<wgpu::CommandBuffer> {
         let resources: &mut VisualizerResources = callback_resources.get_mut().unwrap();
         queue.write_buffer(&resources.bar_buffer, 0, bytemuck::cast_slice(&self.bars));
+        queue.write_buffer(&resources.color_buffer, 0, bytemuck::cast_slice(&self.colors));
         queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
         Vec::new()
     }
@@ -132,9 +133,17 @@ fn setup_wgpu(render_state: &egui_wgpu::RenderState) -> VisualizerResources {
         source: wgpu::ShaderSource::Wgsl(include_str!("visualizer.wgsl").into()),
     });
 
+    // 256 max bars, 32 segments each
     let bar_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Bar Buffer"),
         size: (std::mem::size_of::<GpuBar>() * 256) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let color_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Color Buffer"),
+        size: (std::mem::size_of::<[f32; 4]>() * 256 * 32) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -151,21 +160,19 @@ fn setup_wgpu(render_state: &egui_wgpu::RenderState) -> VisualizerResources {
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             },
         ],
@@ -175,14 +182,9 @@ fn setup_wgpu(render_state: &egui_wgpu::RenderState) -> VisualizerResources {
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         layout: &bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: bar_buffer.as_entire_binding(),
-            },
+            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: bar_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: color_buffer.as_entire_binding() },
         ],
         label: Some("Visualizer Bind Group"),
     });
@@ -196,11 +198,7 @@ fn setup_wgpu(render_state: &egui_wgpu::RenderState) -> VisualizerResources {
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("Visualizer Pipeline"),
         layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: &[],
-        },
+        vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", buffers: &[] },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: "fs_main",
@@ -216,7 +214,7 @@ fn setup_wgpu(render_state: &egui_wgpu::RenderState) -> VisualizerResources {
         multiview: None,
     });
 
-    VisualizerResources { pipeline, bind_group, bar_buffer, uniform_buffer }
+    VisualizerResources { pipeline, bind_group, bar_buffer, color_buffer, uniform_buffer }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1216,11 +1214,9 @@ fn draw_spaced(ctx: &egui::Context, painter: &egui::Painter, text: &str, pos: eg
 // GPU bar drawing
 // ═══════════════════════════════════════════════════════════════
 
-impl VisualizerApp {
     fn draw_bars_gpu(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 { return; }
-
         if self.current_bars.iter().all(|&v| v < 0.001) && self.current_peaks.iter().all(|&p| p < 0.001) {
             return;
         }
@@ -1231,55 +1227,46 @@ impl VisualizerApp {
             base_num_bars
         };
 
+        const NUM_SEGMENTS: usize = 32;
         let time = ui.input(|i| i.time) as f32;
         let dir = self.config.visualizer_direction;
-
+        
         let mut gpu_bars = Vec::with_capacity(visual_num_bars);
+        let mut gpu_colors = Vec::with_capacity(visual_num_bars * NUM_SEGMENTS);
+
+        // Replicate original layout math for accurate color sampling
+        let total_size = visual_num_bars as f32 * (self.config.bar_width + self.config.bar_gap) - self.config.bar_gap;
+        let start_x = rect.center().x - total_size * 0.5 + self.config.x_offset;
+        let bottom_y = rect.bottom() + self.config.y_offset;
+        let rect_h = rect.height() * self.config.height_scale;
+
         for i in 0..visual_num_bars {
             let idx = frequency_index(i, base_num_bars, self.config.frequency_direction);
             let height = self.current_bars[idx].min(1.0);
             let peak = self.current_peaks[idx].min(1.0);
 
-            let (color_top, color_bottom) = match self.config.color_mode {
-                ColorMode::Gradient => {
-                    let rect_w = rect.width();
-                    let rect_h = rect.height();
-                    let x_center = rect.left() + (i as f32 / visual_num_bars as f32) * rect_w;
-                    let cb = self.get_color_at(i, visual_num_bars, x_center, rect.bottom(), 0.0, rect, time);
-                    let ct = self.get_color_at(i, visual_num_bars, x_center, rect.top() + (1.0 - height) * rect_h, 1.0, rect, time);
-                    (ct, cb)
-                }
-                ColorMode::Animated => {
-                    let norm_x = i as f32 / visual_num_bars as f32;
-                    let cb = self.sample_color_changing(norm_x, 0.0, time);
-                    let ct = self.sample_color_changing(norm_x, height, time);
-                    (ct, cb)
-                }
-                _ => {
-                    let c = self.get_color_at(i, visual_num_bars, 0.0, 0.0, 0.0, rect, time);
-                    (c, c)
-                }
-            };
-
             gpu_bars.push(GpuBar {
                 height,
                 peak_height: peak,
-                _pad0: [0.0; 2],
-                color_top: [
-                    color_top.r() as f32 / 255.0,
-                    color_top.g() as f32 / 255.0,
-                    color_top.b() as f32 / 255.0,
-                    color_top.a() as f32 / 255.0,
-                ],
-                color_bottom: [
-                    color_bottom.r() as f32 / 255.0,
-                    color_bottom.g() as f32 / 255.0,
-                    color_bottom.b() as f32 / 255.0,
-                    color_bottom.a() as f32 / 255.0,
-                ],
                 show_peak: if self.config.audio.peak_hold_ms > 0.0 && peak > 0.001 { 1.0 } else { 0.0 },
-                _pad1: [0.0; 3],
+                _pad0: 0.0,
             });
+
+            // Calculate color for each segment
+            let cx = start_x + i as f32 * (self.config.bar_width + self.config.bar_gap) + self.config.bar_width * 0.5;
+            let h = height * rect_h;
+
+            for s in 0..NUM_SEGMENTS {
+                let t = s as f32 / NUM_SEGMENTS as f32;
+                let cy = bottom_y - h * t;
+                let c = self.get_color_at(i, visual_num_bars, cx, cy, t, rect, time);
+                gpu_colors.push([
+                    c.r() as f32 / 255.0,
+                    c.g() as f32 / 255.0,
+                    c.b() as f32 / 255.0,
+                    c.a() as f32 / 255.0,
+                ]);
+            }
         }
 
         let uniforms = ShaderUniforms {
@@ -1294,6 +1281,12 @@ impl VisualizerApp {
                 self.config.bar_gap,
                 rect.width(),
                 rect.height(),
+            ],
+            transform: [
+                self.config.x_offset,
+                self.config.y_offset,
+                self.config.height_scale,
+                self.config.max_bar_height,
             ],
             outline_color: [
                 self.config.visualizer_outline_color[0] as f32 / 255.0,
@@ -1316,11 +1309,10 @@ impl VisualizerApp {
 
         let callback = egui_wgpu::Callback::new_paint_callback(
             rect,
-            VisualizerCallback { bars: gpu_bars, uniforms },
+            VisualizerCallback { bars: gpu_bars, colors: gpu_colors, uniforms },
         );
         ui.painter().add(callback);
     }
-}
 
 // ═══════════════════════════════════════════════════════════════
 // Settings UI (unchanged - identical to previous version)
