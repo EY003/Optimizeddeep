@@ -38,7 +38,7 @@ use tray_icon::{
 fn load_icon() -> (egui::IconData, tray_icon::Icon) {
     let icon_bytes = include_bytes!("icon.png");
     let image = image::load_from_memory(icon_bytes).unwrap_or_else(|_| {
-        image::DynamicImage::new_rgba8(1, 1) // Fallback: 1x1 transparent
+        image::DynamicImage::new_rgba8(1, 1)
     });
     let rgba = image.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -486,6 +486,7 @@ struct VisualizerApp {
     last_bpm: f32,
     audio_rx: crossbeam_channel::Receiver<BarFrame>,
     audio_settings: Arc<ArcSwap<visualizer_core::config::AudioSettings>>,
+    audio_dirty: bool,
     should_quit: Arc<AtomicBool>,
     show_settings: bool,
     current_fps: f32,
@@ -564,6 +565,7 @@ impl VisualizerApp {
             last_bpm: 0.0,
             audio_rx: engine.frame_rx,
             audio_settings,
+            audio_dirty: false,
             show_settings,
             config,
             should_quit,
@@ -1037,12 +1039,10 @@ impl VisualizerApp {
         draw_spaced(ctx, painter, text, pos, font_id, align, color, ls);
     }
 
-    fn draw_track_info(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+    fn draw_track_info(&self, painter: &egui::Painter, ctx: &egui::Context, rect: egui::Rect) {
         let Some(info) = &self.track_info else { return };
         let cfg = &self.config.track_info;
-        let ctx = ui.ctx();
-        let painter = ui.painter();
-        let time = ui.input(|i| i.time) as f32;
+        let time = ctx.input(|i| i.time) as f32;
         let margin = 40.0;
         let art_size = cfg.cover_size;
         let text_gap = 14.0;
@@ -1460,11 +1460,10 @@ impl VisualizerApp {
         }
     }
 
-    fn draw_bars(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+    fn draw_bars(&self, painter: &egui::Painter, ctx: &egui::Context, rect: egui::Rect) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 { return; }
-        let painter = ui.painter();
-        let time = ui.input(|i| i.time) as f32;
+        let time = ctx.input(|i| i.time) as f32;
 
         let is_static_multi_vertical = self.config.color_mode == ColorMode::StaticMultiple
             && self.config.static_mode == StaticDistributionMode::Vertical;
@@ -2050,7 +2049,6 @@ impl VisualizerApp {
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         let scale = self.config.settings_scale.clamp(0.75, 1.5);
         
-        // Sidebar (fixed width, not scaled)
         egui::SidePanel::left("settings_nav")
             .resizable(false)
             .exact_width(140.0)
@@ -2059,11 +2057,9 @@ impl VisualizerApp {
                 self.draw_sidebar(ui);
             });
 
-        // Central panel (scaled, pure black)
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::BLACK).inner_margin(egui::Margin::same(12.0)))
             .show_inside(ui, |ui| {
-                // Scale text sizes first for larger base readability
                 ui.style_mut().text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
                 ui.style_mut().text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
                 ui.style_mut().text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
@@ -2098,7 +2094,6 @@ impl VisualizerApp {
         ui.label(egui::RichText::new("Settings").size(16.0).strong().color(accent()));
         ui.add_space(8.0);
 
-        // Search box
         ui.add(egui::TextEdit::singleline(&mut self.settings_search)
             .hint_text("Search…")
             .desired_width(f32::INFINITY));
@@ -2144,7 +2139,6 @@ impl VisualizerApp {
             }
         }
 
-        // Bottom buttons (minimalist)
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(8.0);
             if ui.add_sized([ui.available_width(), 24.0], 
@@ -2159,6 +2153,7 @@ impl VisualizerApp {
                 self.config = AppConfig::default();
                 self.last_palette_hash = 0;
                 self.loaded_font_path = Some("__reset__".to_string());
+                self.audio_dirty = true;
             }
         });
     }
@@ -2297,7 +2292,6 @@ impl VisualizerApp {
                             if response.clicked() { chosen = Some(preset.color); }
                         }
                         if !preset.is_premade {
-                            // Overlay the delete button to avoid breaking row alignment
                             let btn_rect = egui::Rect::from_center_size(rect.right_top() + egui::vec2(-2.0, 2.0), egui::vec2(16.0, 16.0));
                             let btn = ui.put(btn_rect, egui::Button::new("✖").frame(false).small());
                             if btn.clicked() { to_remove = Some(global_i); }
@@ -2890,10 +2884,12 @@ impl VisualizerApp {
         if let Some(p) = chosen_builtin {
             p.apply(&mut self.config.audio);
             self.last_decay_mode = self.config.audio.decay_mode;
+            self.audio_dirty = true;
         }
         if let Some(i) = chosen_custom {
             self.config.audio = self.config.custom_audio_presets[i].settings.clone();
             self.last_decay_mode = self.config.audio.decay_mode;
+            self.audio_dirty = true;
         }
         if let Some(p) = detected {
             help_text(ui, self.config.show_help_text, p.description());
@@ -2923,6 +2919,7 @@ impl VisualizerApp {
                 if ui.button(name).clicked() {
                     self.config.audio = self.config.custom_audio_presets[*i].settings.clone();
                     self.last_decay_mode = self.config.audio.decay_mode;
+                    self.audio_dirty = true;
                 }
                 if ui.small_button("✖").clicked() { to_remove = Some(*i); }
             }
@@ -2934,9 +2931,10 @@ impl VisualizerApp {
 
     fn tab_track_info(&mut self, ui: &mut egui::Ui) {
         use cfg::*;
-        let system_fonts = self.system_fonts.clone();
-        let cfg = &mut self.config.track_info;
+        // Avoid cloning the font list every frame — borrow it directly.
         let show_help = self.config.show_help_text;
+        let system_fonts = &self.system_fonts;
+        let cfg = &mut self.config.track_info;
 
         section_header(ui, "Cover Art");
         checkbox_reset(ui, &mut cfg.show_cover_art, "Show Cover Art", true);
@@ -2988,7 +2986,7 @@ impl VisualizerApp {
                     if ui.selectable_label(cfg.font_path.is_none(), "Default (proportional)").clicked() {
                         cfg.font_path = None;
                     }
-                    for (name, path) in &system_fonts {
+                    for (name, path) in system_fonts.iter() {
                         let selected = cfg.font_path.as_deref() == Some(path.as_str());
                         if ui.selectable_label(selected, name).clicked() { cfg.font_path = Some(path.clone()); }
                     }
@@ -3057,6 +3055,8 @@ impl VisualizerApp {
             slider_f32(ui, &mut cfg.outline_thickness, 0.1..=6.0, "Outline Thickness", 1.0);
             color_edit_reset(ui, &mut cfg.outline_color, "Outline Color", [0, 0, 0]);
         }
+
+        let _ = show_help;
     }
 
     // ── Appearance tab ───────────────────────────────────────
@@ -3094,12 +3094,16 @@ impl VisualizerApp {
     // ── Performance tab ──────────────────────────────────────
 
     fn tab_performance(&mut self, ui: &mut egui::Ui) {
-        use cfg::*;
-        section_header(ui, "Frame Rate");
-        checkbox_reset(ui, &mut self.config.use_vsync, "Enable VSync (Requires Restart)", false);
-        slider_f32(ui, &mut self.config.target_fps, 15.0..=144.0, "Target FPS", DEFAULT_TARGET_FPS);
+        section_header(ui, "Display");
         checkbox_reset(ui, &mut self.config.show_fps, "Show FPS Counter", false);
         ui.label(format!("Current FPS: {:.1}", self.current_fps));
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("VSync is always enabled. Repaint rate is fixed at 60 Hz.")
+                .size(12.0)
+                .color(egui::Color32::from_gray(150))
+                .italics()
+        );
     }
 
     // ── Static helpers reused across tabs ────────────────────
@@ -3185,10 +3189,7 @@ impl eframe::App for VisualizerApp {
             self.reload_custom_font(ctx);
         }
 
-        if self.config.audio != *self.audio_settings.load_full() {
-            self.audio_settings.store(Arc::new(self.config.audio.clone()));
-        }
-
+        // ── System event handling ─────────────────────────────
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.settings_menu_id { self.show_settings = true; }
             else if event.id == self.quit_menu_id { self.should_quit.store(true, Ordering::Relaxed); }
@@ -3206,51 +3207,60 @@ impl eframe::App for VisualizerApp {
             return;
         }
 
+        // ── Bar buffer resize ─────────────────────────────────
         let n_bars = self.config.audio.num_bars;
         if self.current_bars.len() != n_bars {
             self.current_bars.resize(n_bars, 0.0);
             self.current_peaks.resize(n_bars, 0.0);
         }
 
+        // ── Receive latest audio frame ────────────────────────
         let mut latest: Option<BarFrame> = None;
         while let Ok(frame) = self.audio_rx.try_recv() { latest = Some(frame); }
         if let Some(frame) = latest {
             let limit = self.current_bars.len().min(frame.values.len());
-            for i in 0..limit {
-                self.current_bars[i] = frame.values[i];
-                self.current_peaks[i] = frame.peaks[i];
-            }
+            self.current_bars[..limit].copy_from_slice(&frame.values[..limit]);
+            self.current_peaks[..limit].copy_from_slice(&frame.peaks[..limit]);
             self.last_bpm = frame.bpm;
         }
 
+        // ── Mouse passthrough (set once) ──────────────────────
         if !self.is_passthrough_set {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
             self.is_passthrough_set = true;
         }
 
+        // ── Overlay drawing — direct painter, no Area overhead ──
         let rect = ctx.screen_rect();
-        egui::Area::new(egui::Id::new("overlay")).fixed_pos(rect.min).show(ctx, |ui| {
-            ui.set_min_size(rect.size());
-            if self.config.bg_opacity > 0 {
-                let c = self.config.bg_color;
-                let bg_color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
-                ui.painter().rect_filled(rect, 0.0, bg_color);
-            }
-            self.draw_bars(ui, rect);
-            self.draw_track_info(ui, rect);
-            if self.config.show_fps {
-                ui.painter().text(rect.left_top() + egui::vec2(20.0, 20.0),
-                                  egui::Align2::LEFT_TOP,
-                                  format!("FPS: {:.1}", self.current_fps),
-                                  egui::FontId::monospace(16.0),
-                                  egui::Color32::GREEN);
-            }
-        });
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("overlay"),
+        ));
 
+        if self.config.bg_opacity > 0 {
+            let c = self.config.bg_color;
+            let bg_color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
+            painter.rect_filled(rect, 0.0, bg_color);
+        }
+
+        self.draw_bars(&painter, ctx, rect);
+        self.draw_track_info(&painter, ctx, rect);
+
+        if self.config.show_fps {
+            painter.text(
+                rect.left_top() + egui::vec2(20.0, 20.0),
+                egui::Align2::LEFT_TOP,
+                format!("FPS: {:.1}", self.current_fps),
+                egui::FontId::monospace(16.0),
+                egui::Color32::GREEN,
+            );
+        }
+
+        // ── Settings viewport ─────────────────────────────────
+        let had_settings_ui = self.show_settings;
         if self.show_settings {
             let scale = self.config.settings_scale.clamp(0.75, 1.5);
             
-            // Resize the window when the scale changes
             if (self.config.settings_scale - self.old_settings_scale).abs() > 0.01 {
                 self.old_settings_scale = self.config.settings_scale;
                 ctx.send_viewport_cmd_to(
@@ -3309,8 +3319,21 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        let target_duration = Duration::from_secs_f32(1.0 / self.config.target_fps.max(1.0));
-        ctx.request_repaint_after(target_duration);
+        // ── Propagate audio settings (skip when settings closed) ──
+        // AudioSettings can only be mutated via the settings UI, so we only
+        // need to compare (and potentially re-store) when the settings UI
+        // was shown this frame. `audio_dirty` is an explicit fast-path flag
+        // that bypasses the field-by-field comparison for preset applies
+        // and resets (which occur via button clicks outside slider flow).
+        if had_settings_ui
+            && (self.audio_dirty || self.config.audio != *self.audio_settings.load_full())
+        {
+            self.audio_settings.store(Arc::new(self.config.audio.clone()));
+            self.audio_dirty = false;
+        }
+
+        // ── 60 Hz repaint (VSync handles pacing) ──────────────
+        ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 60.0));
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) { self.config.save(); }
@@ -3321,7 +3344,6 @@ impl eframe::App for VisualizerApp {
 // ═══════════════════════════════════════════════════════════════
 
 fn main() -> eframe::Result<()> {
-    let config = AppConfig::load();
     let (egui_icon, _) = load_icon();
 
     let options = eframe::NativeOptions {
@@ -3331,7 +3353,7 @@ fn main() -> eframe::Result<()> {
             .with_always_on_top()
             .with_maximized(true)
             .with_icon(egui_icon),
-        vsync: config.use_vsync,
+        vsync: true,
         ..Default::default()
     };
     eframe::run_native(
