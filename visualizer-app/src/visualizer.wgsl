@@ -1,6 +1,6 @@
 struct Uniforms {
     dims: vec4<f32>,          // num_bars, is_vertical, is_smooth, is_mirrored
-    layout: vec4<f32>,        // bar_width, bar_gap, screen_width, screen_height
+    layout_data: vec4<f32>,   // bar_width, bar_gap, screen_width, screen_height
     outline_color: vec4<f32>, // r, g, b, a
     extras: vec4<f32>,        // outline_thickness, bar_radius, opacity, direction (0=Up,1=Down,2=Right,3=Left)
 };
@@ -42,10 +42,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let num_bars = u.dims.x;
     let is_smooth = u.dims.z > 0.5;
     let is_mirrored = u.dims.w > 0.5;
-    let bar_width = u.layout.x;
-    let bar_gap = u.layout.y;
-    let screen_w = u.layout.z;
-    let screen_h = u.layout.w;
+    let bar_width = u.layout_data.x;
+    let bar_gap = u.layout_data.y;
+    let screen_w = u.layout_data.z;
+    let screen_h = u.layout_data.w;
     let outline_thickness = u.extras.x;
     let bar_radius = u.extras.y;
     let direction = u.extras.w;
@@ -104,29 +104,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if (bar_idx < u32(num_bars) - 1u) { next_h = bars[bar_idx + 1u].height; }
 
         let t = bar_local_x / bar_width;
-        // Smoothstep-style blend to neighbours
         let s = t * t * (3.0 - 2.0 * t);
-        current_height = mix(prev_h, bar.height, s + 0.5) * (1.0 - s) 
-                       + mix(bar.height, next_h, s) * s;
-        // Simpler approximation that looks good:
-        current_height = prev_h * (1.0 - s) * 0.5 
+        current_height = prev_h * (1.0 - s) * 0.5
                        + bar.height * 1.0
                        + next_h * s * 0.5;
         current_height = clamp(current_height, 0.0, 1.0);
     }
 
+    // Scale by the correct axis: horizontal bars use screen height,
+    // vertical bars use screen width.
     var draw_extent: f32;
-if (direction < 1.5) {
-    draw_extent = screen_h;  // Up / Down -> height
-} else {
-    draw_extent = screen_w;  // Right / Left -> width
-}
-let draw_height = current_height * draw_extent;
+    if (direction < 1.5) {
+        draw_extent = screen_h;
+    } else {
+        draw_extent = screen_w;
+    }
+    let draw_height = current_height * draw_extent;
+
     // Outside the bar (above the top)
     if (local_y > draw_height) {
         // Peak hold line
         if (bar.show_peak > 0.5) {
-            let peak_y = bar.peak_height * max_dim;
+            let peak_y = bar.peak_height * draw_extent;
             let dist_to_peak = abs(local_y - peak_y);
             if (dist_to_peak < 2.0) {
                 return vec4<f32>(bar.color_top.rgb, bar.color_top.a);
