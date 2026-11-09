@@ -12,12 +12,12 @@ use visualizer_core::{
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
+        AppConfig, AudioPreset, BarInterpolation, BlendMode,
         ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
-        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
+        FrequencyDirection, GradientPreset, GradientSource, GradientStop,
         MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
         TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
-        VisualizerDirection, WeightingCurve, WindowFunction,
+        VisualizerDirection,
     },
     musicbee::{self, TrackInfo},
 };
@@ -3272,7 +3272,7 @@ impl eframe::App for VisualizerApp {
                 painter.rect_filled(rect, 0.0, bg_color);
             }
 
-            self.draw_bars(&mut painter, ctx, rect);
+            self.draw_bars(&painter, ctx, rect);
             self.draw_track_info(&painter, ctx, rect);
 
             if self.config.show_fps {
