@@ -115,9 +115,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         current_height = clamp(current_height, 0.0, 1.0);
     }
 
-    let max_dim = max(screen_w, screen_h);
-    let draw_height = current_height * max_dim;
-
+    var draw_extent: f32;
+if (direction < 1.5) {
+    draw_extent = screen_h;  // Up / Down -> height
+} else {
+    draw_extent = screen_w;  // Right / Left -> width
+}
+let draw_height = current_height * draw_extent;
     // Outside the bar (above the top)
     if (local_y > draw_height) {
         // Peak hold line
