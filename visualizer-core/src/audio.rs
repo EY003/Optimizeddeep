@@ -535,7 +535,10 @@ impl AudioProcessor {
             }
         }
 
-        self.update_ballistics(&self.smoothed, s, dt);
+        // Avoid borrow checker issue by temporarily moving `smoothed` out
+        let smoothed = std::mem::take(&mut self.smoothed);
+        self.update_ballistics(&smoothed, s, dt);
+        self.smoothed = smoothed;
         
         let (beat, phase) = if !is_silent {
             self.detect_rhythm(s, dt)
