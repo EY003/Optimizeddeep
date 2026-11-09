@@ -14,10 +14,14 @@ use crate::config::{
     WeightingCurve, WindowFunction,
 };
 
-#[derive(Clone, Debug, Default)]
+// ─────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
 pub struct BarFrame {
-    pub values: Arc<Vec<f32>>,
-    pub peaks: Arc<Vec<f32>>,
+    pub values: Vec<f32>,
+    pub peaks: Vec<f32>,
     pub beat: bool,
     pub beat_envelope: f32,
     pub bpm: f32,
@@ -26,20 +30,20 @@ pub struct BarFrame {
 
 pub struct AudioEngine {
     pub device_name: String,
-    pub shared_frame: Arc<ArcSwap<BarFrame>>,
+    pub frame_rx: Receiver<BarFrame>,
     pub settings: Arc<ArcSwap<AudioSettings>>,
 }
 
 impl AudioEngine {
     pub fn new(initial: AudioSettings) -> Self {
         let settings = Arc::new(ArcSwap::from_pointee(initial));
-        let shared_frame = Arc::new(ArcSwap::from_pointee(BarFrame::default()));
 
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
         let (sample_tx, sample_rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
         let (info_tx, info_rx) = crossbeam_channel::bounded(1);
 
         let settings_for_capture = settings.clone();
-        thread::spawn(move || {
+        let capture_handle = thread::spawn(move || {
             capture_loop(settings_for_capture, sample_tx, info_tx);
         });
 
@@ -48,15 +52,18 @@ impl AudioEngine {
             .unwrap_or_else(|_| ("Unknown".to_string(), 48000.0));
 
         let settings_for_analysis = settings.clone();
-        let shared_frame_analysis = shared_frame.clone();
-        
         thread::spawn(move || {
-            analysis_loop(settings_for_analysis, sample_rx, shared_frame_analysis, sample_rate);
+            analysis_loop(settings_for_analysis, sample_rx, frame_tx, sample_rate);
         });
 
-        Self { device_name, shared_frame, settings }
+        drop(capture_handle);
+        Self { device_name, frame_rx, settings }
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+// Capture thread (unchanged apart from channel mix read)
+// ─────────────────────────────────────────────────────────────
 
 fn capture_loop(
     settings: Arc<ArcSwap<AudioSettings>>,
@@ -166,18 +173,24 @@ fn capture_loop(
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Analysis thread
+// ─────────────────────────────────────────────────────────────
+
 fn analysis_loop(
     settings: Arc<ArcSwap<AudioSettings>>,
     sample_rx: Receiver<Vec<f32>>,
-    shared_frame: Arc<ArcSwap<BarFrame>>,
+    frame_tx: Sender<BarFrame>,
     sample_rate: f32,
 ) {
     let mut processor = AudioProcessor::new(sample_rate);
     let mut history: Vec<f32> = Vec::with_capacity(16_384);
     let mut last_tick = Instant::now();
 
+    // One-pole DC blocker state
     let mut dc_x = 0.0f32;
     let mut dc_y = 0.0f32;
+    // Coefficient for ~10 Hz cutoff at the current sample rate.
     let dc_alpha = {
         let rc = 1.0 / (2.0 * std::f32::consts::PI * 10.0);
         let dt = 1.0 / sample_rate.max(1.0);
@@ -210,16 +223,19 @@ fn analysis_loop(
         last_tick = Instant::now();
 
         if let Some(frame) = processor.process(&history, &current, dt) {
-            shared_frame.store(Arc::new(frame));
+            let _ = frame_tx.try_send(frame);
         }
 
-        let deadline = last_tick + poll_period;
-        let now = Instant::now();
-        if now < deadline {
-            thread::sleep(deadline - now);
+        let elapsed = last_tick.elapsed();
+        if elapsed < poll_period {
+            spin_sleep::sleep(poll_period - elapsed);
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+// The processor
+// ─────────────────────────────────────────────────────────────
 
 struct AudioProcessor {
     sample_rate: f32,
@@ -236,7 +252,7 @@ struct AudioProcessor {
     cached_min_freq: f32,
     cached_max_freq: f32,
     bin_ranges: Vec<(usize, usize)>,
-    bin_centers_hz: Vec<f32>,
+    bin_centers_hz: Vec<f32>,  // precomputed centre frequency for each bar
 
     bar_values: Vec<f32>,
     bar_peaks: Vec<f32>,
@@ -252,11 +268,6 @@ struct AudioProcessor {
     phase: f32,
     beat_envelope: f32,
     time_elapsed: f64,
-
-    raw_bars: Vec<f32>,
-    mapped: Vec<f32>,
-    smoothed: Vec<f32>,
-    tmp: Vec<f32>,
 }
 
 impl AudioProcessor {
@@ -270,8 +281,7 @@ impl AudioProcessor {
         let scratch_buffer = fft.make_scratch_vec();
 
         let window = make_window(window_fn, fft_size);
-        let num_bars = 80;
-        let bin_ranges = make_bin_ranges(fft_size, num_bars, FrequencyScaling::Logarithmic,
+        let bin_ranges = make_bin_ranges(fft_size, 80, FrequencyScaling::Logarithmic,
                                           sample_rate, 30.0, 16000.0);
         let bin_centers_hz = centers_from_ranges(&bin_ranges, fft_size, sample_rate);
 
@@ -284,16 +294,16 @@ impl AudioProcessor {
             input_buffer,
             output_buffer,
             scratch_buffer,
-            cached_num_bars: num_bars,
+            cached_num_bars: 80,
             cached_scaling: FrequencyScaling::Logarithmic,
             cached_min_freq: 30.0,
             cached_max_freq: 16000.0,
             bin_ranges,
             bin_centers_hz,
-            bar_values: vec![0.0; num_bars],
-            bar_peaks: vec![0.0; num_bars],
-            bar_velocities: vec![0.0; num_bars],
-            peak_hold_remaining: vec![0.0; num_bars],
+            bar_values: vec![0.0; 80],
+            bar_peaks: vec![0.0; 80],
+            bar_velocities: vec![0.0; 80],
+            peak_hold_remaining: vec![0.0; 80],
             frame_history: VecDeque::with_capacity(16),
             agc_envelope: 1.0,
             beat_energy_history: VecDeque::with_capacity(240),
@@ -302,10 +312,6 @@ impl AudioProcessor {
             phase: 0.0,
             beat_envelope: 0.0,
             time_elapsed: 0.0,
-            raw_bars: vec![0.0; num_bars],
-            mapped: vec![0.0; num_bars],
-            smoothed: vec![0.0; num_bars],
-            tmp: vec![0.0; num_bars],
         }
     }
 
@@ -348,10 +354,6 @@ impl AudioProcessor {
         self.bar_peaks.resize(n, 0.0);
         self.bar_velocities.resize(n, 0.0);
         self.peak_hold_remaining.resize(n, 0.0);
-        self.raw_bars.resize(n, 0.0);
-        self.mapped.resize(n, 0.0);
-        self.smoothed.resize(n, 0.0);
-        self.tmp.resize(n, 0.0);
         for f in self.frame_history.iter_mut() { f.resize(n, 0.0); }
     }
 
@@ -362,8 +364,8 @@ impl AudioProcessor {
         let n_fft = self.cached_fft_size;
         if history.len() < n_fft {
             return Some(BarFrame {
-                values: Arc::new(self.bar_values.clone()),
-                peaks: Arc::new(self.bar_peaks.clone()),
+                values: self.bar_values.clone(),
+                peaks: self.bar_peaks.clone(),
                 beat: false,
                 beat_envelope: self.beat_envelope,
                 bpm: self.bpm,
@@ -372,24 +374,7 @@ impl AudioProcessor {
         }
         let window_slice = &history[history.len() - n_fft..];
 
-        let max_val = window_slice.iter().map(|x| x.abs()).fold(0.0, f32::max);
-        let is_silent = max_val < 1e-6;
-
-        if is_silent {
-            for v in self.bar_values.iter_mut() { *v *= 0.9; }
-            for p in self.bar_peaks.iter_mut() { *p *= 0.9; }
-            self.beat_envelope *= 0.9;
-
-            return Some(BarFrame {
-                values: Arc::new(self.bar_values.clone()),
-                peaks: Arc::new(self.bar_peaks.clone()),
-                beat: false,
-                beat_envelope: self.beat_envelope,
-                bpm: self.bpm,
-                phase: self.phase,
-            });
-        }
-
+        // AGC (before windowing)
         let raw_rms = {
             let sum_sq: f32 = window_slice.iter().map(|x| x * x).sum();
             (sum_sq / n_fft as f32).sqrt()
@@ -420,7 +405,8 @@ impl AudioProcessor {
         let nyquist = n_fft / 2;
         let norm = 1.0 / (n_fft as f32 / 2.0) * user_gain;
 
-        self.raw_bars.fill(0.0);
+        // ── raw per-bar magnitudes (linear) ───────────────────────
+        let mut raw_bars = vec![0.0f32; num_bars];
         for (i, range) in self.bin_ranges.iter().enumerate().take(num_bars) {
             let (start, end) = *range;
             let end = end.min(nyquist).max(start + 1);
@@ -429,48 +415,53 @@ impl AudioProcessor {
                 mag += self.output_buffer[bin].norm();
             }
             mag /= (end - start) as f32;
-            self.raw_bars[i] = (mag * norm + 1e-9).max(1e-9);
+            raw_bars[i] = (mag * norm + 1e-9).max(1e-9);
         }
 
+        // ── frequency-domain smoothing (linear space) ─────────────
         if s.frequency_smoothing > 0.0 {
             let alpha = s.frequency_smoothing.clamp(0.0, 1.0);
-            self.tmp.copy_from_slice(&self.raw_bars);
+            let mut tmp = raw_bars.clone();
             for i in 0..num_bars {
                 let lo = i.saturating_sub(1);
                 let hi = (i + 1).min(num_bars - 1);
-                let avg = (self.raw_bars[lo] + self.raw_bars[i] * 2.0 + self.raw_bars[hi]) * 0.25;
-                self.tmp[i] = self.raw_bars[i] * (1.0 - alpha) + avg * alpha;
+                let avg = (raw_bars[lo] + raw_bars[i] * 2.0 + raw_bars[hi]) * 0.25;
+                tmp[i] = raw_bars[i] * (1.0 - alpha) + avg * alpha;
             }
-            self.raw_bars.copy_from_slice(&self.tmp);
+            raw_bars = tmp;
         }
 
+        // ── harmonic emphasis (peak smearing) ─────────────────────
         if s.harmonic_emphasis && num_bars >= 5 {
-            self.tmp.copy_from_slice(&self.raw_bars);
+            let mut bloom = raw_bars.clone();
             for i in 2..num_bars - 2 {
-                let c = self.raw_bars[i];
-                let l1 = self.raw_bars[i - 1];
-                let r1 = self.raw_bars[i + 1];
-                let l2 = self.raw_bars[i - 2];
-                let r2 = self.raw_bars[i + 2];
+                let c = raw_bars[i];
+                let l1 = raw_bars[i - 1];
+                let r1 = raw_bars[i + 1];
+                let l2 = raw_bars[i - 2];
+                let r2 = raw_bars[i + 2];
+                // Only bloom true local maxima above a floor
                 if c > l1 && c > r1 && c > l2 && c > r2 && c > 0.005 {
                     let spread = c * 0.15;
-                    self.tmp[i - 1] = self.tmp[i - 1].max(spread * 0.7);
-                    self.tmp[i + 1] = self.tmp[i + 1].max(spread * 0.7);
-                    self.tmp[i - 2] = self.tmp[i - 2].max(spread * 0.3);
-                    self.tmp[i + 2] = self.tmp[i + 2].max(spread * 0.3);
+                    bloom[i - 1] = bloom[i - 1].max(spread * 0.7);
+                    bloom[i + 1] = bloom[i + 1].max(spread * 0.7);
+                    bloom[i - 2] = bloom[i - 2].max(spread * 0.3);
+                    bloom[i + 2] = bloom[i + 2].max(spread * 0.3);
                 }
             }
-            self.raw_bars.copy_from_slice(&self.tmp);
+            raw_bars = bloom;
         }
 
+        // ── dB mapping with tilt / EQ / weighting ─────────────────
         let sens_norm = (s.sensitivity / 100.0).clamp(0.0, 1.0);
         let min_db_effective = s.min_decibels - (sens_norm - 0.5) * 20.0;
         let db_span = (s.max_decibels - min_db_effective).max(1.0);
         let target_ratio = db_span / s.target_dynamic_range_db.max(1.0);
         let gamma = s.response_gamma.max(0.1) * target_ratio;
 
+        let mut mapped = vec![0.0f32; num_bars];
         for i in 0..num_bars {
-            let db = 20.0 * self.raw_bars[i].log10();
+            let db = 20.0 * raw_bars[i].log10();
             let center_freq = self.bin_centers_hz.get(i).copied().unwrap_or(1000.0);
 
             let octaves_from_1k = (center_freq / 1000.0).log2();
@@ -496,38 +487,41 @@ impl AudioProcessor {
             if n01 < s.noise_gate {
                 n01 = 0.0;
             }
-            self.mapped[i] = n01.powf(gamma);
+            mapped[i] = n01.powf(gamma);
         }
 
+        // ── time-domain smoothing (average_size) ──────────────────
         let avg = s.average_size.max(1);
         while self.frame_history.len() >= avg { self.frame_history.pop_front(); }
-        self.frame_history.push_back(self.mapped.clone());
+        self.frame_history.push_back(mapped);
 
-        self.smoothed.fill(0.0);
-        let count = self.frame_history.len() as f32;
-        for frame in &self.frame_history {
-            for i in 0..num_bars.min(frame.len()) {
-                self.smoothed[i] += frame[i];
+        let mut smoothed: Vec<f32> = {
+            let n = num_bars;
+            let count = self.frame_history.len() as f32;
+            let mut out = vec![0.0f32; n];
+            for frame in &self.frame_history {
+                for i in 0..n.min(frame.len()) {
+                    out[i] += frame[i];
+                }
             }
-        }
-        for x in self.smoothed.iter_mut() { *x /= count.max(1.0); }
+            for x in &mut out { *x /= count.max(1.0); }
+            out
+        };
 
+        // ── per-frame peak normalization ──────────────────────────
         if s.per_frame_normalization {
-            let peak = self.smoothed.iter().cloned().fold(0.0f32, f32::max);
+            let peak = smoothed.iter().cloned().fold(0.0f32, f32::max);
             if peak > 0.001 {
-                for v in self.smoothed.iter_mut() { *v /= peak; }
+                for v in smoothed.iter_mut() { *v /= peak; }
             }
         }
 
-        let smoothed = std::mem::take(&mut self.smoothed);
         self.update_ballistics(&smoothed, s, dt);
-        self.smoothed = smoothed;
-
         let (beat, phase) = self.detect_rhythm(s, dt);
 
         Some(BarFrame {
-            values: Arc::new(self.bar_values.clone()),
-            peaks: Arc::new(self.bar_peaks.clone()),
+            values: self.bar_values.clone(),
+            peaks: self.bar_peaks.clone(),
             beat,
             beat_envelope: self.beat_envelope,
             bpm: self.bpm,
@@ -540,6 +534,7 @@ impl AudioProcessor {
         let peak_hold_s = s.peak_hold_ms / 1000.0;
 
         for i in 0..n {
+            // Per-bar ballistics selection
             let (atk_ms, dec_ms) = if s.per_band_ballistics {
                 let f = self.bin_centers_hz.get(i).copied().unwrap_or(1000.0);
                 if f < 250.0 {
@@ -641,6 +636,7 @@ impl AudioProcessor {
             self.recompute_bpm();
         }
 
+        // Beat envelope (fast attack to 1.0, exponential release)
         if is_beat {
             self.beat_envelope = 1.0;
         } else if self.beat_envelope > 0.0 {
@@ -672,6 +668,10 @@ impl AudioProcessor {
         if median > 0.001 { self.bpm = (60.0 / median) as f32; }
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
 
 fn make_window(kind: WindowFunction, n: usize) -> Vec<f32> {
     let mut w = vec![0.0f32; n];
@@ -744,6 +744,7 @@ fn centers_from_ranges(ranges: &[(usize, usize)], fft_size: usize, sample_rate: 
     }).collect()
 }
 
+/// Standard A-weighting in dB (IEC 61672:2003).
 fn a_weighting_db(f: f32) -> f32 {
     let f = f.max(10.0);
     let f2 = f * f;
@@ -755,6 +756,7 @@ fn a_weighting_db(f: f32) -> f32 {
     20.0 * ra.log10() + 2.0
 }
 
+/// Simplified K-weighting (ITU-R BS.1770) — high-shelf + gentle high-pass.
 fn k_weighting_db(f: f32) -> f32 {
     let f = f.max(10.0);
     let shelf = 4.0 * (1.0 - 1.0 / (1.0 + (f / 1500.0).powi(4)));
