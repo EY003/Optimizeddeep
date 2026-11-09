@@ -31,6 +31,9 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
 };
 
+use bytemuck::{Pod, Zeroable};
+use egui_wgpu::{CallbackTrait, wgpu};
+
 #[cfg(windows)]
 #[link(name = "winmm")]
 extern "system" {
@@ -39,7 +42,178 @@ extern "system" {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Custom Icon Loader
+// Shader / wgpu Structs
+// ═══════════════════════════════════════════════════════════════
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct GpuBar {
+    pub height: f32,
+    pub peak_height: f32,
+    pub color_top: [f32; 4],
+    pub color_bottom: [f32; 4],
+    pub show_peak: f32,
+    pub _padding: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct ShaderUniforms {
+    pub num_bars: u32,
+    pub is_vertical: u32,
+    pub is_smooth: u32,
+    pub is_mirrored: u32,
+    pub bar_width: f32,
+    pub bar_gap: f32,
+    pub screen_width: f32,
+    pub screen_height: f32,
+    pub outline_thickness: f32,
+    pub outline_color: [f32; 4],
+    pub bar_radius: f32,
+    pub opacity: f32,
+    pub direction: u32,
+    pub _padding: [f32; 3],
+}
+
+pub struct VisualizerResources {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group: wgpu::BindGroup,
+    pub bar_buffer: wgpu::Buffer,
+    pub uniform_buffer: wgpu::Buffer,
+}
+
+pub struct VisualizerCallback {
+    pub bars: Vec<GpuBar>,
+    pub uniforms: ShaderUniforms,
+}
+
+impl CallbackTrait for VisualizerCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let resources: &mut VisualizerResources = callback_resources.get_mut().unwrap();
+
+        queue.write_buffer(&resources.bar_buffer, 0, bytemuck::cast_slice(&self.bars));
+        queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
+
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        let resources: &VisualizerResources = callback_resources.get().unwrap();
+        render_pass.set_pipeline(&resources.pipeline);
+        render_pass.set_bind_group(0, &resources.bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+}
+
+fn setup_wgpu(render_state: &egui_wgpu::RenderState) -> VisualizerResources {
+    let device = &render_state.device;
+    
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Visualizer Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("visualizer.wgsl").into()),
+    });
+
+    let bar_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Bar Buffer"),
+        size: (std::mem::size_of::<GpuBar>() * 256) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Uniform Buffer"),
+        size: std::mem::size_of::<ShaderUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+        label: Some("Visualizer Bind Group Layout"),
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: bar_buffer.as_entire_binding(),
+            },
+        ],
+        label: Some("Visualizer Bind Group"),
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Visualizer Pipeline Layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Visualizer Pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: render_state.target_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    VisualizerResources { pipeline, bind_group, bar_buffer, uniform_buffer }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Utilities
 // ═══════════════════════════════════════════════════════════════
 
 fn load_icon() -> (egui::IconData, tray_icon::Icon) {
@@ -54,10 +228,6 @@ fn load_icon() -> (egui::IconData, tray_icon::Icon) {
     let tray = tray_icon::Icon::from_rgba(raw, w, h).unwrap();
     (egui_icon, tray)
 }
-
-// ═══════════════════════════════════════════════════════════════
-// Small utilities
-// ═══════════════════════════════════════════════════════════════
 
 fn hash_u32(mut x: u32) -> u32 {
     x ^= x >> 16;
@@ -81,14 +251,6 @@ fn wipe_blend(pos: f32, boundary: f32, softness: f32, hard: bool) -> f32 {
     } else {
         smoothstep(boundary - softness, boundary + softness, pos)
     }
-}
-
-fn lerp_color(c1: egui::Color32, c2: egui::Color32, t: f32) -> egui::Color32 {
-    let r = c1.r() as f32 * (1.0 - t) + c2.r() as f32 * t;
-    let g = c1.g() as f32 * (1.0 - t) + c2.g() as f32 * t;
-    let b = c1.b() as f32 * (1.0 - t) + c2.b() as f32 * t;
-    let a = c1.a() as f32 * (1.0 - t) + c2.a() as f32 * t;
-    egui::Color32::from_rgba_unmultiplied(r as u8, g as u8, b as u8, a as u8)
 }
 
 fn static_multi_vertical_color(colors: &[[u8; 3]], t: f32, blocks: bool) -> egui::Color32 {
@@ -115,97 +277,6 @@ fn static_multi_vertical_color(colors: &[[u8; 3]], t: f32, blocks: bool) -> egui
             (a[2] as f32 * (1.0 - f) + b[2] as f32 * f) as u8,
         )
     }
-}
-
-fn segment_rect(rect: egui::Rect, dir: VisualizerDirection, t0: f32, t1: f32) -> egui::Rect {
-    let h = rect.height();
-    let w = rect.width();
-    match dir {
-        VisualizerDirection::Up => egui::Rect::from_min_max(
-            egui::pos2(rect.left(), rect.bottom() - h * t1),
-            egui::pos2(rect.right(), rect.bottom() - h * t0),
-        ),
-        VisualizerDirection::Down => egui::Rect::from_min_max(
-            egui::pos2(rect.left(), rect.top() + h * t0),
-            egui::pos2(rect.right(), rect.top() + h * t1),
-        ),
-        VisualizerDirection::Right => egui::Rect::from_min_max(
-            egui::pos2(rect.left() + w * t0, rect.top()),
-            egui::pos2(rect.left() + w * t1, rect.bottom()),
-        ),
-        VisualizerDirection::Left => egui::Rect::from_min_max(
-            egui::pos2(rect.right() - w * t1, rect.top()),
-            egui::pos2(rect.right() - w * t0, rect.bottom()),
-        ),
-    }
-}
-
-fn segment_rounding(dir: VisualizerDirection, is_first: bool, is_last: bool, radius: f32) -> egui::Rounding {
-    let mut r = egui::Rounding::ZERO;
-    if !is_first && !is_last { return r; }
-    match dir {
-        VisualizerDirection::Up => {
-            if is_last  { r.nw = radius; r.ne = radius; }
-            if is_first { r.sw = radius; r.se = radius; }
-        }
-        VisualizerDirection::Down => {
-            if is_first { r.nw = radius; r.ne = radius; }
-            if is_last  { r.sw = radius; r.se = radius; }
-        }
-        VisualizerDirection::Right => {
-            if is_first { r.nw = radius; r.sw = radius; }
-            if is_last  { r.ne = radius; r.se = radius; }
-        }
-        VisualizerDirection::Left => {
-            if is_first { r.ne = radius; r.se = radius; }
-            if is_last  { r.nw = radius; r.sw = radius; }
-        }
-    }
-    r
-}
-
-fn bar_vertex(dir: VisualizerDirection, perp: f32, anchor: f32, len: f32, t: f32) -> egui::Pos2 {
-    match dir {
-        VisualizerDirection::Up    => egui::pos2(perp, anchor - len * t),
-        VisualizerDirection::Down  => egui::pos2(perp, anchor + len * t),
-        VisualizerDirection::Right => egui::pos2(anchor + len * t, perp),
-        VisualizerDirection::Left  => egui::pos2(anchor - len * t, perp),
-    }
-}
-
-fn draw_peak_hold(
-    painter: &egui::Painter,
-    dir: VisualizerDirection,
-    anchor: f32,
-    perp: f32,
-    peak_len: f32,
-    bar_width: f32,
-    color: egui::Color32,
-    is_smooth: bool,
-) {
-    let pos = bar_vertex(dir, perp, anchor, peak_len, 1.0);
-    if is_smooth {
-        painter.circle_filled(pos, (bar_width / 4.0).clamp(1.0, 3.0), color);
-    } else {
-        let dash_size = match dir {
-            VisualizerDirection::Up | VisualizerDirection::Down => egui::vec2(bar_width, 3.0),
-            VisualizerDirection::Left | VisualizerDirection::Right => egui::vec2(3.0, bar_width),
-        };
-        let rect = egui::Rect::from_center_size(pos, dash_size);
-        painter.rect_filled(rect, 1.0, color);
-    }
-}
-
-#[derive(Clone, Copy)]
-struct MotionSample {
-    phase_a: f32, phase_b: f32, blend_t: f32, intensity: f32,
-}
-impl Default for MotionSample {
-    fn default() -> Self { Self { phase_a: 0.0, phase_b: 0.0, blend_t: 0.0, intensity: 1.0 } }
-}
-
-fn random_color_index(i: usize, num_colors: usize) -> usize {
-    (hash_u32(i as u32) as usize) % num_colors
 }
 
 fn stops_from_colors(colors: &[[u8; 3]]) -> Vec<GradientStop> {
@@ -236,7 +307,7 @@ fn frequency_index(i: usize, base_num_bars: usize, dir: FrequencyDirection) -> u
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Fonts & Palette Caches (Unchanged)
+// UI & Palette Caches
 // ═══════════════════════════════════════════════════════════════
 
 const CUSTOM_FONT_FAMILY: &str = "custom_track";
@@ -476,7 +547,7 @@ struct VisualizerApp {
     current_bars: Vec<f32>,
     current_peaks: Vec<f32>,
     last_bpm: f32,
-    audio_rx: crossbeam_channel::Receiver<BarFrame>,
+    shared_frame: Arc<ArcSwap<BarFrame>>,
     audio_settings: Arc<ArcSwap<visualizer_core::config::AudioSettings>>,
     should_quit: Arc<AtomicBool>,
     show_settings: bool,
@@ -501,7 +572,6 @@ struct VisualizerApp {
     system_fonts: Vec<(String, String)>,
     smtc_session_count: Arc<AtomicUsize>,
 
-    // settings UI state
     settings_tab: SettingsTab,
     color_subtab: ColorSubTab,
     settings_search: String,
@@ -509,14 +579,11 @@ struct VisualizerApp {
     settings_icon: egui::IconData,
     old_settings_scale: f32,
 
-    // activity scheduling
     last_audio_frame_time: Instant,
 
-    // background track-load
     track_load_tx: crossbeam_channel::Sender<TrackLoadResult>,
     track_load_rx: crossbeam_channel::Receiver<TrackLoadResult>,
 
-    // system
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
     settings_menu_id: tray_icon::menu::MenuId,
@@ -524,12 +591,13 @@ struct VisualizerApp {
 }
 
 impl VisualizerApp {
-    fn new() -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = AppConfig::load();
         let engine = AudioEngine::new(config.audio.clone());
         let should_quit = Arc::new(AtomicBool::new(false));
         musicbee::log_smtc("APP: Initializing VisualizerApp.");
         let audio_settings = engine.settings.clone();
+        let shared_frame = engine.shared_frame.clone();
         let (track_tx, track_rx) = crossbeam_channel::unbounded();
         let smtc_session_count = Arc::new(AtomicUsize::new(0));
         musicbee::spawn_smtc_listener(track_tx, should_quit.clone(), smtc_session_count.clone());
@@ -559,11 +627,16 @@ impl VisualizerApp {
 
         let (track_load_tx, track_load_rx) = crossbeam_channel::unbounded();
 
+        // WGPU Setup
+        let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("WGPU render state required");
+        let resources = setup_wgpu(wgpu_render_state);
+        wgpu_render_state.renderer.write().callback_resources.insert(resources);
+
         Self {
             current_bars: vec![0.0; num_bars],
             current_peaks: vec![0.0; num_bars],
             last_bpm: 0.0,
-            audio_rx: engine.frame_rx,
+            shared_frame,
             audio_settings,
             show_settings,
             config,
@@ -665,8 +738,6 @@ impl VisualizerApp {
         self.loaded_font_path = target;
     }
 
-    // ── Palettes ─────────────────────────────────────────────
-
     fn update_palettes(&mut self) {
         match self.config.color_mode {
             ColorMode::StaticSingle => self.update_static_single_palette(),
@@ -766,8 +837,6 @@ impl VisualizerApp {
         h.finish()
     }
 
-    // ── Color helpers ────────────────────────────────────────
-
     fn get_visualizer_text_color(&self, time: f32) -> [u8; 3] {
         match self.config.color_mode {
             ColorMode::StaticSingle => self.active_palettes.static_single_colors.first().copied().unwrap_or([255, 255, 255]),
@@ -777,7 +846,6 @@ impl VisualizerApp {
         }
     }
 
-    #[inline]
     fn apply_vis(&self, c: egui::Color32) -> egui::Color32 {
         let a = (c.a() as u32 * self.config.visualizer_opacity as u32 / 255) as u8;
         egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
@@ -866,27 +934,27 @@ impl VisualizerApp {
         egui::Color32::from_rgba_unmultiplied(r as u8, g as u8, b as u8, (a * 255.0) as u8)
     }
 
-    fn evaluate_motion(&self, shape: MotionShape, x: f32, y: f32, time: f32, base_t: f32) -> MotionSample {
+    fn evaluate_motion(&self, shape: MotionShape, x: f32, y: f32, time: f32, base_t: f32) -> cfg::MotionSample {
         let m = &self.config.color_change_motion;
         let hard = m.blend == BlendMode::Hard;
         let freq = m.wave_frequency;
         match shape {
-            MotionShape::Uniform => MotionSample { phase_a: base_t, intensity: 1.0, ..Default::default() },
+            MotionShape::Uniform => cfg::MotionSample { phase_a: base_t, intensity: 1.0, ..Default::default() },
             MotionShape::HorizontalWipe => {
                 let boundary = tri01(base_t * 0.5);
                 let t = wipe_blend(x, boundary, m.wipe_softness, hard);
-                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::VerticalWipe => {
                 let boundary = tri01(base_t * 0.5);
                 let t = wipe_blend(y, boundary, m.wipe_softness, hard);
-                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::DiagonalWipe => {
                 let boundary = tri01(base_t * 0.5);
                 let diag = (x + y) * 0.5;
                 let t = wipe_blend(diag, boundary, m.wipe_softness, hard);
-                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::RadialWipe => {
                 let boundary = tri01(base_t * 0.5);
@@ -894,7 +962,7 @@ impl VisualizerApp {
                 let dy = y - 0.5;
                 let r = (dx * dx + dy * dy).sqrt() * 2.0;
                 let t = wipe_blend(r, boundary, m.wipe_softness, hard);
-                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::Spiral => {
                 let dx = x - 0.5;
@@ -902,31 +970,31 @@ impl VisualizerApp {
                 let r = (dx * dx + dy * dy).sqrt() * 2.0;
                 let angle = dy.atan2(dx) / TAU + 0.5;
                 let t = (angle + r * 2.0 + base_t).fract();
-                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::WaveInterference => {
                 let wave1 = (x * freq * TAU + base_t * TAU).sin();
                 let wave2 = (y * freq * TAU + base_t * TAU * 0.7).sin();
                 let wave = (wave1 + wave2) * 0.25 + 0.5;
-                MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
             }
             MotionShape::Ripple => {
                 let dx = x - 0.5;
                 let dy = y - 0.5;
                 let r = (dx * dx + dy * dy).sqrt() * 2.0;
                 let wave = (r * 8.0 - base_t * TAU).sin() * 0.5 + 0.5;
-                MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
             }
-            MotionShape::SineWave => { let w = (x * freq * TAU + base_t * TAU).sin() * 0.5 + 0.5; MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
-            MotionShape::TriangleWave => { let w = tri01(x * freq + base_t); MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
-            MotionShape::SquareWave => { let w = ((x * freq + base_t).fract() < 0.5) as u8 as f32; MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
-            MotionShape::SawtoothWave => { let w = (x * freq + base_t).fract(); MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
+            MotionShape::SineWave => { let w = (x * freq * TAU + base_t * TAU).sin() * 0.5 + 0.5; cfg::MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
+            MotionShape::TriangleWave => { let w = tri01(x * freq + base_t); cfg::MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
+            MotionShape::SquareWave => { let w = ((x * freq + base_t).fract() < 0.5) as u8 as f32; cfg::MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
+            MotionShape::SawtoothWave => { let w = (x * freq + base_t).fract(); cfg::MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
             MotionShape::Strobe => {
                 let on = ((base_t * 4.0).fract() < 0.5) as u8 as f32;
                 let k = if hard { on } else { smoothstep(0.35, 0.65, on + base_t.fract() * 0.3) };
-                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
-            MotionShape::Pulse => { let k = (base_t * TAU).sin() * 0.5 + 0.5; MotionSample { phase_a: base_t, intensity: k, ..Default::default() } }
+            MotionShape::Pulse => { let k = (base_t * TAU).sin() * 0.5 + 0.5; cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() } }
             MotionShape::Heartbeat => {
                 let beat = base_t.fract();
                 let k = if hard {
@@ -936,7 +1004,7 @@ impl VisualizerApp {
                     let b = (-((beat - 0.22) / 0.04).powi(2)).exp() * 0.7;
                     (a + b).clamp(0.0, 1.0)
                 };
-                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: 0.0, intensity: k }
+                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: 0.0, intensity: k }
             }
             MotionShape::Stutter => {
                 let step = (time * 10.0) as u32;
@@ -944,7 +1012,7 @@ impl VisualizerApp {
                 let hash = hash_u32(step.wrapping_mul(37).wrapping_add(pos));
                 let event = (hash % 100) as f32 / 100.0 < m.stutter_intensity;
                 let offset = if event { 0.5 } else { 0.0 };
-                MotionSample { phase_a: base_t + offset, intensity: 1.0, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t + offset, intensity: 1.0, ..Default::default() }
             }
             MotionShape::Comet => {
                 let head = base_t.fract();
@@ -952,19 +1020,19 @@ impl VisualizerApp {
                 let dist = raw.min(1.0 - raw);
                 let k = (1.0 - dist / m.trail_length.max(0.01)).clamp(0.0, 1.0);
                 let k = if hard { (k > 0.5) as u8 as f32 } else { k };
-                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::Chase => {
                 let pos = (x - base_t * 0.5).rem_euclid(1.0);
                 let k = if hard { (pos < 0.15) as u8 as f32 } else { smoothstep(0.05, 0.15, 0.15 - (pos - 0.075).abs()) };
-                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::BouncingBall => {
                 let head = tri01(base_t * 0.5);
                 let dist = (x - head).abs();
                 let k = (1.0 - dist / m.trail_length.max(0.01)).clamp(0.0, 1.0);
                 let k = if hard { (k > 0.4) as u8 as f32 } else { k };
-                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::Sparkle => {
                 let step = (time * 12.0) as u32;
@@ -972,42 +1040,42 @@ impl VisualizerApp {
                 let hash = hash_u32(step.wrapping_mul(13).wrapping_add(pos));
                 let p = (hash % 100) as f32 / 100.0;
                 let on = p < 0.04 + m.stutter_intensity * 0.1;
-                MotionSample { phase_a: base_t + p, intensity: if on { 1.0 } else { 0.0 }, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t + p, intensity: if on { 1.0 } else { 0.0 }, ..Default::default() }
             }
             MotionShape::Sinelon => {
                 let head = tri01(base_t * 0.5);
                 let dist = (x - head).abs();
                 let k = (1.0 - dist / m.trail_length.max(0.01)).clamp(0.0, 1.0);
-                MotionSample { phase_a: base_t, intensity: k.powf(2.0), ..Default::default() }
+                cfg::MotionSample { phase_a: base_t, intensity: k.powf(2.0), ..Default::default() }
             }
             MotionShape::FireSimulation => {
                 let n = (base_t * 1.0 + x * 5.0).sin() + (base_t * 1.3 + x * 11.0).sin() * 0.5 + (base_t * 2.1 + x * 23.0).sin() * 0.25;
-                MotionSample { phase_a: base_t + n * 0.05, intensity: (n * 0.25 + 0.75).clamp(0.0, 1.0), ..Default::default() }
+                cfg::MotionSample { phase_a: base_t + n * 0.05, intensity: (n * 0.25 + 0.75).clamp(0.0, 1.0), ..Default::default() }
             }
             MotionShape::Plasma => {
                 let p = (x * 6.0 + base_t * 2.0).sin() + (y * 6.0 - base_t * 1.5).sin() + ((x + y) * 4.0 + base_t).sin();
-                MotionSample { phase_a: base_t + p * 0.08, intensity: 1.0, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t + p * 0.08, intensity: 1.0, ..Default::default() }
             }
-            MotionShape::RainbowCycle => MotionSample { phase_a: base_t + x, intensity: 1.0, ..Default::default() },
+            MotionShape::RainbowCycle => cfg::MotionSample { phase_a: base_t + x, intensity: 1.0, ..Default::default() },
             MotionShape::Confetti => {
                 let step = (time * 10.0) as u32;
                 let pos = (x * 400.0) as u32;
                 let hash = hash_u32(step.wrapping_mul(97).wrapping_add(pos));
                 let p = (hash % 100) as f32 / 100.0;
                 let on = p < m.stutter_intensity * 0.15;
-                MotionSample { phase_a: (hash % 1000) as f32 / 1000.0 + base_t * 0.1, intensity: if on { 1.0 } else { 0.0 }, ..Default::default() }
+                cfg::MotionSample { phase_a: (hash % 1000) as f32 / 1000.0 + base_t * 0.1, intensity: if on { 1.0 } else { 0.0 }, ..Default::default() }
             }
             MotionShape::Breathing => {
                 let k = (base_t * TAU * 0.5).sin() * 0.5 + 0.5;
-                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::FlipFlop => {
                 let k = if (base_t * 2.0).fract() < 0.5 { 1.0 } else { 0.0 };
-                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::Kaleidoscope => {
                 let wave = ((x * freq * TAU + base_t * TAU).sin() * (y * freq * TAU + base_t * TAU).cos()).abs();
-                MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
             }
             MotionShape::DigitalRain => {
                 let col = (x * 50.0) as u32;
@@ -1016,18 +1084,16 @@ impl VisualizerApp {
                 let y_offset = (hash % 1000) as f32 / 1000.0;
                 let pos = (y + base_t * speed + y_offset).fract();
                 let k = if pos < 0.2 { 1.0 - pos / 0.2 } else { 0.0 };
-                MotionSample { phase_a: base_t + col as f32 * 0.1, intensity: k, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t + col as f32 * 0.1, intensity: k, ..Default::default() }
             }
             MotionShape::MeteorShower => {
                 let head = base_t.fract() * 2.0;
                 let dist = ((x * 2.0 - head) % 1.0).abs();
                 let k = (1.0 - dist / 0.15).clamp(0.0, 1.0);
-                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
         }
     }
-
-    // ── Track info rendering ────────────────────────────────
 
     fn draw_styled_text(&self, ctx: &egui::Context, painter: &egui::Painter, text: &str, pos: egui::Pos2, font_id: &egui::FontId, align: egui::Align2, color: egui::Color32, cfg: &TrackInfoConfig) {
         if text.is_empty() { return; }
@@ -1124,961 +1190,106 @@ fn draw_spaced(ctx: &egui::Context, painter: &egui::Painter, text: &str, pos: eg
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Visualizer drawing
-// ═══════════════════════════════════════════════════════════════
-
 impl VisualizerApp {
-    fn draw_bar_outline(&self, painter: &egui::Painter, bar_rect: egui::Rect) {
-        if !self.config.visualizer_outline_enabled || self.config.visualizer_outline_thickness <= 0.0 { return; }
-        let c = self.config.visualizer_outline_color;
-        let color = self.apply_vis(egui::Color32::from_rgb(c[0], c[1], c[2]));
-        painter.rect_stroke(bar_rect, self.config.bar_radius,
-                            egui::Stroke::new(self.config.visualizer_outline_thickness, color));
-    }
-
-    fn draw_static_multi_vertical(&self, painter: &egui::Painter, rect: egui::Rect) {
+    fn draw_bars_gpu(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 { return; }
+
+        // Don't draw if everything is zeroed out
+        if self.current_bars.iter().all(|&v| v < 0.001) && self.current_peaks.iter().all(|&p| p < 0.001) {
+            return;
+        }
+
         let visual_num_bars = if self.config.frequency_direction == FrequencyDirection::Mirrored {
             base_num_bars * 2
-        } else { base_num_bars };
-        let bar_width = self.config.bar_width;
-        let gap = self.config.bar_gap;
-        let stride = bar_width + gap;
-        let total_size = visual_num_bars as f32 * stride - gap;
-        let max_h = self.config.max_bar_height;
-        let radius = self.config.bar_radius;
-        let freq_dir = self.config.frequency_direction;
-        let dir = self.config.visualizer_direction;
-        let is_blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
-        let is_smooth = self.config.bar_interpolation == BarInterpolation::Smooth;
-        let colors = &self.active_palettes.static_multi_colors;
-        if colors.is_empty() { return; }
-        let n_colors = colors.len();
-        let n_segments: usize = if is_blocks { n_colors } else { 32 };
-
-        let (start_pos, anchor, rect_len) = match dir {
-            VisualizerDirection::Up => (
-                rect.center().x - total_size / 2.0 + self.config.x_offset,
-                rect.bottom() + self.config.y_offset,
-                rect.height() * self.config.height_scale),
-            VisualizerDirection::Down => (
-                rect.center().x - total_size / 2.0 + self.config.x_offset,
-                rect.top() + self.config.y_offset,
-                rect.height() * self.config.height_scale),
-            VisualizerDirection::Right => (
-                rect.center().y - total_size / 2.0 + self.config.y_offset,
-                rect.left() + self.config.x_offset,
-                rect.width() * self.config.height_scale),
-            VisualizerDirection::Left => (
-                rect.center().y - total_size / 2.0 + self.config.y_offset,
-                rect.right() + self.config.x_offset,
-                rect.width() * self.config.height_scale),
+        } else {
+            base_num_bars
         };
 
-        if !is_smooth {
-            for i in 0..visual_num_bars {
-                let idx = frequency_index(i, base_num_bars, freq_dir);
-                let len = (self.current_bars[idx] * rect_len).min(if max_h > 0.0 { max_h } else { rect_len });
-                if len <= 0.5 { continue; }
-                let bar_rect = match dir {
-                    VisualizerDirection::Up => {
-                        let x = start_pos + i as f32 * stride;
-                        egui::Rect::from_min_max(egui::pos2(x, anchor - len), egui::pos2(x + bar_width, anchor))
-                    }
-                    VisualizerDirection::Down => {
-                        let x = start_pos + i as f32 * stride;
-                        egui::Rect::from_min_max(egui::pos2(x, anchor), egui::pos2(x + bar_width, anchor + len))
-                    }
-                    VisualizerDirection::Right => {
-                        let y = start_pos + i as f32 * stride;
-                        egui::Rect::from_min_max(egui::pos2(anchor, y), egui::pos2(anchor + len, y + bar_width))
-                    }
-                    VisualizerDirection::Left => {
-                        let y = start_pos + i as f32 * stride;
-                        egui::Rect::from_min_max(egui::pos2(anchor - len, y), egui::pos2(anchor, y + bar_width))
-                    }
-                };
-                for k in 0..n_segments {
-                    let t0 = k as f32 / n_segments as f32;
-                    let t1 = (k + 1) as f32 / n_segments as f32;
-                    let t_mid = (t0 + t1) * 0.5;
-                    let seg_rect = segment_rect(bar_rect, dir, t0, t1);
-                    let r = segment_rounding(dir, k == 0, k == n_segments - 1, radius);
-                    let c = self.apply_vis(static_multi_vertical_color(colors, t_mid, is_blocks));
-                    painter.rect_filled(seg_rect, r, c);
-                }
-                self.draw_bar_outline(painter, bar_rect);
-                if self.config.audio.peak_hold_ms > 0.0 {
-                    let mut peak_len = self.current_peaks[idx] * rect_len;
-                    if max_h > 0.0 { peak_len = peak_len.min(max_h); }
-                    if peak_len > 0.001 {
-                        let center = start_pos + i as f32 * stride + bar_width / 2.0;
-                        let t = (peak_len / rect_len).clamp(0.0, 1.0);
-                        let c = self.apply_vis(static_multi_vertical_color(colors, t, is_blocks));
-                        draw_peak_hold(painter, dir, anchor, center, peak_len, bar_width, c, false);
-                    }
-                }
-            }
-            return;
-        }
-
-        let mut bars: Vec<(f32, f32)> = Vec::with_capacity(visual_num_bars);
-        for i in 0..visual_num_bars {
-            let idx = frequency_index(i, base_num_bars, freq_dir);
-            let len = (self.current_bars[idx] * rect_len).min(if max_h > 0.0 { max_h } else { rect_len });
-            let center = start_pos + i as f32 * stride + bar_width / 2.0;
-            bars.push((center, len));
-        }
-        let extended: Vec<(f32, f32)> = {
-            let mut v = Vec::with_capacity(bars.len() + 2);
-            v.push((start_pos, bars[0].1));
-            v.extend(bars.iter().copied());
-            v.push((start_pos + total_size, bars.last().unwrap().1));
-            v
-        };
-        let steps = 4usize;
-        let mut mesh = egui::Mesh::default();
-        mesh.vertices.reserve(extended.len() * steps * n_segments * 4);
-        mesh.indices.reserve(extended.len() * steps * n_segments * 6);
-        macro_rules! push_quad {
-            ($p1:expr, $c1:expr, $p2:expr, $c2:expr, $p3:expr, $c3:expr, $p4:expr, $c4:expr) => {{
-                let base = mesh.vertices.len() as u32;
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p1, uv: egui::Pos2::ZERO, color: $c1 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p2, uv: egui::Pos2::ZERO, color: $c2 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p3, uv: egui::Pos2::ZERO, color: $c3 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p4, uv: egui::Pos2::ZERO, color: $c4 });
-                mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-            }};
-        }
-        for i in 0..extended.len() - 1 {
-            let (perp_i, len_i) = extended[i];
-            let (perp_j, len_j) = extended[i + 1];
-            for s in 0..steps {
-                let t1 = s as f32 / steps as f32;
-                let t2 = (s + 1) as f32 / steps as f32;
-                let ts1 = smoothstep(0.0, 1.0, t1);
-                let ts2 = smoothstep(0.0, 1.0, t2);
-                let perp1 = perp_i + (perp_j - perp_i) * t1;
-                let perp2 = perp_i + (perp_j - perp_i) * t2;
-                let len1 = len_i + (len_j - len_i) * ts1;
-                let len2 = len_i + (len_j - len_i) * ts2;
-                for k in 0..n_segments {
-                    let t_bot = k as f32 / n_segments as f32;
-                    let t_top = (k + 1) as f32 / n_segments as f32;
-                    let t_mid = (t_bot + t_top) * 0.5;
-                    let c = self.apply_vis(static_multi_vertical_color(colors, t_mid, is_blocks));
-                    let p1 = bar_vertex(dir, perp1, anchor, len1, t_top);
-                    let p2 = bar_vertex(dir, perp2, anchor, len2, t_top);
-                    let p3 = bar_vertex(dir, perp2, anchor, len2, t_bot);
-                    let p4 = bar_vertex(dir, perp1, anchor, len1, t_bot);
-                    push_quad!(p1, c, p2, c, p3, c, p4, c);
-                }
-            }
-        }
-        painter.add(egui::Shape::mesh(mesh));
-        if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
-            for i in 0..visual_num_bars {
-                let (center, len) = bars[i];
-                let half = bar_width / 2.0;
-                let bar_rect = match dir {
-                    VisualizerDirection::Up => egui::Rect::from_min_max(egui::pos2(center - half, anchor - len), egui::pos2(center + half, anchor)),
-                    VisualizerDirection::Down => egui::Rect::from_min_max(egui::pos2(center - half, anchor), egui::pos2(center + half, anchor + len)),
-                    VisualizerDirection::Right => egui::Rect::from_min_max(egui::pos2(anchor, center - half), egui::pos2(anchor + len, center + half)),
-                    VisualizerDirection::Left => egui::Rect::from_min_max(egui::pos2(anchor - len, center - half), egui::pos2(anchor, center + half)),
-                };
-                self.draw_bar_outline(painter, bar_rect);
-            }
-        }
-        if self.config.audio.peak_hold_ms > 0.0 {
-            for i in 0..visual_num_bars {
-                let idx = frequency_index(i, base_num_bars, freq_dir);
-                let mut peak_len = self.current_peaks[idx] * rect_len;
-                if max_h > 0.0 { peak_len = peak_len.min(max_h); }
-                if peak_len > 0.001 {
-                    let center = start_pos + i as f32 * stride + bar_width / 2.0;
-                    let t = (peak_len / rect_len).clamp(0.0, 1.0);
-                    let c = self.apply_vis(static_multi_vertical_color(colors, t, is_blocks));
-                    draw_peak_hold(painter, dir, anchor, center, peak_len, bar_width, c, true);
-                }
-            }
-        }
-    }
-
-    fn draw_animated_vertical(&self, painter: &egui::Painter, rect: egui::Rect, time: f32) {
-        let base_num_bars = self.current_bars.len();
-        if base_num_bars == 0 { return; }
-        let visual_num_bars = if self.config.frequency_direction == FrequencyDirection::Mirrored {
-            base_num_bars * 2
-        } else { base_num_bars };
-        let bar_width = self.config.bar_width;
-        let gap = self.config.bar_gap;
-        let stride = bar_width + gap;
-        let total_size = visual_num_bars as f32 * stride - gap;
-        let max_h = self.config.max_bar_height;
-        let radius = self.config.bar_radius;
-        let freq_dir = self.config.frequency_direction;
-        let dir = self.config.visualizer_direction;
-        let is_blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
-        let is_smooth = self.config.bar_interpolation == BarInterpolation::Smooth;
-        let palette_len = self.active_palettes.animated_colors.len().max(1);
-        let n_segments: usize = if is_blocks { palette_len.clamp(6, 16) } else { 24 };
-
-        let (start_pos, anchor, rect_len) = match dir {
-            VisualizerDirection::Up => (
-                rect.center().x - total_size / 2.0 + self.config.x_offset,
-                rect.bottom() + self.config.y_offset,
-                rect.height() * self.config.height_scale),
-            VisualizerDirection::Down => (
-                rect.center().x - total_size / 2.0 + self.config.x_offset,
-                rect.top() + self.config.y_offset,
-                rect.height() * self.config.height_scale),
-            VisualizerDirection::Right => (
-                rect.center().y - total_size / 2.0 + self.config.y_offset,
-                rect.left() + self.config.x_offset,
-                rect.width() * self.config.height_scale),
-            VisualizerDirection::Left => (
-                rect.center().y - total_size / 2.0 + self.config.y_offset,
-                rect.right() + self.config.x_offset,
-                rect.width() * self.config.height_scale),
-        };
-
-        if !is_smooth {
-            for i in 0..visual_num_bars {
-                let idx = frequency_index(i, base_num_bars, freq_dir);
-                let len = (self.current_bars[idx] * rect_len).min(if max_h > 0.0 { max_h } else { rect_len });
-                if len <= 0.5 { continue; }
-                let bar_rect = match dir {
-                    VisualizerDirection::Up => {
-                        let x = start_pos + i as f32 * stride;
-                        egui::Rect::from_min_max(egui::pos2(x, anchor - len), egui::pos2(x + bar_width, anchor))
-                    }
-                    VisualizerDirection::Down => {
-                        let x = start_pos + i as f32 * stride;
-                        egui::Rect::from_min_max(egui::pos2(x, anchor), egui::pos2(x + bar_width, anchor + len))
-                    }
-                    VisualizerDirection::Right => {
-                        let y = start_pos + i as f32 * stride;
-                        egui::Rect::from_min_max(egui::pos2(anchor, y), egui::pos2(anchor + len, y + bar_width))
-                    }
-                    VisualizerDirection::Left => {
-                        let y = start_pos + i as f32 * stride;
-                        egui::Rect::from_min_max(egui::pos2(anchor - len, y), egui::pos2(anchor, y + bar_width))
-                    }
-                };
-                for k in 0..n_segments {
-                    let t0 = k as f32 / n_segments as f32;
-                    let t1 = (k + 1) as f32 / n_segments as f32;
-                    let seg_rect = segment_rect(bar_rect, dir, t0, t1);
-                    let r = segment_rounding(dir, k == 0, k == n_segments - 1, radius);
-                    let mid = seg_rect.center();
-                    let x_norm = ((mid.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                    let y_norm = (t0 + t1) * 0.5;
-                    let c = self.apply_vis(self.sample_color_changing(x_norm, y_norm, time));
-                    painter.rect_filled(seg_rect, r, c);
-                }
-                self.draw_bar_outline(painter, bar_rect);
-                if self.config.audio.peak_hold_ms > 0.0 {
-                    let mut peak_len = self.current_peaks[idx] * rect_len;
-                    if max_h > 0.0 { peak_len = peak_len.min(max_h); }
-                    if peak_len > 0.001 {
-                        let center = start_pos + i as f32 * stride + bar_width / 2.0;
-                        let peak_pos = bar_vertex(dir, center, anchor, peak_len, 1.0);
-                        let x_norm = ((peak_pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                        let c = self.apply_vis(self.sample_color_changing(x_norm, 1.0, time));
-                        draw_peak_hold(painter, dir, anchor, center, peak_len, bar_width, c, false);
-                    }
-                }
-            }
-            return;
-        }
-
-        let mut bars: Vec<(f32, f32)> = Vec::with_capacity(visual_num_bars);
-        for i in 0..visual_num_bars {
-            let idx = frequency_index(i, base_num_bars, freq_dir);
-            let len = (self.current_bars[idx] * rect_len).min(if max_h > 0.0 { max_h } else { rect_len });
-            let center = start_pos + i as f32 * stride + bar_width / 2.0;
-            bars.push((center, len));
-        }
-        let extended: Vec<(f32, f32)> = {
-            let mut v = Vec::with_capacity(bars.len() + 2);
-            v.push((start_pos, bars[0].1));
-            v.extend(bars.iter().copied());
-            v.push((start_pos + total_size, bars.last().unwrap().1));
-            v
-        };
-        let steps = 4usize;
-        let mut mesh = egui::Mesh::default();
-        mesh.vertices.reserve(extended.len() * steps * n_segments * 4);
-        mesh.indices.reserve(extended.len() * steps * n_segments * 6);
-        macro_rules! push_quad {
-            ($p1:expr, $c1:expr, $p2:expr, $c2:expr, $p3:expr, $c3:expr, $p4:expr, $c4:expr) => {{
-                let base = mesh.vertices.len() as u32;
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p1, uv: egui::Pos2::ZERO, color: $c1 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p2, uv: egui::Pos2::ZERO, color: $c2 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p3, uv: egui::Pos2::ZERO, color: $c3 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p4, uv: egui::Pos2::ZERO, color: $c4 });
-                mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-            }};
-        }
-        for i in 0..extended.len() - 1 {
-            let (perp_i, len_i) = extended[i];
-            let (perp_j, len_j) = extended[i + 1];
-            for s in 0..steps {
-                let t1 = s as f32 / steps as f32;
-                let t2 = (s + 1) as f32 / steps as f32;
-                let ts1 = smoothstep(0.0, 1.0, t1);
-                let ts2 = smoothstep(0.0, 1.0, t2);
-                let perp1 = perp_i + (perp_j - perp_i) * t1;
-                let perp2 = perp_i + (perp_j - perp_i) * t2;
-                let len1 = len_i + (len_j - len_i) * ts1;
-                let len2 = len_i + (len_j - len_i) * ts2;
-                for k in 0..n_segments {
-                    let t_bot = k as f32 / n_segments as f32;
-                    let t_top = (k + 1) as f32 / n_segments as f32;
-                    let p1 = bar_vertex(dir, perp1, anchor, len1, t_top);
-                    let p2 = bar_vertex(dir, perp2, anchor, len2, t_top);
-                    let p3 = bar_vertex(dir, perp2, anchor, len2, t_bot);
-                    let p4 = bar_vertex(dir, perp1, anchor, len1, t_bot);
-                    if is_blocks {
-                        let mid = egui::pos2((p1.x + p2.x + p3.x + p4.x) * 0.25, (p1.y + p2.y + p3.y + p4.y) * 0.25);
-                        let x_norm = ((mid.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                        let y_norm = (t_bot + t_top) * 0.5;
-                        let c = self.apply_vis(self.sample_color_changing(x_norm, y_norm, time));
-                        push_quad!(p1, c, p2, c, p3, c, p4, c);
-                    } else {
-                        let c1 = self.apply_vis(self.sample_color_changing(((p1.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0), t_top, time));
-                        let c2 = self.apply_vis(self.sample_color_changing(((p2.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0), t_top, time));
-                        let c3 = self.apply_vis(self.sample_color_changing(((p3.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0), t_bot, time));
-                        let c4 = self.apply_vis(self.sample_color_changing(((p4.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0), t_bot, time));
-                        push_quad!(p1, c1, p2, c2, p3, c3, p4, c4);
-                    }
-                }
-            }
-        }
-        painter.add(egui::Shape::mesh(mesh));
-        if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
-            for i in 0..visual_num_bars {
-                let (center, len) = bars[i];
-                let half = bar_width / 2.0;
-                let bar_rect = match dir {
-                    VisualizerDirection::Up => egui::Rect::from_min_max(egui::pos2(center - half, anchor - len), egui::pos2(center + half, anchor)),
-                    VisualizerDirection::Down => egui::Rect::from_min_max(egui::pos2(center - half, anchor), egui::pos2(center + half, anchor + len)),
-                    VisualizerDirection::Right => egui::Rect::from_min_max(egui::pos2(anchor, center - half), egui::pos2(anchor + len, center + half)),
-                    VisualizerDirection::Left => egui::Rect::from_min_max(egui::pos2(anchor - len, center - half), egui::pos2(anchor, center + half)),
-                };
-                self.draw_bar_outline(painter, bar_rect);
-            }
-        }
-        if self.config.audio.peak_hold_ms > 0.0 {
-            for i in 0..visual_num_bars {
-                let idx = frequency_index(i, base_num_bars, freq_dir);
-                let mut peak_len = self.current_peaks[idx] * rect_len;
-                if max_h > 0.0 { peak_len = peak_len.min(max_h); }
-                if peak_len > 0.001 {
-                    let center = start_pos + i as f32 * stride + bar_width / 2.0;
-                    let peak_pos = bar_vertex(dir, center, anchor, peak_len, 1.0);
-                    let x_norm = ((peak_pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                    let c = self.apply_vis(self.sample_color_changing(x_norm, 1.0, time));
-                    draw_peak_hold(painter, dir, anchor, center, peak_len, bar_width, c, true);
-                }
-            }
-        }
-    }
-
-    fn draw_bars(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let base_num_bars = self.current_bars.len();
-        if base_num_bars == 0 { return; }
-
-        // Idle fast-path: skip all drawing if bars and peaks are empty.
-        if self.current_bars.iter().all(|&v| v < 0.001)
-            && self.current_peaks.iter().all(|&p| p < 0.001)
-        {
-            return;
-        }
-
-        let painter = ui.painter();
         let time = ui.input(|i| i.time) as f32;
+        let is_blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
+        let dir = self.config.visualizer_direction;
 
-        let is_static_multi_vertical = self.config.color_mode == ColorMode::StaticMultiple
-            && self.config.static_mode == StaticDistributionMode::Vertical;
-        if is_static_multi_vertical {
-            self.draw_static_multi_vertical(painter, rect);
-            return;
+        let mut gpu_bars = Vec::with_capacity(visual_num_bars);
+        for i in 0..visual_num_bars {
+            let idx = frequency_index(i, base_num_bars, self.config.frequency_direction);
+            let height = self.current_bars[idx].min(1.0);
+            let peak = self.current_peaks[idx].min(1.0);
+
+            // Determine top and bottom colors for the GPU
+            let mut color_top = egui::Color32::WHITE;
+            let mut color_bottom = egui::Color32::WHITE;
+
+            // Get base colors
+            match self.config.color_mode {
+                ColorMode::Gradient => {
+                    // For global gradient, the CPU needs to calculate it based on the bounding box.
+                    // For maximum efficiency, we sample top and bottom of the bar.
+                    let rect_w = rect.width();
+                    let rect_h = rect.height();
+                    let x_center = rect.left() + (i as f32 / visual_num_bars as f32) * rect_w;
+                    color_bottom = self.get_color_at(i, visual_num_bars, x_center, rect.bottom(), 0.0, rect, time);
+                    color_top = self.get_color_at(i, visual_num_bars, x_center, rect.top() + (1.0 - height) * rect_h, 1.0, rect, time);
+                }
+                ColorMode::Animated => {
+                    let norm_x = i as f32 / visual_num_bars as f32;
+                    color_bottom = self.sample_color_changing(norm_x, 0.0, time);
+                    color_top = self.sample_color_changing(norm_x, height, time);
+                }
+                _ => {
+                    // For Static or Multi, we just use the base color for both top and bottom
+                    color_bottom = self.get_color_at(i, visual_num_bars, 0.0, 0.0, 0.0, rect, time);
+                    color_top = color_bottom;
+                }
+            }
+
+            gpu_bars.push(GpuBar {
+                height,
+                peak_height: peak,
+                color_top: [color_top.r() as f32 / 255.0, color_top.g() as f32 / 255.0, color_top.b() as f32 / 255.0, color_top.a() as f32 / 255.0],
+                color_bottom: [color_bottom.r() as f32 / 255.0, color_bottom.g() as f32 / 255.0, color_bottom.b() as f32 / 255.0, color_bottom.a() as f32 / 255.0],
+                show_peak: if self.config.audio.peak_hold_ms > 0.0 && peak > 0.001 { 1.0 } else { 0.0 },
+                _padding: [0.0, 0.0, 0.0],
+            });
         }
-        let is_animated_vertical = self.config.color_mode == ColorMode::Animated
-            && self.config.color_change_motion.shape.uses_vertical_axis();
-        if is_animated_vertical {
-            self.draw_animated_vertical(painter, rect, time);
-            return;
-        }
 
-        let visual_num_bars = if self.config.frequency_direction == FrequencyDirection::Mirrored {
-            base_num_bars * 2
-        } else { base_num_bars };
-        let bar_width = self.config.bar_width;
-        let gap = self.config.bar_gap;
-        let stride = bar_width + gap;
-        let total_size = visual_num_bars as f32 * stride - gap;
-        let max_h = self.config.max_bar_height;
-        let freq_dir = self.config.frequency_direction;
-        let is_smooth = self.config.bar_interpolation == BarInterpolation::Smooth;
-
-        let mut max_val: f32 = 0.0;
-        for i in 0..base_num_bars { max_val = max_val.max(self.current_bars[i]); }
-        let max_h_drawn = (max_val * rect.height() * self.config.height_scale)
-            .min(if max_h > 0.0 { max_h } else { rect.height() * self.config.height_scale })
-            .max(1.0);
-
-        let gradient_rect = match self.config.visualizer_direction {
-            VisualizerDirection::Up => egui::Rect::from_min_max(
-                egui::pos2(rect.center().x - total_size / 2.0 + self.config.x_offset, rect.bottom() + self.config.y_offset - max_h_drawn),
-                egui::pos2(rect.center().x + total_size / 2.0 + self.config.x_offset, rect.bottom() + self.config.y_offset)),
-            VisualizerDirection::Down => egui::Rect::from_min_max(
-                egui::pos2(rect.center().x - total_size / 2.0 + self.config.x_offset, rect.top() + self.config.y_offset),
-                egui::pos2(rect.center().x + total_size / 2.0 + self.config.x_offset, rect.top() + self.config.y_offset + max_h_drawn)),
-            VisualizerDirection::Right => egui::Rect::from_min_max(
-                egui::pos2(rect.left() + self.config.x_offset, rect.center().y - total_size / 2.0 + self.config.y_offset),
-                egui::pos2(rect.left() + self.config.x_offset + max_h_drawn, rect.center().y + total_size / 2.0 + self.config.y_offset)),
-            VisualizerDirection::Left => egui::Rect::from_min_max(
-                egui::pos2(rect.right() + self.config.x_offset - max_h_drawn, rect.center().y - total_size / 2.0 + self.config.y_offset),
-                egui::pos2(rect.right() + self.config.x_offset, rect.center().y + total_size / 2.0 + self.config.y_offset)),
+        let uniforms = ShaderUniforms {
+            num_bars: visual_num_bars as u32,
+            is_vertical: (dir == VisualizerDirection::Up || dir == VisualizerDirection::Down) as u32,
+            is_smooth: (self.config.bar_interpolation == BarInterpolation::Smooth) as u32,
+            is_mirrored: (self.config.frequency_direction == FrequencyDirection::Mirrored) as u32,
+            bar_width: self.config.bar_width,
+            bar_gap: self.config.bar_gap,
+            screen_width: rect.width(),
+            screen_height: rect.height(),
+            outline_thickness: if self.config.visualizer_outline_enabled { self.config.visualizer_outline_thickness } else { 0.0 },
+            outline_color: [
+                self.config.visualizer_outline_color[0] as f32 / 255.0,
+                self.config.visualizer_outline_color[1] as f32 / 255.0,
+                self.config.visualizer_outline_color[2] as f32 / 255.0,
+                1.0
+            ],
+            bar_radius: self.config.bar_radius,
+            opacity: self.config.visualizer_opacity as f32 / 255.0,
+            direction: match dir {
+                VisualizerDirection::Up => 0,
+                VisualizerDirection::Down => 1,
+                VisualizerDirection::Right => 2,
+                VisualizerDirection::Left => 3,
+            },
+            _padding: [0.0, 0.0, 0.0],
         };
 
-        match self.config.visualizer_direction {
-            VisualizerDirection::Up => {
-                let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
-                let bottom_y = rect.bottom() + self.config.y_offset;
-                let rect_h = rect.height() * self.config.height_scale;
-
-                if is_smooth {
-                    let mut mesh = egui::Mesh::default();
-                    let steps = 6;
-                    let mut prev_center: Option<(f32, f32)> = None;
-                    let mut prev_color_bot = egui::Color32::TRANSPARENT;
-                    let mut prev_color_top = egui::Color32::TRANSPARENT;
-                    let mut top_points = Vec::new();
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let h = (self.current_bars[idx] * rect_h).min(if max_h > 0.0 { max_h } else { rect_h });
-                        let cx = start_x + i as f32 * stride + bar_width / 2.0;
-                        let cy = bottom_y - h;
-                        let color_bot = self.get_color_at(i, visual_num_bars, cx, bottom_y, 0.0, gradient_rect, time);
-                        let color_top = self.get_color_at(i, visual_num_bars, cx, cy, 1.0, gradient_rect, time);
-                        top_points.push(egui::pos2(cx, cy));
-                        if let Some((pcx, pcy)) = prev_center {
-                            for s in 0..steps {
-                                let t1 = s as f32 / steps as f32;
-                                let t2 = (s + 1) as f32 / steps as f32;
-                                let ts1 = t1 * t1 * (3.0 - 2.0 * t1);
-                                let ts2 = t2 * t2 * (3.0 - 2.0 * t2);
-                                let x1 = pcx + (cx - pcx) * t1;
-                                let y1 = pcy + (cy - pcy) * ts1;
-                                let x2 = pcx + (cx - pcx) * t2;
-                                let y2 = pcy + (cy - pcy) * ts2;
-                                let c_bot1 = lerp_color(prev_color_bot, color_bot, t1);
-                                let c_bot2 = lerp_color(prev_color_bot, color_bot, t2);
-                                let c_top1 = lerp_color(prev_color_top, color_top, t1);
-                                let c_top2 = lerp_color(prev_color_top, color_top, t2);
-                                let base_idx = mesh.vertices.len() as u32;
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_top1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, bottom_y), uv: egui::Pos2::ZERO, color: c_bot1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, bottom_y), uv: egui::Pos2::ZERO, color: c_bot2 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_top2 });
-                                mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
-                            }
-                        }
-                        prev_center = Some((cx, cy));
-                        prev_color_bot = color_bot;
-                        prev_color_top = color_top;
-                    }
-                    if visual_num_bars > 0 {
-                        let first = top_points.first().unwrap();
-                        let last = top_points.last().unwrap();
-                        let left_x = first.x - bar_width / 2.0;
-                        let first_c_bot = self.get_color_at(0, visual_num_bars, left_x, bottom_y, 0.0, gradient_rect, time);
-                        let first_c_top = self.get_color_at(0, visual_num_bars, left_x, first.y, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, bottom_y), uv: egui::Pos2::ZERO, color: first_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, bottom_y), uv: egui::Pos2::ZERO, color: first_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, first.y), uv: egui::Pos2::ZERO, color: first_c_top });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
-                        let right_x = last.x + bar_width / 2.0;
-                        let last_c_bot = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, bottom_y, 0.0, gradient_rect, time);
-                        let last_c_top = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, last.y, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bottom_y), uv: egui::Pos2::ZERO, color: last_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, bottom_y), uv: egui::Pos2::ZERO, color: last_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_top });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
-                    }
-                    painter.add(egui::Shape::mesh(mesh));
-                    if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
-                        let mut pts = Vec::with_capacity(top_points.len() + 3);
-                        pts.extend_from_slice(&top_points);
-                        if let Some(last) = top_points.last() { pts.push(egui::pos2(last.x + bar_width / 2.0, bottom_y)); }
-                        if let Some(first) = top_points.first() { pts.push(egui::pos2(first.x - bar_width / 2.0, bottom_y)); pts.push(*first); }
-                        let c = self.config.visualizer_outline_color;
-                        let stroke = egui::Stroke::new(self.config.visualizer_outline_thickness, self.apply_vis(egui::Color32::from_rgb(c[0], c[1], c[2])));
-                        painter.add(egui::Shape::line(pts, stroke));
-                    }
-                    if self.config.audio.peak_hold_ms > 0.0 {
-                        for i in 0..visual_num_bars {
-                            let idx = frequency_index(i, base_num_bars, freq_dir);
-                            let mut peak_h = self.current_peaks[idx] * rect_h;
-                            if max_h > 0.0 { peak_h = peak_h.min(max_h); }
-                            if peak_h > 0.001 {
-                                let x_center = start_x + i as f32 * stride + bar_width / 2.0;
-                                let cy = bottom_y - peak_h;
-                                let color = self.get_color_at(i, visual_num_bars, x_center, cy, 1.0, gradient_rect, time);
-                                draw_peak_hold(painter, VisualizerDirection::Up, bottom_y, x_center, peak_h, bar_width, color, true);
-                            }
-                        }
-                    }
-                    return;
-                }
-
-                let mut mesh = egui::Mesh::default();
-                for i in 0..visual_num_bars {
-                    let idx = frequency_index(i, base_num_bars, freq_dir);
-                    let h = (self.current_bars[idx] * rect_h).min(if max_h > 0.0 { max_h } else { rect_h });
-                    let x0 = start_x + i as f32 * stride;
-                    let x1 = x0 + bar_width;
-                    let y_top = bottom_y - h;
-                    let c_top = self.get_color_at(i, visual_num_bars, x0 + bar_width / 2.0, y_top, 1.0, gradient_rect, time);
-                    let c_bot = self.get_color_at(i, visual_num_bars, x0 + bar_width / 2.0, bottom_y, 0.0, gradient_rect, time);
-                    let base_idx = mesh.vertices.len() as u32;
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y_top), uv: egui::Pos2::ZERO, color: c_top });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, bottom_y), uv: egui::Pos2::ZERO, color: c_bot });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, bottom_y), uv: egui::Pos2::ZERO, color: c_bot });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y_top), uv: egui::Pos2::ZERO, color: c_top });
-                    mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
-                }
-                painter.add(egui::Shape::mesh(mesh));
-                if self.config.visualizer_outline_enabled {
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let h = (self.current_bars[idx] * rect_h).min(if max_h > 0.0 { max_h } else { rect_h });
-                        let x = start_x + i as f32 * stride;
-                        let bar_rect = egui::Rect::from_min_max(egui::pos2(x, bottom_y - h), egui::pos2(x + bar_width, bottom_y));
-                        self.draw_bar_outline(painter, bar_rect);
-                    }
-                }
-                if self.config.audio.peak_hold_ms > 0.0 {
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let mut peak_h = self.current_peaks[idx] * rect_h;
-                        if max_h > 0.0 { peak_h = peak_h.min(max_h); }
-                        if peak_h > 0.001 {
-                            let x_center = start_x + i as f32 * stride + bar_width / 2.0;
-                            let color = self.get_color_at(i, visual_num_bars, x_center, bottom_y - peak_h, 1.0, gradient_rect, time);
-                            draw_peak_hold(painter, VisualizerDirection::Up, bottom_y, x_center, peak_h, bar_width, color, false);
-                        }
-                    }
-                }
-            }
-            VisualizerDirection::Down => {
-                let start_x = rect.center().x - (total_size / 2.0) + self.config.x_offset;
-                let top_y = rect.top() + self.config.y_offset;
-                let rect_h = rect.height() * self.config.height_scale;
-                if is_smooth {
-                    let mut mesh = egui::Mesh::default();
-                    let steps = 6;
-                    let mut prev_center: Option<(f32, f32)> = None;
-                    let mut prev_color_bot = egui::Color32::TRANSPARENT;
-                    let mut prev_color_top = egui::Color32::TRANSPARENT;
-                    let mut top_points = Vec::new();
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let h = (self.current_bars[idx] * rect_h).min(if max_h > 0.0 { max_h } else { rect_h });
-                        let cx = start_x + i as f32 * stride + bar_width / 2.0;
-                        let cy = top_y + h;
-                        let color_top = self.get_color_at(i, visual_num_bars, cx, top_y, 0.0, gradient_rect, time);
-                        let color_bot = self.get_color_at(i, visual_num_bars, cx, cy, 1.0, gradient_rect, time);
-                        top_points.push(egui::pos2(cx, cy));
-                        if let Some((pcx, pcy)) = prev_center {
-                            for s in 0..steps {
-                                let t1 = s as f32 / steps as f32;
-                                let t2 = (s + 1) as f32 / steps as f32;
-                                let ts1 = t1 * t1 * (3.0 - 2.0 * t1);
-                                let ts2 = t2 * t2 * (3.0 - 2.0 * t2);
-                                let x1 = pcx + (cx - pcx) * t1;
-                                let y1 = pcy + (cy - pcy) * ts1;
-                                let x2 = pcx + (cx - pcx) * t2;
-                                let y2 = pcy + (cy - pcy) * ts2;
-                                let c_top1 = lerp_color(prev_color_top, color_top, t1);
-                                let c_top2 = lerp_color(prev_color_top, color_top, t2);
-                                let c_bot1 = lerp_color(prev_color_bot, color_bot, t1);
-                                let c_bot2 = lerp_color(prev_color_bot, color_bot, t2);
-                                let base_idx = mesh.vertices.len() as u32;
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, top_y), uv: egui::Pos2::ZERO, color: c_top1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_bot1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_bot2 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, top_y), uv: egui::Pos2::ZERO, color: c_top2 });
-                                mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
-                            }
-                        }
-                        prev_center = Some((cx, cy));
-                        prev_color_bot = color_bot;
-                        prev_color_top = color_top;
-                    }
-                    if visual_num_bars > 0 {
-                        let first = top_points.first().unwrap();
-                        let last = top_points.last().unwrap();
-                        let left_x = first.x - bar_width / 2.0;
-                        let first_c_top = self.get_color_at(0, visual_num_bars, left_x, top_y, 0.0, gradient_rect, time);
-                        let first_c_bot = self.get_color_at(0, visual_num_bars, left_x, first.y, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, top_y), uv: egui::Pos2::ZERO, color: first_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, top_y), uv: egui::Pos2::ZERO, color: first_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, first.y), uv: egui::Pos2::ZERO, color: first_c_bot });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
-                        let right_x = last.x + bar_width / 2.0;
-                        let last_c_top = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, top_y, 0.0, gradient_rect, time);
-                        let last_c_bot = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, last.y, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, top_y), uv: egui::Pos2::ZERO, color: last_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, top_y), uv: egui::Pos2::ZERO, color: last_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_bot });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
-                    }
-                    painter.add(egui::Shape::mesh(mesh));
-                    if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
-                        let mut pts = Vec::with_capacity(top_points.len() + 3);
-                        pts.extend_from_slice(&top_points);
-                        if let Some(last) = top_points.last() { pts.push(egui::pos2(last.x + bar_width / 2.0, top_y)); }
-                        if let Some(first) = top_points.first() { pts.push(egui::pos2(first.x - bar_width / 2.0, top_y)); pts.push(*first); }
-                        let c = self.config.visualizer_outline_color;
-                        let stroke = egui::Stroke::new(self.config.visualizer_outline_thickness, self.apply_vis(egui::Color32::from_rgb(c[0], c[1], c[2])));
-                        painter.add(egui::Shape::line(pts, stroke));
-                    }
-                    if self.config.audio.peak_hold_ms > 0.0 {
-                        for i in 0..visual_num_bars {
-                            let idx = frequency_index(i, base_num_bars, freq_dir);
-                            let mut peak_h = self.current_peaks[idx] * rect_h;
-                            if max_h > 0.0 { peak_h = peak_h.min(max_h); }
-                            if peak_h > 0.001 {
-                                let x_center = start_x + i as f32 * stride + bar_width / 2.0;
-                                let cy = top_y + peak_h;
-                                let color = self.get_color_at(i, visual_num_bars, x_center, cy, 1.0, gradient_rect, time);
-                                draw_peak_hold(painter, VisualizerDirection::Down, top_y, x_center, peak_h, bar_width, color, true);
-                            }
-                        }
-                    }
-                    return;
-                }
-                let mut mesh = egui::Mesh::default();
-                for i in 0..visual_num_bars {
-                    let idx = frequency_index(i, base_num_bars, freq_dir);
-                    let h = (self.current_bars[idx] * rect_h).min(if max_h > 0.0 { max_h } else { rect_h });
-                    let x0 = start_x + i as f32 * stride;
-                    let x1 = x0 + bar_width;
-                    let y_bot = top_y + h;
-                    let c_top = self.get_color_at(i, visual_num_bars, x0 + bar_width / 2.0, top_y, 0.0, gradient_rect, time);
-                    let c_bot = self.get_color_at(i, visual_num_bars, x0 + bar_width / 2.0, y_bot, 1.0, gradient_rect, time);
-                    let base_idx = mesh.vertices.len() as u32;
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, top_y), uv: egui::Pos2::ZERO, color: c_top });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y_bot), uv: egui::Pos2::ZERO, color: c_bot });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y_bot), uv: egui::Pos2::ZERO, color: c_bot });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, top_y), uv: egui::Pos2::ZERO, color: c_top });
-                    mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
-                }
-                painter.add(egui::Shape::mesh(mesh));
-                if self.config.visualizer_outline_enabled {
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let h = (self.current_bars[idx] * rect_h).min(if max_h > 0.0 { max_h } else { rect_h });
-                        let x = start_x + i as f32 * stride;
-                        let bar_rect = egui::Rect::from_min_max(egui::pos2(x, top_y), egui::pos2(x + bar_width, top_y + h));
-                        self.draw_bar_outline(painter, bar_rect);
-                    }
-                }
-                if self.config.audio.peak_hold_ms > 0.0 {
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let mut peak_h = self.current_peaks[idx] * rect_h;
-                        if max_h > 0.0 { peak_h = peak_h.min(max_h); }
-                        if peak_h > 0.001 {
-                            let x_center = start_x + i as f32 * stride + bar_width / 2.0;
-                            let color = self.get_color_at(i, visual_num_bars, x_center, top_y + peak_h, 1.0, gradient_rect, time);
-                            draw_peak_hold(painter, VisualizerDirection::Down, top_y, x_center, peak_h, bar_width, color, false);
-                        }
-                    }
-                }
-            }
-            VisualizerDirection::Right => {
-                let left_x = rect.left() + self.config.x_offset;
-                let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
-                let rect_w = rect.width() * self.config.height_scale;
-                if is_smooth {
-                    let mut mesh = egui::Mesh::default();
-                    let steps = 6;
-                    let mut prev_center: Option<(f32, f32)> = None;
-                    let mut prev_color_left = egui::Color32::TRANSPARENT;
-                    let mut prev_color_right = egui::Color32::TRANSPARENT;
-                    let mut top_points = Vec::new();
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let w = (self.current_bars[idx] * rect_w).min(if max_h > 0.0 { max_h } else { rect_w });
-                        let cx = left_x + w;
-                        let cy = start_y + i as f32 * stride + bar_width / 2.0;
-                        let color_left = self.get_color_at(i, visual_num_bars, left_x, cy, 0.0, gradient_rect, time);
-                        let color_right = self.get_color_at(i, visual_num_bars, cx, cy, 1.0, gradient_rect, time);
-                        top_points.push(egui::pos2(cx, cy));
-                        if let Some((pcx, pcy)) = prev_center {
-                            for s in 0..steps {
-                                let t1 = s as f32 / steps as f32;
-                                let t2 = (s + 1) as f32 / steps as f32;
-                                let ts1 = t1 * t1 * (3.0 - 2.0 * t1);
-                                let ts2 = t2 * t2 * (3.0 - 2.0 * t2);
-                                let x1 = pcx + (cx - pcx) * ts1;
-                                let y1 = pcy + (cy - pcy) * t1;
-                                let x2 = pcx + (cx - pcx) * ts2;
-                                let y2 = pcy + (cy - pcy) * t2;
-                                let c_left1 = lerp_color(prev_color_left, color_left, t1);
-                                let c_left2 = lerp_color(prev_color_left, color_left, t2);
-                                let c_right1 = lerp_color(prev_color_right, color_right, t1);
-                                let c_right2 = lerp_color(prev_color_right, color_right, t2);
-                                let base_idx = mesh.vertices.len() as u32;
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y1), uv: egui::Pos2::ZERO, color: c_left1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_right1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_right2 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y2), uv: egui::Pos2::ZERO, color: c_left2 });
-                                mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
-                            }
-                        }
-                        prev_center = Some((cx, cy));
-                        prev_color_left = color_left;
-                        prev_color_right = color_right;
-                    }
-                    if visual_num_bars > 0 {
-                        let first = top_points.first().unwrap();
-                        let last = top_points.last().unwrap();
-                        let top_y_first = first.y - bar_width / 2.0;
-                        let first_c_left = self.get_color_at(0, visual_num_bars, left_x, top_y_first, 0.0, gradient_rect, time);
-                        let first_c_right = self.get_color_at(0, visual_num_bars, first.x, top_y_first, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, first.y), uv: egui::Pos2::ZERO, color: first_c_left });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
-                        let bot_y_last = last.y + bar_width / 2.0;
-                        let last_c_left = self.get_color_at(visual_num_bars-1, visual_num_bars, left_x, bot_y_last, 0.0, gradient_rect, time);
-                        let last_c_right = self.get_color_at(visual_num_bars-1, visual_num_bars, last.x, bot_y_last, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, last.y), uv: egui::Pos2::ZERO, color: last_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_left });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
-                    }
-                    painter.add(egui::Shape::mesh(mesh));
-                    if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
-                        let mut pts = Vec::with_capacity(top_points.len() + 3);
-                        pts.extend_from_slice(&top_points);
-                        if let Some(last) = top_points.last() { pts.push(egui::pos2(last.x, last.y + bar_width / 2.0)); }
-                        if let Some(first) = top_points.first() { pts.push(egui::pos2(first.x, first.y - bar_width / 2.0)); pts.push(*first); }
-                        let c = self.config.visualizer_outline_color;
-                        let stroke = egui::Stroke::new(self.config.visualizer_outline_thickness, self.apply_vis(egui::Color32::from_rgb(c[0], c[1], c[2])));
-                        painter.add(egui::Shape::line(pts, stroke));
-                    }
-                    if self.config.audio.peak_hold_ms > 0.0 {
-                        for i in 0..visual_num_bars {
-                            let idx = frequency_index(i, base_num_bars, freq_dir);
-                            let mut peak_w = self.current_peaks[idx] * rect_w;
-                            if max_h > 0.0 { peak_w = peak_w.min(max_h); }
-                            if peak_w > 0.001 {
-                                let y_center = start_y + i as f32 * stride + bar_width / 2.0;
-                                let cx = left_x + peak_w;
-                                let color = self.get_color_at(i, visual_num_bars, cx, y_center, 1.0, gradient_rect, time);
-                                draw_peak_hold(painter, VisualizerDirection::Right, left_x, y_center, peak_w, bar_width, color, true);
-                            }
-                        }
-                    }
-                    return;
-                }
-                let mut mesh = egui::Mesh::default();
-                for i in 0..visual_num_bars {
-                    let idx = frequency_index(i, base_num_bars, freq_dir);
-                    let w = (self.current_bars[idx] * rect_w).min(if max_h > 0.0 { max_h } else { rect_w });
-                    let y0 = start_y + i as f32 * stride;
-                    let y1 = y0 + bar_width;
-                    let x1 = left_x + w;
-                    let c_left = self.get_color_at(i, visual_num_bars, left_x, y0 + bar_width / 2.0, 0.0, gradient_rect, time);
-                    let c_right = self.get_color_at(i, visual_num_bars, x1, y0 + bar_width / 2.0, 1.0, gradient_rect, time);
-                    let base_idx = mesh.vertices.len() as u32;
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y0), uv: egui::Pos2::ZERO, color: c_left });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y0), uv: egui::Pos2::ZERO, color: c_right });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_right });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y1), uv: egui::Pos2::ZERO, color: c_left });
-                    mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
-                }
-                painter.add(egui::Shape::mesh(mesh));
-                if self.config.visualizer_outline_enabled {
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let w = (self.current_bars[idx] * rect_w).min(if max_h > 0.0 { max_h } else { rect_w });
-                        let y = start_y + i as f32 * stride;
-                        let bar_rect = egui::Rect::from_min_max(egui::pos2(left_x, y), egui::pos2(left_x + w, y + bar_width));
-                        self.draw_bar_outline(painter, bar_rect);
-                    }
-                }
-                if self.config.audio.peak_hold_ms > 0.0 {
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let mut peak_w = self.current_peaks[idx] * rect_w;
-                        if max_h > 0.0 { peak_w = peak_w.min(max_h); }
-                        if peak_w > 0.001 {
-                            let y_center = start_y + i as f32 * stride + bar_width / 2.0;
-                            let color = self.get_color_at(i, visual_num_bars, left_x + peak_w, y_center, 1.0, gradient_rect, time);
-                            draw_peak_hold(painter, VisualizerDirection::Right, left_x, y_center, peak_w, bar_width, color, false);
-                        }
-                    }
-                }
-            }
-            VisualizerDirection::Left => {
-                let right_x = rect.right() + self.config.x_offset;
-                let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
-                let rect_w = rect.width() * self.config.height_scale;
-                if is_smooth {
-                    let mut mesh = egui::Mesh::default();
-                    let steps = 6;
-                    let mut prev_center: Option<(f32, f32)> = None;
-                    let mut prev_color_left = egui::Color32::TRANSPARENT;
-                    let mut prev_color_right = egui::Color32::TRANSPARENT;
-                    let mut top_points = Vec::new();
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let w = (self.current_bars[idx] * rect_w).min(if max_h > 0.0 { max_h } else { rect_w });
-                        let cx = right_x - w;
-                        let cy = start_y + i as f32 * stride + bar_width / 2.0;
-                        let color_left = self.get_color_at(i, visual_num_bars, cx, cy, 1.0, gradient_rect, time);
-                        let color_right = self.get_color_at(i, visual_num_bars, right_x, cy, 0.0, gradient_rect, time);
-                        top_points.push(egui::pos2(cx, cy));
-                        if let Some((pcx, pcy)) = prev_center {
-                            for s in 0..steps {
-                                let t1 = s as f32 / steps as f32;
-                                let t2 = (s + 1) as f32 / steps as f32;
-                                let ts1 = t1 * t1 * (3.0 - 2.0 * t1);
-                                let ts2 = t2 * t2 * (3.0 - 2.0 * t2);
-                                let x1 = pcx + (cx - pcx) * ts1;
-                                let y1 = pcy + (cy - pcy) * t1;
-                                let x2 = pcx + (cx - pcx) * ts2;
-                                let y2 = pcy + (cy - pcy) * t2;
-                                let c_left1 = lerp_color(prev_color_left, color_left, t1);
-                                let c_left2 = lerp_color(prev_color_left, color_left, t2);
-                                let c_right1 = lerp_color(prev_color_right, color_right, t1);
-                                let c_right2 = lerp_color(prev_color_right, color_right, t2);
-                                let base_idx = mesh.vertices.len() as u32;
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y1), uv: egui::Pos2::ZERO, color: c_right1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_left1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_left2 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y2), uv: egui::Pos2::ZERO, color: c_right2 });
-                                mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
-                            }
-                        }
-                        prev_center = Some((cx, cy));
-                        prev_color_left = color_left;
-                        prev_color_right = color_right;
-                    }
-                    if visual_num_bars > 0 {
-                        let first = top_points.first().unwrap();
-                        let last = top_points.last().unwrap();
-                        let top_y_first = first.y - bar_width / 2.0;
-                        let first_c_left = self.get_color_at(0, visual_num_bars, first.x, top_y_first, 1.0, gradient_rect, time);
-                        let first_c_right = self.get_color_at(0, visual_num_bars, right_x, top_y_first, 0.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, first.y), uv: egui::Pos2::ZERO, color: first_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_right });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
-                        let bot_y_last = last.y + bar_width / 2.0;
-                        let last_c_left = self.get_color_at(visual_num_bars-1, visual_num_bars, last.x, bot_y_last, 1.0, gradient_rect, time);
-                        let last_c_right = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, bot_y_last, 0.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_right });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
-                    }
-                    painter.add(egui::Shape::mesh(mesh));
-                    if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
-                        let mut pts = Vec::with_capacity(top_points.len() + 3);
-                        pts.extend_from_slice(&top_points);
-                        if let Some(last) = top_points.last() { pts.push(egui::pos2(last.x, last.y + bar_width / 2.0)); }
-                        if let Some(first) = top_points.first() { pts.push(egui::pos2(first.x, first.y - bar_width / 2.0)); pts.push(*first); }
-                        let c = self.config.visualizer_outline_color;
-                        let stroke = egui::Stroke::new(self.config.visualizer_outline_thickness, self.apply_vis(egui::Color32::from_rgb(c[0], c[1], c[2])));
-                        painter.add(egui::Shape::line(pts, stroke));
-                    }
-                    if self.config.audio.peak_hold_ms > 0.0 {
-                        for i in 0..visual_num_bars {
-                            let idx = frequency_index(i, base_num_bars, freq_dir);
-                            let mut peak_w = self.current_peaks[idx] * rect_w;
-                            if max_h > 0.0 { peak_w = peak_w.min(max_h); }
-                            if peak_w > 0.001 {
-                                let y_center = start_y + i as f32 * stride + bar_width / 2.0;
-                                let cx = right_x - peak_w;
-                                let color = self.get_color_at(i, visual_num_bars, cx, y_center, 1.0, gradient_rect, time);
-                                draw_peak_hold(painter, VisualizerDirection::Left, right_x, y_center, peak_w, bar_width, color, true);
-                            }
-                        }
-                    }
-                    return;
-                }
-                let mut mesh = egui::Mesh::default();
-                for i in 0..visual_num_bars {
-                    let idx = frequency_index(i, base_num_bars, freq_dir);
-                    let w = (self.current_bars[idx] * rect_w).min(if max_h > 0.0 { max_h } else { rect_w });
-                    let y0 = start_y + i as f32 * stride;
-                    let y1 = y0 + bar_width;
-                    let x0 = right_x - w;
-                    let c_left = self.get_color_at(i, visual_num_bars, x0, y0 + bar_width / 2.0, 1.0, gradient_rect, time);
-                    let c_right = self.get_color_at(i, visual_num_bars, right_x, y0 + bar_width / 2.0, 0.0, gradient_rect, time);
-                    let base_idx = mesh.vertices.len() as u32;
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y0), uv: egui::Pos2::ZERO, color: c_left });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y0), uv: egui::Pos2::ZERO, color: c_right });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y1), uv: egui::Pos2::ZERO, color: c_right });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y1), uv: egui::Pos2::ZERO, color: c_left });
-                    mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
-                }
-                painter.add(egui::Shape::mesh(mesh));
-                if self.config.visualizer_outline_enabled {
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let w = (self.current_bars[idx] * rect_w).min(if max_h > 0.0 { max_h } else { rect_w });
-                        let y = start_y + i as f32 * stride;
-                        let bar_rect = egui::Rect::from_min_max(egui::pos2(right_x - w, y), egui::pos2(right_x, y + bar_width));
-                        self.draw_bar_outline(painter, bar_rect);
-                    }
-                }
-                if self.config.audio.peak_hold_ms > 0.0 {
-                    for i in 0..visual_num_bars {
-                        let idx = frequency_index(i, base_num_bars, freq_dir);
-                        let mut peak_w = self.current_peaks[idx] * rect_w;
-                        if max_h > 0.0 { peak_w = peak_w.min(max_h); }
-                        if peak_w > 0.001 {
-                            let y_center = start_y + i as f32 * stride + bar_width / 2.0;
-                            let color = self.get_color_at(i, visual_num_bars, right_x - peak_w, y_center, 1.0, gradient_rect, time);
-                            draw_peak_hold(painter, VisualizerDirection::Left, right_x, y_center, peak_w, bar_width, color, false);
-                        }
-                    }
-                }
-            }
-        }
+        let callback = egui_wgpu::Callback::new_paint_callback(
+            rect,
+            VisualizerCallback { bars: gpu_bars, uniforms },
+        );
+        ui.painter().add(callback);
     }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Settings UI
+// Settings UI (unchanged logic)
 // ═══════════════════════════════════════════════════════════════
 
 impl VisualizerApp {
@@ -3124,7 +2335,7 @@ impl VisualizerApp {
         ui.add_space(4.0);
 
         let mut new_vsync = self.config.use_vsync;
-        checkbox_reset(ui, &mut new_vsync, "Enable VSync (Requires Restart)", false);
+        checkbox_reset(ui, &mut new_vsync, "Enable VSync (Requires Restart)", true);
         if new_vsync != self.config.use_vsync {
             self.config.use_vsync = new_vsync;
         }
@@ -3266,22 +2477,18 @@ impl eframe::App for VisualizerApp {
             self.current_peaks.resize(n_bars, 0.0);
         }
 
-        let mut latest: Option<BarFrame> = None;
-        while let Ok(frame) = self.audio_rx.try_recv() {
-            latest = Some(frame);
+        // Load data from ArcSwap (Zero-Allocation)
+        let frame = self.shared_frame.load();
+        let limit = self.current_bars.len().min(frame.values.len());
+        for i in 0..limit {
+            self.current_bars[i] = frame.values[i];
+            self.current_peaks[i] = frame.peaks[i];
         }
-        if let Some(frame) = latest {
-            let limit = self.current_bars.len().min(frame.values.len());
-            for i in 0..limit {
-                self.current_bars[i] = frame.values[i];
-                self.current_peaks[i] = frame.peaks[i];
-            }
-            self.last_bpm = frame.bpm;
-            let peak_signal = frame.values.iter().cloned().fold(0.0f32, f32::max);
-            if peak_signal > 0.001 {
-                self.last_audio_frame_time = now;
-            }
+        self.last_bpm = frame.bpm;
+        if frame.values.iter().cloned().fold(0.0f32, f32::max) > 0.001 {
+            self.last_audio_frame_time = now;
         }
+        drop(frame); // Drop the Arc load guard ASAP
 
         if !self.is_passthrough_set {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
@@ -3296,8 +2503,11 @@ impl eframe::App for VisualizerApp {
                 let bg_color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
                 ui.painter().rect_filled(rect, 0.0, bg_color);
             }
-            self.draw_bars(ui, rect);
+            
+            // Draw the new shader-based bars
+            self.draw_bars_gpu(ui, rect); 
             self.draw_track_info(ui, rect);
+            
             if self.config.show_fps {
                 ui.painter().text(rect.left_top() + egui::vec2(20.0, 20.0),
                                   egui::Align2::LEFT_TOP,
@@ -3368,12 +2578,11 @@ impl eframe::App for VisualizerApp {
             }
         }
 
+        // SMART REPAINT SCHEDULING (CPU/GPU Idle Fix)
         let audio_active = now.duration_since(self.last_audio_frame_time) < Duration::from_millis(500);
         let is_animated  = self.config.color_mode == ColorMode::Animated;
-        let peaks_active = self.current_peaks.iter().any(|&p| p > 0.001);
-        let wants_full_fps = audio_active || is_animated || peaks_active;
-
-        if wants_full_fps {
+        
+        if audio_active || is_animated {
             if self.config.use_vsync {
                 ctx.request_repaint();
             } else {
@@ -3381,7 +2590,8 @@ impl eframe::App for VisualizerApp {
                 ctx.request_repaint_after(target_dt);
             }
         } else {
-            ctx.request_repaint_after(Duration::from_millis(250));
+            // When idle, sleep heavily. Clicks/inputs will automatically wake the settings window.
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 
@@ -3399,21 +2609,27 @@ fn main() -> eframe::Result<()> {
     let config = AppConfig::load();
     let (egui_icon, _) = load_icon();
 
+    // Force DX12 for DirectComposition path
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    wgpu_options.supported_backends = wgpu::Backends::DX12;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_transparent(true)
+            .with_transparent(true) // Triggers WS_EX_NOREDIRECTIONBITMAP
             .with_decorations(false)
             .with_always_on_top()
             .with_maximized(true)
-            .with_taskbar(true) // <--- Added: lowers OS window message overhead
+            .with_taskbar(false)
             .with_icon(egui_icon),
-        vsync: config.use_vsync,
-        renderer: eframe::Renderer::Wgpu, // <--- THE BIG ONE: bypasses DWM OpenGL bottleneck
+        wgpu_options,
+        vsync: config.use_vsync, 
+        renderer: eframe::Renderer::Wgpu, 
         ..Default::default()
     };
+    
     eframe::run_native(
         "Rust Visualizer",
         options,
-        Box::new(|_cc| Box::new(VisualizerApp::new())),
+        Box::new(|cc| Box::new(VisualizerApp::new(cc))),
     )
 }
