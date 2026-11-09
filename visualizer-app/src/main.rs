@@ -5,7 +5,7 @@ use image::DynamicImage;
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use arc_swap::ArcSwap;
 use visualizer_core::{
     audio::{AudioEngine, BarFrame},
@@ -3333,7 +3333,7 @@ impl eframe::App for VisualizerApp {
         }
 
         // ── 60 Hz repaint (VSync handles pacing) ──────────────
-        ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 60.0));
+        ctx.request_repaint();
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) { self.config.save(); }
