@@ -16,7 +16,6 @@ pub const DEFAULT_Y_OFFSET:        f32 = 0.0;
 pub const DEFAULT_BG_OPACITY:      u8 = 0;
 pub const DEFAULT_VISUALIZER_OPACITY: u8 = 255;
 pub const DEFAULT_COVER_OPACITY:   u8 = 255;
-pub const DEFAULT_TARGET_FPS:      f32 = 60.0;
 pub const DEFAULT_SETTINGS_SCALE:  f32 = 1.0;
 pub const DEFAULT_OPEN_SETTINGS_ON_LAUNCH: bool = true;
 pub const DEFAULT_SHOW_HELP_TEXT:  bool = true;
@@ -1049,7 +1048,7 @@ pub struct AppConfig {
     pub bg_opacity: u8,
     #[serde(default)] pub bg_color: [u8; 3],
     pub x_offset: f32, pub y_offset: f32,
-    pub max_bar_height: f32, pub target_fps: f32, pub show_fps: bool, pub use_vsync: bool,
+    pub max_bar_height: f32, pub show_fps: bool,
     #[serde(default = "default_height_scale")] pub height_scale: f32,
 
     // Opacity / menu
@@ -1118,7 +1117,7 @@ impl Default for AppConfig {
             bg_opacity: DEFAULT_BG_OPACITY, bg_color: [0, 0, 0],
             x_offset: DEFAULT_X_OFFSET, y_offset: DEFAULT_Y_OFFSET,
             max_bar_height: DEFAULT_MAX_BAR_HEIGHT,
-            target_fps: DEFAULT_TARGET_FPS, show_fps: false, use_vsync: false,
+            show_fps: false,
             height_scale: DEFAULT_HEIGHT_SCALE,
             visualizer_opacity: DEFAULT_VISUALIZER_OPACITY,
             settings_scale: DEFAULT_SETTINGS_SCALE,
