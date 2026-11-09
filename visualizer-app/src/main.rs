@@ -42,37 +42,46 @@ extern "system" {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Shader / wgpu Structs
+// MotionSample (was originally a local struct in main.rs)
+// ═══════════════════════════════════════════════════════════════
+
+#[derive(Clone, Copy)]
+struct MotionSample {
+    phase_a: f32,
+    phase_b: f32,
+    blend_t: f32,
+    intensity: f32,
+}
+
+impl Default for MotionSample {
+    fn default() -> Self {
+        Self { phase_a: 0.0, phase_b: 0.0, blend_t: 0.0, intensity: 1.0 }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GPU structs (must match visualizer.wgsl layout exactly)
 // ═══════════════════════════════════════════════════════════════
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct GpuBar {
-    pub height: f32,
-    pub peak_height: f32,
-    pub color_top: [f32; 4],
-    pub color_bottom: [f32; 4],
-    pub show_peak: f32,
-    pub _padding: [f32; 3],
+    pub height: f32,            // offset 0
+    pub peak_height: f32,       // offset 4
+    pub _pad0: [f32; 2],        // offset 8..16 (aligns color_top to 16)
+    pub color_top: [f32; 4],    // offset 16
+    pub color_bottom: [f32; 4], // offset 32
+    pub show_peak: f32,         // offset 48
+    pub _pad1: [f32; 3],        // offset 52..64 (struct size = 64)
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct ShaderUniforms {
-    pub num_bars: u32,
-    pub is_vertical: u32,
-    pub is_smooth: u32,
-    pub is_mirrored: u32,
-    pub bar_width: f32,
-    pub bar_gap: f32,
-    pub screen_width: f32,
-    pub screen_height: f32,
-    pub outline_thickness: f32,
-    pub outline_color: [f32; 4],
-    pub bar_radius: f32,
-    pub opacity: f32,
-    pub direction: u32,
-    pub _padding: [f32; 3],
+    pub dims: [f32; 4],          // num_bars, is_vertical, is_smooth, is_mirrored
+    pub layout: [f32; 4],        // bar_width, bar_gap, screen_width, screen_height
+    pub outline_color: [f32; 4], // r, g, b, a
+    pub extras: [f32; 4],        // outline_thickness, bar_radius, opacity, direction
 }
 
 pub struct VisualizerResources {
@@ -97,18 +106,16 @@ impl CallbackTrait for VisualizerCallback {
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let resources: &mut VisualizerResources = callback_resources.get_mut().unwrap();
-
         queue.write_buffer(&resources.bar_buffer, 0, bytemuck::cast_slice(&self.bars));
         queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
-
         Vec::new()
     }
 
-    fn paint(
-        &self,
+    fn paint<'a>(
+        &'a self,
         _info: egui::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'static>,
-        callback_resources: &egui_wgpu::CallbackResources,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        callback_resources: &'a egui_wgpu::CallbackResources,
     ) {
         let resources: &VisualizerResources = callback_resources.get().unwrap();
         render_pass.set_pipeline(&resources.pipeline);
@@ -119,7 +126,7 @@ impl CallbackTrait for VisualizerCallback {
 
 fn setup_wgpu(render_state: &egui_wgpu::RenderState) -> VisualizerResources {
     let device = &render_state.device;
-    
+
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Visualizer Shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("visualizer.wgsl").into()),
@@ -213,7 +220,7 @@ fn setup_wgpu(render_state: &egui_wgpu::RenderState) -> VisualizerResources {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Utilities
+// Icon loading
 // ═══════════════════════════════════════════════════════════════
 
 fn load_icon() -> (egui::IconData, tray_icon::Icon) {
@@ -229,6 +236,10 @@ fn load_icon() -> (egui::IconData, tray_icon::Icon) {
     (egui_icon, tray)
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Utilities
+// ═══════════════════════════════════════════════════════════════
+
 fn hash_u32(mut x: u32) -> u32 {
     x ^= x >> 16;
     x = x.wrapping_mul(0x85EB_CA6B);
@@ -236,6 +247,10 @@ fn hash_u32(mut x: u32) -> u32 {
     x = x.wrapping_mul(0xC2B2_AE35);
     x ^= x >> 16;
     x
+}
+
+fn random_color_index(i: usize, num_colors: usize) -> usize {
+    (hash_u32(i as u32) as usize) % num_colors
 }
 
 fn tri01(t: f32) -> f32 { 1.0 - (2.0 * t.fract() - 1.0).abs() }
@@ -307,7 +322,7 @@ fn frequency_index(i: usize, base_num_bars: usize, dir: FrequencyDirection) -> u
 }
 
 // ═══════════════════════════════════════════════════════════════
-// UI & Palette Caches
+// Font & Palette caches
 // ═══════════════════════════════════════════════════════════════
 
 const CUSTOM_FONT_FAMILY: &str = "custom_track";
@@ -539,7 +554,7 @@ struct TrackLoadResult {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// App
+// App struct
 // ═══════════════════════════════════════════════════════════════
 
 struct VisualizerApp {
@@ -627,7 +642,7 @@ impl VisualizerApp {
 
         let (track_load_tx, track_load_rx) = crossbeam_channel::unbounded();
 
-        // WGPU Setup
+        // WGPU setup
         let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("WGPU render state required");
         let resources = setup_wgpu(wgpu_render_state);
         wgpu_render_state.renderer.write().callback_resources.insert(resources);
@@ -859,11 +874,11 @@ impl VisualizerApp {
             }
             ColorMode::StaticMultiple => {
                 let colors = &self.active_palettes.static_multi_colors;
-                if colors.is_empty() { return self.apply_vis(egui::Color32::WHITE); }
+                if colors.is_empty() { return egui::Color32::WHITE; }
                 let num_colors = colors.len();
                 if self.config.static_mode == StaticDistributionMode::Vertical {
                     let blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
-                    return self.apply_vis(static_multi_vertical_color(colors, t, blocks));
+                    return static_multi_vertical_color(colors, t, blocks);
                 }
                 let idx = match self.config.static_mode {
                     StaticDistributionMode::Blocks => {
@@ -934,27 +949,27 @@ impl VisualizerApp {
         egui::Color32::from_rgba_unmultiplied(r as u8, g as u8, b as u8, (a * 255.0) as u8)
     }
 
-    fn evaluate_motion(&self, shape: MotionShape, x: f32, y: f32, time: f32, base_t: f32) -> cfg::MotionSample {
+    fn evaluate_motion(&self, shape: MotionShape, x: f32, y: f32, time: f32, base_t: f32) -> MotionSample {
         let m = &self.config.color_change_motion;
         let hard = m.blend == BlendMode::Hard;
         let freq = m.wave_frequency;
         match shape {
-            MotionShape::Uniform => cfg::MotionSample { phase_a: base_t, intensity: 1.0, ..Default::default() },
+            MotionShape::Uniform => MotionSample { phase_a: base_t, intensity: 1.0, ..Default::default() },
             MotionShape::HorizontalWipe => {
                 let boundary = tri01(base_t * 0.5);
                 let t = wipe_blend(x, boundary, m.wipe_softness, hard);
-                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::VerticalWipe => {
                 let boundary = tri01(base_t * 0.5);
                 let t = wipe_blend(y, boundary, m.wipe_softness, hard);
-                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::DiagonalWipe => {
                 let boundary = tri01(base_t * 0.5);
                 let diag = (x + y) * 0.5;
                 let t = wipe_blend(diag, boundary, m.wipe_softness, hard);
-                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::RadialWipe => {
                 let boundary = tri01(base_t * 0.5);
@@ -962,7 +977,7 @@ impl VisualizerApp {
                 let dy = y - 0.5;
                 let r = (dx * dx + dy * dy).sqrt() * 2.0;
                 let t = wipe_blend(r, boundary, m.wipe_softness, hard);
-                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::Spiral => {
                 let dx = x - 0.5;
@@ -970,31 +985,31 @@ impl VisualizerApp {
                 let r = (dx * dx + dy * dy).sqrt() * 2.0;
                 let angle = dy.atan2(dx) / TAU + 0.5;
                 let t = (angle + r * 2.0 + base_t).fract();
-                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
+                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: t, intensity: 1.0 }
             }
             MotionShape::WaveInterference => {
                 let wave1 = (x * freq * TAU + base_t * TAU).sin();
                 let wave2 = (y * freq * TAU + base_t * TAU * 0.7).sin();
                 let wave = (wave1 + wave2) * 0.25 + 0.5;
-                cfg::MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
+                MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
             }
             MotionShape::Ripple => {
                 let dx = x - 0.5;
                 let dy = y - 0.5;
                 let r = (dx * dx + dy * dy).sqrt() * 2.0;
                 let wave = (r * 8.0 - base_t * TAU).sin() * 0.5 + 0.5;
-                cfg::MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
+                MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
             }
-            MotionShape::SineWave => { let w = (x * freq * TAU + base_t * TAU).sin() * 0.5 + 0.5; cfg::MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
-            MotionShape::TriangleWave => { let w = tri01(x * freq + base_t); cfg::MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
-            MotionShape::SquareWave => { let w = ((x * freq + base_t).fract() < 0.5) as u8 as f32; cfg::MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
-            MotionShape::SawtoothWave => { let w = (x * freq + base_t).fract(); cfg::MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
+            MotionShape::SineWave => { let w = (x * freq * TAU + base_t * TAU).sin() * 0.5 + 0.5; MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
+            MotionShape::TriangleWave => { let w = tri01(x * freq + base_t); MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
+            MotionShape::SquareWave => { let w = ((x * freq + base_t).fract() < 0.5) as u8 as f32; MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
+            MotionShape::SawtoothWave => { let w = (x * freq + base_t).fract(); MotionSample { phase_a: base_t + w * 0.5, intensity: 1.0, ..Default::default() } }
             MotionShape::Strobe => {
                 let on = ((base_t * 4.0).fract() < 0.5) as u8 as f32;
                 let k = if hard { on } else { smoothstep(0.35, 0.65, on + base_t.fract() * 0.3) };
-                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
-            MotionShape::Pulse => { let k = (base_t * TAU).sin() * 0.5 + 0.5; cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() } }
+            MotionShape::Pulse => { let k = (base_t * TAU).sin() * 0.5 + 0.5; MotionSample { phase_a: base_t, intensity: k, ..Default::default() } }
             MotionShape::Heartbeat => {
                 let beat = base_t.fract();
                 let k = if hard {
@@ -1004,7 +1019,7 @@ impl VisualizerApp {
                     let b = (-((beat - 0.22) / 0.04).powi(2)).exp() * 0.7;
                     (a + b).clamp(0.0, 1.0)
                 };
-                cfg::MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: 0.0, intensity: k }
+                MotionSample { phase_a: base_t, phase_b: base_t + 0.5, blend_t: 0.0, intensity: k }
             }
             MotionShape::Stutter => {
                 let step = (time * 10.0) as u32;
@@ -1012,7 +1027,7 @@ impl VisualizerApp {
                 let hash = hash_u32(step.wrapping_mul(37).wrapping_add(pos));
                 let event = (hash % 100) as f32 / 100.0 < m.stutter_intensity;
                 let offset = if event { 0.5 } else { 0.0 };
-                cfg::MotionSample { phase_a: base_t + offset, intensity: 1.0, ..Default::default() }
+                MotionSample { phase_a: base_t + offset, intensity: 1.0, ..Default::default() }
             }
             MotionShape::Comet => {
                 let head = base_t.fract();
@@ -1020,19 +1035,19 @@ impl VisualizerApp {
                 let dist = raw.min(1.0 - raw);
                 let k = (1.0 - dist / m.trail_length.max(0.01)).clamp(0.0, 1.0);
                 let k = if hard { (k > 0.5) as u8 as f32 } else { k };
-                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::Chase => {
                 let pos = (x - base_t * 0.5).rem_euclid(1.0);
                 let k = if hard { (pos < 0.15) as u8 as f32 } else { smoothstep(0.05, 0.15, 0.15 - (pos - 0.075).abs()) };
-                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::BouncingBall => {
                 let head = tri01(base_t * 0.5);
                 let dist = (x - head).abs();
                 let k = (1.0 - dist / m.trail_length.max(0.01)).clamp(0.0, 1.0);
                 let k = if hard { (k > 0.4) as u8 as f32 } else { k };
-                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::Sparkle => {
                 let step = (time * 12.0) as u32;
@@ -1040,42 +1055,42 @@ impl VisualizerApp {
                 let hash = hash_u32(step.wrapping_mul(13).wrapping_add(pos));
                 let p = (hash % 100) as f32 / 100.0;
                 let on = p < 0.04 + m.stutter_intensity * 0.1;
-                cfg::MotionSample { phase_a: base_t + p, intensity: if on { 1.0 } else { 0.0 }, ..Default::default() }
+                MotionSample { phase_a: base_t + p, intensity: if on { 1.0 } else { 0.0 }, ..Default::default() }
             }
             MotionShape::Sinelon => {
                 let head = tri01(base_t * 0.5);
                 let dist = (x - head).abs();
                 let k = (1.0 - dist / m.trail_length.max(0.01)).clamp(0.0, 1.0);
-                cfg::MotionSample { phase_a: base_t, intensity: k.powf(2.0), ..Default::default() }
+                MotionSample { phase_a: base_t, intensity: k.powf(2.0), ..Default::default() }
             }
             MotionShape::FireSimulation => {
                 let n = (base_t * 1.0 + x * 5.0).sin() + (base_t * 1.3 + x * 11.0).sin() * 0.5 + (base_t * 2.1 + x * 23.0).sin() * 0.25;
-                cfg::MotionSample { phase_a: base_t + n * 0.05, intensity: (n * 0.25 + 0.75).clamp(0.0, 1.0), ..Default::default() }
+                MotionSample { phase_a: base_t + n * 0.05, intensity: (n * 0.25 + 0.75).clamp(0.0, 1.0), ..Default::default() }
             }
             MotionShape::Plasma => {
                 let p = (x * 6.0 + base_t * 2.0).sin() + (y * 6.0 - base_t * 1.5).sin() + ((x + y) * 4.0 + base_t).sin();
-                cfg::MotionSample { phase_a: base_t + p * 0.08, intensity: 1.0, ..Default::default() }
+                MotionSample { phase_a: base_t + p * 0.08, intensity: 1.0, ..Default::default() }
             }
-            MotionShape::RainbowCycle => cfg::MotionSample { phase_a: base_t + x, intensity: 1.0, ..Default::default() },
+            MotionShape::RainbowCycle => MotionSample { phase_a: base_t + x, intensity: 1.0, ..Default::default() },
             MotionShape::Confetti => {
                 let step = (time * 10.0) as u32;
                 let pos = (x * 400.0) as u32;
                 let hash = hash_u32(step.wrapping_mul(97).wrapping_add(pos));
                 let p = (hash % 100) as f32 / 100.0;
                 let on = p < m.stutter_intensity * 0.15;
-                cfg::MotionSample { phase_a: (hash % 1000) as f32 / 1000.0 + base_t * 0.1, intensity: if on { 1.0 } else { 0.0 }, ..Default::default() }
+                MotionSample { phase_a: (hash % 1000) as f32 / 1000.0 + base_t * 0.1, intensity: if on { 1.0 } else { 0.0 }, ..Default::default() }
             }
             MotionShape::Breathing => {
                 let k = (base_t * TAU * 0.5).sin() * 0.5 + 0.5;
-                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::FlipFlop => {
                 let k = if (base_t * 2.0).fract() < 0.5 { 1.0 } else { 0.0 };
-                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
             MotionShape::Kaleidoscope => {
                 let wave = ((x * freq * TAU + base_t * TAU).sin() * (y * freq * TAU + base_t * TAU).cos()).abs();
-                cfg::MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
+                MotionSample { phase_a: base_t + wave * 0.5, intensity: 1.0, ..Default::default() }
             }
             MotionShape::DigitalRain => {
                 let col = (x * 50.0) as u32;
@@ -1084,13 +1099,13 @@ impl VisualizerApp {
                 let y_offset = (hash % 1000) as f32 / 1000.0;
                 let pos = (y + base_t * speed + y_offset).fract();
                 let k = if pos < 0.2 { 1.0 - pos / 0.2 } else { 0.0 };
-                cfg::MotionSample { phase_a: base_t + col as f32 * 0.1, intensity: k, ..Default::default() }
+                MotionSample { phase_a: base_t + col as f32 * 0.1, intensity: k, ..Default::default() }
             }
             MotionShape::MeteorShower => {
                 let head = base_t.fract() * 2.0;
                 let dist = ((x * 2.0 - head) % 1.0).abs();
                 let k = (1.0 - dist / 0.15).clamp(0.0, 1.0);
-                cfg::MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
+                MotionSample { phase_a: base_t, intensity: k, ..Default::default() }
             }
         }
     }
@@ -1190,12 +1205,15 @@ fn draw_spaced(ctx: &egui::Context, painter: &egui::Painter, text: &str, pos: eg
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// GPU bar drawing
+// ═══════════════════════════════════════════════════════════════
+
 impl VisualizerApp {
     fn draw_bars_gpu(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 { return; }
 
-        // Don't draw if everything is zeroed out
         if self.current_bars.iter().all(|&v| v < 0.001) && self.current_peaks.iter().all(|&p| p < 0.001) {
             return;
         }
@@ -1207,7 +1225,6 @@ impl VisualizerApp {
         };
 
         let time = ui.input(|i| i.time) as f32;
-        let is_blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
         let dir = self.config.visualizer_direction;
 
         let mut gpu_bars = Vec::with_capacity(visual_num_bars);
@@ -1216,68 +1233,78 @@ impl VisualizerApp {
             let height = self.current_bars[idx].min(1.0);
             let peak = self.current_peaks[idx].min(1.0);
 
-            // Determine top and bottom colors for the GPU
-            let mut color_top = egui::Color32::WHITE;
-            let mut color_bottom = egui::Color32::WHITE;
-
-            // Get base colors
-            match self.config.color_mode {
+            let (color_top, color_bottom) = match self.config.color_mode {
                 ColorMode::Gradient => {
-                    // For global gradient, the CPU needs to calculate it based on the bounding box.
-                    // For maximum efficiency, we sample top and bottom of the bar.
                     let rect_w = rect.width();
                     let rect_h = rect.height();
                     let x_center = rect.left() + (i as f32 / visual_num_bars as f32) * rect_w;
-                    color_bottom = self.get_color_at(i, visual_num_bars, x_center, rect.bottom(), 0.0, rect, time);
-                    color_top = self.get_color_at(i, visual_num_bars, x_center, rect.top() + (1.0 - height) * rect_h, 1.0, rect, time);
+                    let cb = self.get_color_at(i, visual_num_bars, x_center, rect.bottom(), 0.0, rect, time);
+                    let ct = self.get_color_at(i, visual_num_bars, x_center, rect.top() + (1.0 - height) * rect_h, 1.0, rect, time);
+                    (ct, cb)
                 }
                 ColorMode::Animated => {
                     let norm_x = i as f32 / visual_num_bars as f32;
-                    color_bottom = self.sample_color_changing(norm_x, 0.0, time);
-                    color_top = self.sample_color_changing(norm_x, height, time);
+                    let cb = self.sample_color_changing(norm_x, 0.0, time);
+                    let ct = self.sample_color_changing(norm_x, height, time);
+                    (ct, cb)
                 }
                 _ => {
-                    // For Static or Multi, we just use the base color for both top and bottom
-                    color_bottom = self.get_color_at(i, visual_num_bars, 0.0, 0.0, 0.0, rect, time);
-                    color_top = color_bottom;
+                    let c = self.get_color_at(i, visual_num_bars, 0.0, 0.0, 0.0, rect, time);
+                    (c, c)
                 }
-            }
+            };
 
             gpu_bars.push(GpuBar {
                 height,
                 peak_height: peak,
-                color_top: [color_top.r() as f32 / 255.0, color_top.g() as f32 / 255.0, color_top.b() as f32 / 255.0, color_top.a() as f32 / 255.0],
-                color_bottom: [color_bottom.r() as f32 / 255.0, color_bottom.g() as f32 / 255.0, color_bottom.b() as f32 / 255.0, color_bottom.a() as f32 / 255.0],
+                _pad0: [0.0; 2],
+                color_top: [
+                    color_top.r() as f32 / 255.0,
+                    color_top.g() as f32 / 255.0,
+                    color_top.b() as f32 / 255.0,
+                    color_top.a() as f32 / 255.0,
+                ],
+                color_bottom: [
+                    color_bottom.r() as f32 / 255.0,
+                    color_bottom.g() as f32 / 255.0,
+                    color_bottom.b() as f32 / 255.0,
+                    color_bottom.a() as f32 / 255.0,
+                ],
                 show_peak: if self.config.audio.peak_hold_ms > 0.0 && peak > 0.001 { 1.0 } else { 0.0 },
-                _padding: [0.0, 0.0, 0.0],
+                _pad1: [0.0; 3],
             });
         }
 
         let uniforms = ShaderUniforms {
-            num_bars: visual_num_bars as u32,
-            is_vertical: (dir == VisualizerDirection::Up || dir == VisualizerDirection::Down) as u32,
-            is_smooth: (self.config.bar_interpolation == BarInterpolation::Smooth) as u32,
-            is_mirrored: (self.config.frequency_direction == FrequencyDirection::Mirrored) as u32,
-            bar_width: self.config.bar_width,
-            bar_gap: self.config.bar_gap,
-            screen_width: rect.width(),
-            screen_height: rect.height(),
-            outline_thickness: if self.config.visualizer_outline_enabled { self.config.visualizer_outline_thickness } else { 0.0 },
+            dims: [
+                visual_num_bars as f32,
+                (dir == VisualizerDirection::Up || dir == VisualizerDirection::Down) as u32 as f32,
+                (self.config.bar_interpolation == BarInterpolation::Smooth) as u32 as f32,
+                (self.config.frequency_direction == FrequencyDirection::Mirrored) as u32 as f32,
+            ],
+            layout: [
+                self.config.bar_width,
+                self.config.bar_gap,
+                rect.width(),
+                rect.height(),
+            ],
             outline_color: [
                 self.config.visualizer_outline_color[0] as f32 / 255.0,
                 self.config.visualizer_outline_color[1] as f32 / 255.0,
                 self.config.visualizer_outline_color[2] as f32 / 255.0,
-                1.0
+                1.0,
             ],
-            bar_radius: self.config.bar_radius,
-            opacity: self.config.visualizer_opacity as f32 / 255.0,
-            direction: match dir {
-                VisualizerDirection::Up => 0,
-                VisualizerDirection::Down => 1,
-                VisualizerDirection::Right => 2,
-                VisualizerDirection::Left => 3,
-            },
-            _padding: [0.0, 0.0, 0.0],
+            extras: [
+                if self.config.visualizer_outline_enabled { self.config.visualizer_outline_thickness } else { 0.0 },
+                self.config.bar_radius,
+                self.config.visualizer_opacity as f32 / 255.0,
+                match dir {
+                    VisualizerDirection::Up => 0.0,
+                    VisualizerDirection::Down => 1.0,
+                    VisualizerDirection::Right => 2.0,
+                    VisualizerDirection::Left => 3.0,
+                },
+            ],
         };
 
         let callback = egui_wgpu::Callback::new_paint_callback(
@@ -1289,7 +1316,7 @@ impl VisualizerApp {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Settings UI (unchanged logic)
+// Settings UI (unchanged - identical to previous version)
 // ═══════════════════════════════════════════════════════════════
 
 impl VisualizerApp {
@@ -2477,7 +2504,6 @@ impl eframe::App for VisualizerApp {
             self.current_peaks.resize(n_bars, 0.0);
         }
 
-        // Load data from ArcSwap (Zero-Allocation)
         let frame = self.shared_frame.load();
         let limit = self.current_bars.len().min(frame.values.len());
         for i in 0..limit {
@@ -2488,7 +2514,7 @@ impl eframe::App for VisualizerApp {
         if frame.values.iter().cloned().fold(0.0f32, f32::max) > 0.001 {
             self.last_audio_frame_time = now;
         }
-        drop(frame); // Drop the Arc load guard ASAP
+        drop(frame);
 
         if !self.is_passthrough_set {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
@@ -2503,11 +2529,8 @@ impl eframe::App for VisualizerApp {
                 let bg_color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
                 ui.painter().rect_filled(rect, 0.0, bg_color);
             }
-            
-            // Draw the new shader-based bars
-            self.draw_bars_gpu(ui, rect); 
+            self.draw_bars_gpu(ui, rect);
             self.draw_track_info(ui, rect);
-            
             if self.config.show_fps {
                 ui.painter().text(rect.left_top() + egui::vec2(20.0, 20.0),
                                   egui::Align2::LEFT_TOP,
@@ -2578,10 +2601,9 @@ impl eframe::App for VisualizerApp {
             }
         }
 
-        // SMART REPAINT SCHEDULING (CPU/GPU Idle Fix)
         let audio_active = now.duration_since(self.last_audio_frame_time) < Duration::from_millis(500);
         let is_animated  = self.config.color_mode == ColorMode::Animated;
-        
+
         if audio_active || is_animated {
             if self.config.use_vsync {
                 ctx.request_repaint();
@@ -2590,7 +2612,6 @@ impl eframe::App for VisualizerApp {
                 ctx.request_repaint_after(target_dt);
             }
         } else {
-            // When idle, sleep heavily. Clicks/inputs will automatically wake the settings window.
             ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
@@ -2609,24 +2630,23 @@ fn main() -> eframe::Result<()> {
     let config = AppConfig::load();
     let (egui_icon, _) = load_icon();
 
-    // Force DX12 for DirectComposition path
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
     wgpu_options.supported_backends = wgpu::Backends::DX12;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_transparent(true) // Triggers WS_EX_NOREDIRECTIONBITMAP
+            .with_transparent(true)
             .with_decorations(false)
             .with_always_on_top()
             .with_maximized(true)
             .with_taskbar(false)
             .with_icon(egui_icon),
         wgpu_options,
-        vsync: config.use_vsync, 
-        renderer: eframe::Renderer::Wgpu, 
+        vsync: config.use_vsync,
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
-    
+
     eframe::run_native(
         "Rust Visualizer",
         options,
