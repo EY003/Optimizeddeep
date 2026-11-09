@@ -643,7 +643,14 @@ impl VisualizerApp {
         let (track_load_tx, track_load_rx) = crossbeam_channel::unbounded();
 
         // WGPU setup
-        let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("WGPU render state required");
+        let wgpu_render_state = cc.wgpu_render_state.as_ref().unwrap_or_else(|| {
+    let _ = std::fs::write(
+        "crash.log",
+        "VisualizerApp::new: wgpu_render_state was None.\n\
+         Set `renderer: eframe::Renderer::Wgpu` in NativeOptions.\n",
+    );
+    panic!("wgpu render state missing");
+});
         let resources = setup_wgpu(wgpu_render_state);
         wgpu_render_state.renderer.write().callback_resources.insert(resources);
 
@@ -2623,33 +2630,63 @@ impl eframe::App for VisualizerApp {
     }
 }
 
-fn main() -> eframe::Result<()> {
+fn main() {
+    // Install panic hook that writes to a file (release builds hide stderr)
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let msg = format!("PANIC at {}\n\n{}\n", location, payload);
+        let _ = std::fs::write("crash.log", &msg);
+        eprintln!("{}", msg);
+    }));
+
     #[cfg(windows)]
     unsafe { timeBeginPeriod(1); }
 
     let config = AppConfig::load();
     let (egui_icon, _) = load_icon();
 
-    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
-    wgpu_options.supported_backends = wgpu::Backends::DX12;
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_transparent(true)
             .with_decorations(false)
             .with_always_on_top()
-            .with_maximized(true)
-            .with_taskbar(false)
+            .with_inner_size([1920.0, 1080.0])
             .with_icon(egui_icon),
-        wgpu_options,
-        vsync: config.use_vsync,
+        // Always use VSync with a transparent window — no-vsync + transparency
+        // is a known crash path on some drivers.
+        vsync: true,
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Rust Visualizer",
         options,
-        Box::new(|cc| Box::new(VisualizerApp::new(cc))),
-    )
+        Box::new(|cc| {
+            if cc.wgpu_render_state.is_none() {
+                let msg = "wgpu_render_state is None — WGPU renderer failed to initialize.\n\
+                           This usually means the graphics driver rejected a DX12 surface.\n";
+                let _ = std::fs::write("crash.log", msg);
+                panic!("{}", msg);
+            }
+            Box::new(VisualizerApp::new(cc))
+        }),
+    );
+
+    if let Err(e) = result {
+        let msg = format!("eframe::run_native returned an error:\n{:?}\n", e);
+        let _ = std::fs::write("crash.log", &msg);
+        eprintln!("{}", msg);
+        std::process::exit(1);
+    }
 }
