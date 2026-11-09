@@ -1,6 +1,6 @@
 struct Uniforms {
     dims: vec4<f32>,          // num_bars, is_vertical, is_smooth, is_mirrored
-    layout: vec4<f32>,        // bar_width, bar_gap, screen_width, screen_height
+    layout_data: vec4<f32>,   // bar_width, bar_gap, screen_width, screen_height
     transform: vec4<f32>,     // x_offset, y_offset, height_scale, max_bar_height
     outline_color: vec4<f32>, // r, g, b, a
     extras: vec4<f32>,        // outline_thickness, bar_radius, opacity, direction
@@ -45,10 +45,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let is_smooth = u.dims.z > 0.5;
     let is_mirrored = u.dims.w > 0.5;
     
-    let bar_width = u.layout.x;
-    let bar_gap = u.layout.y;
-    let screen_w = u.layout.z;
-    let screen_h = u.layout.w;
+    let bar_width = u.layout_data.x;
+    let bar_gap = u.layout_data.y;
+    let screen_w = u.layout_data.z;
+    let screen_h = u.layout_data.w;
     
     let x_offset = u.transform.x;
     let y_offset = u.transform.y;
