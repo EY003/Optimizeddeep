@@ -523,6 +523,14 @@ struct VisualizerApp {
     _hotkey_manager: GlobalHotKeyManager,
     settings_menu_id: tray_icon::menu::MenuId,
     quit_menu_id: tray_icon::menu::MenuId,
+
+    // Optimizations
+    is_window_visible: bool,
+    is_silent: bool,
+    mesh: egui::Mesh,
+    static_color_cache: Vec<egui::Color32>,
+    animated_color_cache: Vec<egui::Color32>,
+    computed_palette_hash: u64,
 }
 
 impl VisualizerApp {
@@ -599,6 +607,12 @@ impl VisualizerApp {
             _hotkey_manager: hotkey_manager,
             settings_menu_id: settings_item.id().clone(),
             quit_menu_id: quit_item.id().clone(),
+            is_window_visible: true,
+            is_silent: true,
+            mesh: egui::Mesh::default(),
+            static_color_cache: Vec::new(),
+            animated_color_cache: Vec::new(),
+            computed_palette_hash: 0,
         }
     }
 
@@ -1114,7 +1128,7 @@ impl VisualizerApp {
                             egui::Stroke::new(self.config.visualizer_outline_thickness, color));
     }
 
-    fn draw_static_multi_vertical(&self, painter: &egui::Painter, rect: egui::Rect) {
+    fn draw_static_multi_vertical(&mut self, painter: &egui::Painter, rect: egui::Rect) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 { return; }
         let visual_num_bars = if self.config.frequency_direction == FrequencyDirection::Mirrored {
@@ -1134,6 +1148,17 @@ impl VisualizerApp {
         if colors.is_empty() { return; }
         let n_colors = colors.len();
         let n_segments: usize = if is_blocks { n_colors } else { 32 };
+
+        // Pre-calculate colors
+        let current_hash = self.last_palette_hash;
+        if self.static_color_cache.len() != n_segments || self.computed_palette_hash != current_hash {
+            self.static_color_cache.resize(n_segments, egui::Color32::TRANSPARENT);
+            for k in 0..n_segments {
+                let t_mid = (k as f32 + 0.5) / n_segments as f32;
+                self.static_color_cache[k] = self.apply_vis(static_multi_vertical_color(colors, t_mid, is_blocks));
+            }
+            self.computed_palette_hash = current_hash;
+        }
 
         let (start_pos, anchor, rect_len) = match dir {
             VisualizerDirection::Up => (
@@ -1180,11 +1205,9 @@ impl VisualizerApp {
                 for k in 0..n_segments {
                     let t0 = k as f32 / n_segments as f32;
                     let t1 = (k + 1) as f32 / n_segments as f32;
-                    let t_mid = (t0 + t1) * 0.5;
                     let seg_rect = segment_rect(bar_rect, dir, t0, t1);
                     let r = segment_rounding(dir, k == 0, k == n_segments - 1, radius);
-                    let c = self.apply_vis(static_multi_vertical_color(colors, t_mid, is_blocks));
-                    painter.rect_filled(seg_rect, r, c);
+                    painter.rect_filled(seg_rect, r, self.static_color_cache[k]);
                 }
                 self.draw_bar_outline(painter, bar_rect);
                 if self.config.audio.peak_hold_ms > 0.0 {
@@ -1216,15 +1239,15 @@ impl VisualizerApp {
             v
         };
         let steps = 4usize;
-        let mut mesh = egui::Mesh::default();
+        self.mesh.clear();
         macro_rules! push_quad {
             ($p1:expr, $c1:expr, $p2:expr, $c2:expr, $p3:expr, $c3:expr, $p4:expr, $c4:expr) => {{
-                let base = mesh.vertices.len() as u32;
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p1, uv: egui::Pos2::ZERO, color: $c1 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p2, uv: egui::Pos2::ZERO, color: $c2 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p3, uv: egui::Pos2::ZERO, color: $c3 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p4, uv: egui::Pos2::ZERO, color: $c4 });
-                mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                let base = self.mesh.vertices.len() as u32;
+                self.mesh.vertices.push(egui::epaint::Vertex { pos: $p1, uv: egui::Pos2::ZERO, color: $c1 });
+                self.mesh.vertices.push(egui::epaint::Vertex { pos: $p2, uv: egui::Pos2::ZERO, color: $c2 });
+                self.mesh.vertices.push(egui::epaint::Vertex { pos: $p3, uv: egui::Pos2::ZERO, color: $c3 });
+                self.mesh.vertices.push(egui::epaint::Vertex { pos: $p4, uv: egui::Pos2::ZERO, color: $c4 });
+                self.mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             }};
         }
         for i in 0..extended.len() - 1 {
@@ -1242,17 +1265,16 @@ impl VisualizerApp {
                 for k in 0..n_segments {
                     let t_bot = k as f32 / n_segments as f32;
                     let t_top = (k + 1) as f32 / n_segments as f32;
-                    let t_mid = (t_bot + t_top) * 0.5;
-                    let c = self.apply_vis(static_multi_vertical_color(colors, t_mid, is_blocks));
                     let p1 = bar_vertex(dir, perp1, anchor, len1, t_top);
                     let p2 = bar_vertex(dir, perp2, anchor, len2, t_top);
                     let p3 = bar_vertex(dir, perp2, anchor, len2, t_bot);
                     let p4 = bar_vertex(dir, perp1, anchor, len1, t_bot);
+                    let c = self.static_color_cache[k];
                     push_quad!(p1, c, p2, c, p3, c, p4, c);
                 }
             }
         }
-        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
         if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
             for i in 0..visual_num_bars {
                 let (center, len) = bars[i];
@@ -1281,7 +1303,7 @@ impl VisualizerApp {
         }
     }
 
-    fn draw_animated_vertical(&self, painter: &egui::Painter, rect: egui::Rect, time: f32) {
+    fn draw_animated_vertical(&mut self, painter: &egui::Painter, rect: egui::Rect, time: f32) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 { return; }
         let visual_num_bars = if self.config.frequency_direction == FrequencyDirection::Mirrored {
@@ -1299,6 +1321,15 @@ impl VisualizerApp {
         let is_smooth = self.config.bar_interpolation == BarInterpolation::Smooth;
         let palette_len = self.active_palettes.animated_colors.len().max(1);
         let n_segments: usize = if is_blocks { palette_len.clamp(6, 16) } else { 24 };
+
+        // Pre-calculate animated colors for this frame
+        self.animated_color_cache.resize(n_segments, egui::Color32::TRANSPARENT);
+        for k in 0..n_segments {
+            let t_bot = k as f32 / n_segments as f32;
+            let t_top = (k + 1) as f32 / n_segments as f32;
+            let t_mid = (t_bot + t_top) * 0.5;
+            self.animated_color_cache[k] = self.apply_vis(self.sample_color_changing(0.5, t_mid, time));
+        }
 
         let (start_pos, anchor, rect_len) = match dir {
             VisualizerDirection::Up => (
@@ -1347,11 +1378,7 @@ impl VisualizerApp {
                     let t1 = (k + 1) as f32 / n_segments as f32;
                     let seg_rect = segment_rect(bar_rect, dir, t0, t1);
                     let r = segment_rounding(dir, k == 0, k == n_segments - 1, radius);
-                    let mid = seg_rect.center();
-                    let x_norm = ((mid.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                    let y_norm = (t0 + t1) * 0.5;
-                    let c = self.apply_vis(self.sample_color_changing(x_norm, y_norm, time));
-                    painter.rect_filled(seg_rect, r, c);
+                    painter.rect_filled(seg_rect, r, self.animated_color_cache[k]);
                 }
                 self.draw_bar_outline(painter, bar_rect);
                 if self.config.audio.peak_hold_ms > 0.0 {
@@ -1384,15 +1411,15 @@ impl VisualizerApp {
             v
         };
         let steps = 4usize;
-        let mut mesh = egui::Mesh::default();
+        self.mesh.clear();
         macro_rules! push_quad {
             ($p1:expr, $c1:expr, $p2:expr, $c2:expr, $p3:expr, $c3:expr, $p4:expr, $c4:expr) => {{
-                let base = mesh.vertices.len() as u32;
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p1, uv: egui::Pos2::ZERO, color: $c1 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p2, uv: egui::Pos2::ZERO, color: $c2 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p3, uv: egui::Pos2::ZERO, color: $c3 });
-                mesh.vertices.push(egui::epaint::Vertex { pos: $p4, uv: egui::Pos2::ZERO, color: $c4 });
-                mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                let base = self.mesh.vertices.len() as u32;
+                self.mesh.vertices.push(egui::epaint::Vertex { pos: $p1, uv: egui::Pos2::ZERO, color: $c1 });
+                self.mesh.vertices.push(egui::epaint::Vertex { pos: $p2, uv: egui::Pos2::ZERO, color: $c2 });
+                self.mesh.vertices.push(egui::epaint::Vertex { pos: $p3, uv: egui::Pos2::ZERO, color: $c3 });
+                self.mesh.vertices.push(egui::epaint::Vertex { pos: $p4, uv: egui::Pos2::ZERO, color: $c4 });
+                self.mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             }};
         }
         for i in 0..extended.len() - 1 {
@@ -1414,23 +1441,12 @@ impl VisualizerApp {
                     let p2 = bar_vertex(dir, perp2, anchor, len2, t_top);
                     let p3 = bar_vertex(dir, perp2, anchor, len2, t_bot);
                     let p4 = bar_vertex(dir, perp1, anchor, len1, t_bot);
-                    if is_blocks {
-                        let mid = egui::pos2((p1.x + p2.x + p3.x + p4.x) * 0.25, (p1.y + p2.y + p3.y + p4.y) * 0.25);
-                        let x_norm = ((mid.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                        let y_norm = (t_bot + t_top) * 0.5;
-                        let c = self.apply_vis(self.sample_color_changing(x_norm, y_norm, time));
-                        push_quad!(p1, c, p2, c, p3, c, p4, c);
-                    } else {
-                        let c1 = self.apply_vis(self.sample_color_changing(((p1.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0), t_top, time));
-                        let c2 = self.apply_vis(self.sample_color_changing(((p2.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0), t_top, time));
-                        let c3 = self.apply_vis(self.sample_color_changing(((p3.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0), t_bot, time));
-                        let c4 = self.apply_vis(self.sample_color_changing(((p4.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0), t_bot, time));
-                        push_quad!(p1, c1, p2, c2, p3, c3, p4, c4);
-                    }
+                    let c = self.animated_color_cache[k];
+                    push_quad!(p1, c, p2, c, p3, c, p4, c);
                 }
             }
         }
-        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
         if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
             for i in 0..visual_num_bars {
                 let (center, len) = bars[i];
@@ -1460,7 +1476,7 @@ impl VisualizerApp {
         }
     }
 
-    fn draw_bars(&self, painter: &egui::Painter, ctx: &egui::Context, rect: egui::Rect) {
+    fn draw_bars(&mut self, painter: &egui::Painter, ctx: &egui::Context, rect: egui::Rect) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 { return; }
         let time = ctx.input(|i| i.time) as f32;
@@ -1517,7 +1533,7 @@ impl VisualizerApp {
                 let rect_h = rect.height() * self.config.height_scale;
 
                 if is_smooth {
-                    let mut mesh = egui::Mesh::default();
+                    self.mesh.clear();
                     let steps = 6;
                     let mut prev_center: Option<(f32, f32)> = None;
                     let mut prev_color_bot = egui::Color32::TRANSPARENT;
@@ -1545,12 +1561,12 @@ impl VisualizerApp {
                                 let c_bot2 = lerp_color(prev_color_bot, color_bot, t2);
                                 let c_top1 = lerp_color(prev_color_top, color_top, t1);
                                 let c_top2 = lerp_color(prev_color_top, color_top, t2);
-                                let base_idx = mesh.vertices.len() as u32;
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_top1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, bottom_y), uv: egui::Pos2::ZERO, color: c_bot1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, bottom_y), uv: egui::Pos2::ZERO, color: c_bot2 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_top2 });
-                                mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+                                let base_idx = self.mesh.vertices.len() as u32;
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_top1 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, bottom_y), uv: egui::Pos2::ZERO, color: c_bot1 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, bottom_y), uv: egui::Pos2::ZERO, color: c_bot2 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_top2 });
+                                self.mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                             }
                         }
                         prev_center = Some((cx, cy));
@@ -1563,23 +1579,23 @@ impl VisualizerApp {
                         let left_x = first.x - bar_width / 2.0;
                         let first_c_bot = self.get_color_at(0, visual_num_bars, left_x, bottom_y, 0.0, gradient_rect, time);
                         let first_c_top = self.get_color_at(0, visual_num_bars, left_x, first.y, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, bottom_y), uv: egui::Pos2::ZERO, color: first_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, bottom_y), uv: egui::Pos2::ZERO, color: first_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, first.y), uv: egui::Pos2::ZERO, color: first_c_top });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
+                        let b_idx = self.mesh.vertices.len() as u32;
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_top });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, bottom_y), uv: egui::Pos2::ZERO, color: first_c_bot });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, bottom_y), uv: egui::Pos2::ZERO, color: first_c_bot });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, first.y), uv: egui::Pos2::ZERO, color: first_c_top });
+                        self.mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                         let right_x = last.x + bar_width / 2.0;
                         let last_c_bot = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, bottom_y, 0.0, gradient_rect, time);
                         let last_c_top = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, last.y, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bottom_y), uv: egui::Pos2::ZERO, color: last_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, bottom_y), uv: egui::Pos2::ZERO, color: last_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_top });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
+                        let b_idx = self.mesh.vertices.len() as u32;
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_top });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bottom_y), uv: egui::Pos2::ZERO, color: last_c_bot });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, bottom_y), uv: egui::Pos2::ZERO, color: last_c_bot });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_top });
+                        self.mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
                     if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
                         let mut pts = Vec::with_capacity(top_points.len() + 3);
                         pts.extend_from_slice(&top_points);
@@ -1605,7 +1621,7 @@ impl VisualizerApp {
                     return;
                 }
 
-                let mut mesh = egui::Mesh::default();
+                self.mesh.clear();
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let h = (self.current_bars[idx] * rect_h).min(if max_h > 0.0 { max_h } else { rect_h });
@@ -1614,14 +1630,14 @@ impl VisualizerApp {
                     let y_top = bottom_y - h;
                     let c_top = self.get_color_at(i, visual_num_bars, x0 + bar_width / 2.0, y_top, 1.0, gradient_rect, time);
                     let c_bot = self.get_color_at(i, visual_num_bars, x0 + bar_width / 2.0, bottom_y, 0.0, gradient_rect, time);
-                    let base_idx = mesh.vertices.len() as u32;
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y_top), uv: egui::Pos2::ZERO, color: c_top });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, bottom_y), uv: egui::Pos2::ZERO, color: c_bot });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, bottom_y), uv: egui::Pos2::ZERO, color: c_bot });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y_top), uv: egui::Pos2::ZERO, color: c_top });
-                    mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+                    let base_idx = self.mesh.vertices.len() as u32;
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y_top), uv: egui::Pos2::ZERO, color: c_top });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, bottom_y), uv: egui::Pos2::ZERO, color: c_bot });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, bottom_y), uv: egui::Pos2::ZERO, color: c_bot });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y_top), uv: egui::Pos2::ZERO, color: c_top });
+                    self.mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                 }
-                painter.add(egui::Shape::mesh(mesh));
+                painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
                 if self.config.visualizer_outline_enabled {
                     for i in 0..visual_num_bars {
                         let idx = frequency_index(i, base_num_bars, freq_dir);
@@ -1649,7 +1665,7 @@ impl VisualizerApp {
                 let top_y = rect.top() + self.config.y_offset;
                 let rect_h = rect.height() * self.config.height_scale;
                 if is_smooth {
-                    let mut mesh = egui::Mesh::default();
+                    self.mesh.clear();
                     let steps = 6;
                     let mut prev_center: Option<(f32, f32)> = None;
                     let mut prev_color_bot = egui::Color32::TRANSPARENT;
@@ -1677,12 +1693,12 @@ impl VisualizerApp {
                                 let c_top2 = lerp_color(prev_color_top, color_top, t2);
                                 let c_bot1 = lerp_color(prev_color_bot, color_bot, t1);
                                 let c_bot2 = lerp_color(prev_color_bot, color_bot, t2);
-                                let base_idx = mesh.vertices.len() as u32;
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, top_y), uv: egui::Pos2::ZERO, color: c_top1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_bot1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_bot2 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, top_y), uv: egui::Pos2::ZERO, color: c_top2 });
-                                mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+                                let base_idx = self.mesh.vertices.len() as u32;
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, top_y), uv: egui::Pos2::ZERO, color: c_top1 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_bot1 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_bot2 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, top_y), uv: egui::Pos2::ZERO, color: c_top2 });
+                                self.mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                             }
                         }
                         prev_center = Some((cx, cy));
@@ -1695,23 +1711,23 @@ impl VisualizerApp {
                         let left_x = first.x - bar_width / 2.0;
                         let first_c_top = self.get_color_at(0, visual_num_bars, left_x, top_y, 0.0, gradient_rect, time);
                         let first_c_bot = self.get_color_at(0, visual_num_bars, left_x, first.y, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, top_y), uv: egui::Pos2::ZERO, color: first_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, top_y), uv: egui::Pos2::ZERO, color: first_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, first.y), uv: egui::Pos2::ZERO, color: first_c_bot });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
+                        let b_idx = self.mesh.vertices.len() as u32;
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, top_y), uv: egui::Pos2::ZERO, color: first_c_top });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, top_y), uv: egui::Pos2::ZERO, color: first_c_top });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_bot });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, first.y), uv: egui::Pos2::ZERO, color: first_c_bot });
+                        self.mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                         let right_x = last.x + bar_width / 2.0;
                         let last_c_top = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, top_y, 0.0, gradient_rect, time);
                         let last_c_bot = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, last.y, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, top_y), uv: egui::Pos2::ZERO, color: last_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, top_y), uv: egui::Pos2::ZERO, color: last_c_top });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_bot });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_bot });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
+                        let b_idx = self.mesh.vertices.len() as u32;
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, top_y), uv: egui::Pos2::ZERO, color: last_c_top });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, top_y), uv: egui::Pos2::ZERO, color: last_c_top });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_bot });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_bot });
+                        self.mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
                     if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
                         let mut pts = Vec::with_capacity(top_points.len() + 3);
                         pts.extend_from_slice(&top_points);
@@ -1736,7 +1752,7 @@ impl VisualizerApp {
                     }
                     return;
                 }
-                let mut mesh = egui::Mesh::default();
+                self.mesh.clear();
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let h = (self.current_bars[idx] * rect_h).min(if max_h > 0.0 { max_h } else { rect_h });
@@ -1745,14 +1761,14 @@ impl VisualizerApp {
                     let y_bot = top_y + h;
                     let c_top = self.get_color_at(i, visual_num_bars, x0 + bar_width / 2.0, top_y, 0.0, gradient_rect, time);
                     let c_bot = self.get_color_at(i, visual_num_bars, x0 + bar_width / 2.0, y_bot, 1.0, gradient_rect, time);
-                    let base_idx = mesh.vertices.len() as u32;
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, top_y), uv: egui::Pos2::ZERO, color: c_top });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y_bot), uv: egui::Pos2::ZERO, color: c_bot });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y_bot), uv: egui::Pos2::ZERO, color: c_bot });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, top_y), uv: egui::Pos2::ZERO, color: c_top });
-                    mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+                    let base_idx = self.mesh.vertices.len() as u32;
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, top_y), uv: egui::Pos2::ZERO, color: c_top });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y_bot), uv: egui::Pos2::ZERO, color: c_bot });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y_bot), uv: egui::Pos2::ZERO, color: c_bot });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, top_y), uv: egui::Pos2::ZERO, color: c_top });
+                    self.mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                 }
-                painter.add(egui::Shape::mesh(mesh));
+                painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
                 if self.config.visualizer_outline_enabled {
                     for i in 0..visual_num_bars {
                         let idx = frequency_index(i, base_num_bars, freq_dir);
@@ -1780,7 +1796,7 @@ impl VisualizerApp {
                 let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
                 let rect_w = rect.width() * self.config.height_scale;
                 if is_smooth {
-                    let mut mesh = egui::Mesh::default();
+                    self.mesh.clear();
                     let steps = 6;
                     let mut prev_center: Option<(f32, f32)> = None;
                     let mut prev_color_left = egui::Color32::TRANSPARENT;
@@ -1808,12 +1824,12 @@ impl VisualizerApp {
                                 let c_left2 = lerp_color(prev_color_left, color_left, t2);
                                 let c_right1 = lerp_color(prev_color_right, color_right, t1);
                                 let c_right2 = lerp_color(prev_color_right, color_right, t2);
-                                let base_idx = mesh.vertices.len() as u32;
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y1), uv: egui::Pos2::ZERO, color: c_left1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_right1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_right2 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y2), uv: egui::Pos2::ZERO, color: c_left2 });
-                                mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+                                let base_idx = self.mesh.vertices.len() as u32;
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y1), uv: egui::Pos2::ZERO, color: c_left1 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_right1 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_right2 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y2), uv: egui::Pos2::ZERO, color: c_left2 });
+                                self.mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                             }
                         }
                         prev_center = Some((cx, cy));
@@ -1826,23 +1842,23 @@ impl VisualizerApp {
                         let top_y_first = first.y - bar_width / 2.0;
                         let first_c_left = self.get_color_at(0, visual_num_bars, left_x, top_y_first, 0.0, gradient_rect, time);
                         let first_c_right = self.get_color_at(0, visual_num_bars, first.x, top_y_first, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, first.y), uv: egui::Pos2::ZERO, color: first_c_left });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
+                        let b_idx = self.mesh.vertices.len() as u32;
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_left });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_right });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_right });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, first.y), uv: egui::Pos2::ZERO, color: first_c_left });
+                        self.mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                         let bot_y_last = last.y + bar_width / 2.0;
                         let last_c_left = self.get_color_at(visual_num_bars-1, visual_num_bars, left_x, bot_y_last, 0.0, gradient_rect, time);
                         let last_c_right = self.get_color_at(visual_num_bars-1, visual_num_bars, last.x, bot_y_last, 1.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, last.y), uv: egui::Pos2::ZERO, color: last_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_left });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
+                        let b_idx = self.mesh.vertices.len() as u32;
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, last.y), uv: egui::Pos2::ZERO, color: last_c_left });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_right });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_right });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_left });
+                        self.mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
                     if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
                         let mut pts = Vec::with_capacity(top_points.len() + 3);
                         pts.extend_from_slice(&top_points);
@@ -1867,7 +1883,7 @@ impl VisualizerApp {
                     }
                     return;
                 }
-                let mut mesh = egui::Mesh::default();
+                self.mesh.clear();
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let w = (self.current_bars[idx] * rect_w).min(if max_h > 0.0 { max_h } else { rect_w });
@@ -1876,14 +1892,14 @@ impl VisualizerApp {
                     let x1 = left_x + w;
                     let c_left = self.get_color_at(i, visual_num_bars, left_x, y0 + bar_width / 2.0, 0.0, gradient_rect, time);
                     let c_right = self.get_color_at(i, visual_num_bars, x1, y0 + bar_width / 2.0, 1.0, gradient_rect, time);
-                    let base_idx = mesh.vertices.len() as u32;
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y0), uv: egui::Pos2::ZERO, color: c_left });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y0), uv: egui::Pos2::ZERO, color: c_right });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_right });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y1), uv: egui::Pos2::ZERO, color: c_left });
-                    mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+                    let base_idx = self.mesh.vertices.len() as u32;
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y0), uv: egui::Pos2::ZERO, color: c_left });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y0), uv: egui::Pos2::ZERO, color: c_right });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_right });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y1), uv: egui::Pos2::ZERO, color: c_left });
+                    self.mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                 }
-                painter.add(egui::Shape::mesh(mesh));
+                painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
                 if self.config.visualizer_outline_enabled {
                     for i in 0..visual_num_bars {
                         let idx = frequency_index(i, base_num_bars, freq_dir);
@@ -1911,7 +1927,7 @@ impl VisualizerApp {
                 let start_y = rect.center().y - (total_size / 2.0) + self.config.y_offset;
                 let rect_w = rect.width() * self.config.height_scale;
                 if is_smooth {
-                    let mut mesh = egui::Mesh::default();
+                    self.mesh.clear();
                     let steps = 6;
                     let mut prev_center: Option<(f32, f32)> = None;
                     let mut prev_color_left = egui::Color32::TRANSPARENT;
@@ -1939,12 +1955,12 @@ impl VisualizerApp {
                                 let c_left2 = lerp_color(prev_color_left, color_left, t2);
                                 let c_right1 = lerp_color(prev_color_right, color_right, t1);
                                 let c_right2 = lerp_color(prev_color_right, color_right, t2);
-                                let base_idx = mesh.vertices.len() as u32;
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y1), uv: egui::Pos2::ZERO, color: c_right1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_left1 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_left2 });
-                                mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y2), uv: egui::Pos2::ZERO, color: c_right2 });
-                                mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+                                let base_idx = self.mesh.vertices.len() as u32;
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y1), uv: egui::Pos2::ZERO, color: c_right1 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y1), uv: egui::Pos2::ZERO, color: c_left1 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x2, y2), uv: egui::Pos2::ZERO, color: c_left2 });
+                                self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y2), uv: egui::Pos2::ZERO, color: c_right2 });
+                                self.mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                             }
                         }
                         prev_center = Some((cx, cy));
@@ -1957,23 +1973,23 @@ impl VisualizerApp {
                         let top_y_first = first.y - bar_width / 2.0;
                         let first_c_left = self.get_color_at(0, visual_num_bars, first.x, top_y_first, 1.0, gradient_rect, time);
                         let first_c_right = self.get_color_at(0, visual_num_bars, right_x, top_y_first, 0.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, first.y), uv: egui::Pos2::ZERO, color: first_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_right });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
+                        let b_idx = self.mesh.vertices.len() as u32;
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_left });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(first.x, first.y), uv: egui::Pos2::ZERO, color: first_c_left });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, first.y), uv: egui::Pos2::ZERO, color: first_c_right });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, top_y_first), uv: egui::Pos2::ZERO, color: first_c_right });
+                        self.mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                         let bot_y_last = last.y + bar_width / 2.0;
                         let last_c_left = self.get_color_at(visual_num_bars-1, visual_num_bars, last.x, bot_y_last, 1.0, gradient_rect, time);
                         let last_c_right = self.get_color_at(visual_num_bars-1, visual_num_bars, right_x, bot_y_last, 0.0, gradient_rect, time);
-                        let b_idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_left });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_right });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_right });
-                        mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
+                        let b_idx = self.mesh.vertices.len() as u32;
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_left });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_left });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_right });
+                        self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_right });
+                        self.mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
                     if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
                         let mut pts = Vec::with_capacity(top_points.len() + 3);
                         pts.extend_from_slice(&top_points);
@@ -1998,7 +2014,7 @@ impl VisualizerApp {
                     }
                     return;
                 }
-                let mut mesh = egui::Mesh::default();
+                self.mesh.clear();
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let w = (self.current_bars[idx] * rect_w).min(if max_h > 0.0 { max_h } else { rect_w });
@@ -2007,14 +2023,14 @@ impl VisualizerApp {
                     let x0 = right_x - w;
                     let c_left = self.get_color_at(i, visual_num_bars, x0, y0 + bar_width / 2.0, 1.0, gradient_rect, time);
                     let c_right = self.get_color_at(i, visual_num_bars, right_x, y0 + bar_width / 2.0, 0.0, gradient_rect, time);
-                    let base_idx = mesh.vertices.len() as u32;
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y0), uv: egui::Pos2::ZERO, color: c_left });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y0), uv: egui::Pos2::ZERO, color: c_right });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y1), uv: egui::Pos2::ZERO, color: c_right });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y1), uv: egui::Pos2::ZERO, color: c_left });
-                    mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+                    let base_idx = self.mesh.vertices.len() as u32;
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y0), uv: egui::Pos2::ZERO, color: c_left });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y0), uv: egui::Pos2::ZERO, color: c_right });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, y1), uv: egui::Pos2::ZERO, color: c_right });
+                    self.mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y1), uv: egui::Pos2::ZERO, color: c_left });
+                    self.mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                 }
-                painter.add(egui::Shape::mesh(mesh));
+                painter.add(egui::Shape::mesh(std::mem::take(&mut self.mesh)));
                 if self.config.visualizer_outline_enabled {
                     for i in 0..visual_num_bars {
                         let idx = frequency_index(i, base_num_bars, freq_dir);
@@ -3183,6 +3199,7 @@ impl eframe::App for VisualizerApp {
         if new_hash != self.last_palette_hash {
             self.update_palettes();
             self.last_palette_hash = new_hash;
+            self.computed_palette_hash = 0; // Force color cache refresh
         }
 
         if self.config.track_info.font_path != self.loaded_font_path {
@@ -3222,6 +3239,10 @@ impl eframe::App for VisualizerApp {
             self.current_bars[..limit].copy_from_slice(&frame.values[..limit]);
             self.current_peaks[..limit].copy_from_slice(&frame.peaks[..limit]);
             self.last_bpm = frame.bpm;
+            self.is_silent = frame.is_silent && self.track_info.is_none();
+        } else {
+            // If we didn't receive a frame, are we idle?
+            self.is_silent = self.current_bars.iter().all(|&x| x < 0.001) && self.track_info.is_none();
         }
 
         // ── Mouse passthrough (set once) ──────────────────────
@@ -3230,30 +3251,39 @@ impl eframe::App for VisualizerApp {
             self.is_passthrough_set = true;
         }
 
-        // ── Overlay drawing — direct painter, no Area overhead ──
-        let rect = ctx.screen_rect();
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Background,
-            egui::Id::new("overlay"),
-        ));
-
-        if self.config.bg_opacity > 0 {
-            let c = self.config.bg_color;
-            let bg_color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
-            painter.rect_filled(rect, 0.0, bg_color);
+        // ── Window Visibility Management ──────────────────────
+        let want_visible = !self.is_silent || self.show_settings;
+        if want_visible != self.is_window_visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(want_visible));
+            self.is_window_visible = want_visible;
         }
 
-        self.draw_bars(&painter, ctx, rect);
-        self.draw_track_info(&painter, ctx, rect);
+        // ── Overlay drawing — only if visible ─────────────────
+        if self.is_window_visible {
+            let rect = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("overlay"),
+            ));
 
-        if self.config.show_fps {
-            painter.text(
-                rect.left_top() + egui::vec2(20.0, 20.0),
-                egui::Align2::LEFT_TOP,
-                format!("FPS: {:.1}", self.current_fps),
-                egui::FontId::monospace(16.0),
-                egui::Color32::GREEN,
-            );
+            if self.config.bg_opacity > 0 {
+                let c = self.config.bg_color;
+                let bg_color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
+                painter.rect_filled(rect, 0.0, bg_color);
+            }
+
+            self.draw_bars(&mut painter, ctx, rect);
+            self.draw_track_info(&painter, ctx, rect);
+
+            if self.config.show_fps {
+                painter.text(
+                    rect.left_top() + egui::vec2(20.0, 20.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("FPS: {:.1}", self.current_fps),
+                    egui::FontId::monospace(16.0),
+                    egui::Color32::GREEN,
+                );
+            }
         }
 
         // ── Settings viewport ─────────────────────────────────
@@ -3320,11 +3350,6 @@ impl eframe::App for VisualizerApp {
         }
 
         // ── Propagate audio settings (skip when settings closed) ──
-        // AudioSettings can only be mutated via the settings UI, so we only
-        // need to compare (and potentially re-store) when the settings UI
-        // was shown this frame. `audio_dirty` is an explicit fast-path flag
-        // that bypasses the field-by-field comparison for preset applies
-        // and resets (which occur via button clicks outside slider flow).
         if had_settings_ui
             && (self.audio_dirty || self.config.audio != *self.audio_settings.load_full())
         {
@@ -3332,8 +3357,13 @@ impl eframe::App for VisualizerApp {
             self.audio_dirty = false;
         }
 
-        // ── 60 Hz repaint (VSync handles pacing) ──────────────
-        ctx.request_repaint();
+        // ── Conditional Repaint Logic ─────────────────────────
+        if want_visible {
+            ctx.request_repaint(); // 60 Hz when active
+        } else {
+            // Poll slowly when hidden/idle to check for new audio or SMTC updates
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) { self.config.save(); }
