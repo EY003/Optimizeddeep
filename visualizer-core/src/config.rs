@@ -1106,7 +1106,7 @@ pub struct AppConfig {
 }
 
 fn default_height_scale() -> f32 { DEFAULT_HEIGHT_SCALE }
-fn default_visualizer_opacity() -> u8 { DEFAULT_VISUALIZER_OPACITY }
+fn default_visualizer_opacity() -> u8 { 255 }
 fn default_settings_scale() -> f32 { DEFAULT_SETTINGS_SCALE }
 fn default_open_settings_on_launch() -> bool { DEFAULT_OPEN_SETTINGS_ON_LAUNCH }
 fn default_show_help_text() -> bool { DEFAULT_SHOW_HELP_TEXT }
@@ -1118,7 +1118,7 @@ impl Default for AppConfig {
             bg_opacity: DEFAULT_BG_OPACITY, bg_color: [0, 0, 0],
             x_offset: DEFAULT_X_OFFSET, y_offset: DEFAULT_Y_OFFSET,
             max_bar_height: DEFAULT_MAX_BAR_HEIGHT,
-            target_fps: DEFAULT_TARGET_FPS, show_fps: false, use_vsync: false,
+            target_fps: DEFAULT_TARGET_FPS, show_fps: false, use_vsync: true,
             height_scale: DEFAULT_HEIGHT_SCALE,
             visualizer_opacity: DEFAULT_VISUALIZER_OPACITY,
             settings_scale: DEFAULT_SETTINGS_SCALE,
