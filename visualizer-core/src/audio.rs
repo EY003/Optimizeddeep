@@ -14,7 +14,7 @@ use crate::config::{
     WeightingCurve, WindowFunction,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct BarFrame {
     pub values: Arc<Vec<f32>>,
     pub peaks: Arc<Vec<f32>>,
@@ -26,20 +26,20 @@ pub struct BarFrame {
 
 pub struct AudioEngine {
     pub device_name: String,
-    pub frame_rx: Receiver<BarFrame>,
+    pub shared_frame: Arc<ArcSwap<BarFrame>>,
     pub settings: Arc<ArcSwap<AudioSettings>>,
 }
 
 impl AudioEngine {
     pub fn new(initial: AudioSettings) -> Self {
         let settings = Arc::new(ArcSwap::from_pointee(initial));
+        let shared_frame = Arc::new(ArcSwap::from_pointee(BarFrame::default()));
 
-        let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
         let (sample_tx, sample_rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
         let (info_tx, info_rx) = crossbeam_channel::bounded(1);
 
         let settings_for_capture = settings.clone();
-        let capture_handle = thread::spawn(move || {
+        thread::spawn(move || {
             capture_loop(settings_for_capture, sample_tx, info_tx);
         });
 
@@ -48,12 +48,13 @@ impl AudioEngine {
             .unwrap_or_else(|_| ("Unknown".to_string(), 48000.0));
 
         let settings_for_analysis = settings.clone();
+        let shared_frame_analysis = shared_frame.clone();
+        
         thread::spawn(move || {
-            analysis_loop(settings_for_analysis, sample_rx, frame_tx, sample_rate);
+            analysis_loop(settings_for_analysis, sample_rx, shared_frame_analysis, sample_rate);
         });
 
-        drop(capture_handle);
-        Self { device_name, frame_rx, settings }
+        Self { device_name, shared_frame, settings }
     }
 }
 
@@ -168,7 +169,7 @@ fn capture_loop(
 fn analysis_loop(
     settings: Arc<ArcSwap<AudioSettings>>,
     sample_rx: Receiver<Vec<f32>>,
-    frame_tx: Sender<BarFrame>,
+    shared_frame: Arc<ArcSwap<BarFrame>>,
     sample_rate: f32,
 ) {
     let mut processor = AudioProcessor::new(sample_rate);
@@ -209,7 +210,7 @@ fn analysis_loop(
         last_tick = Instant::now();
 
         if let Some(frame) = processor.process(&history, &current, dt) {
-            let _ = frame_tx.try_send(frame);
+            shared_frame.store(Arc::new(frame));
         }
 
         let deadline = last_tick + poll_period;
@@ -252,7 +253,6 @@ struct AudioProcessor {
     beat_envelope: f32,
     time_elapsed: f64,
 
-    // Pre-allocated buffers for optimization
     raw_bars: Vec<f32>,
     mapped: Vec<f32>,
     smoothed: Vec<f32>,
@@ -372,8 +372,6 @@ impl AudioProcessor {
         }
         let window_slice = &history[history.len() - n_fft..];
 
-        // --- SILENCE FAST PATH ---
-        // Skip FFT and math entirely if the signal is zero.
         let max_val = window_slice.iter().map(|x| x.abs()).fold(0.0, f32::max);
         let is_silent = max_val < 1e-6;
 
@@ -391,7 +389,6 @@ impl AudioProcessor {
                 phase: self.phase,
             });
         }
-        // -------------------------
 
         let raw_rms = {
             let sum_sq: f32 = window_slice.iter().map(|x| x * x).sum();
@@ -522,11 +519,9 @@ impl AudioProcessor {
             }
         }
 
-        // --- FIX: Temporarily take ownership of `smoothed` to avoid mutable/immutable borrow overlap ---
         let smoothed = std::mem::take(&mut self.smoothed);
         self.update_ballistics(&smoothed, s, dt);
         self.smoothed = smoothed;
-        // ---------------------------------------------------------------------------------------------
 
         let (beat, phase) = self.detect_rhythm(s, dt);
 
@@ -678,7 +673,6 @@ impl AudioProcessor {
     }
 }
 
-// Helpers (make_window, make_bin_ranges, centers_from_ranges, a_weighting_db, k_weighting_db) remain the same as original
 fn make_window(kind: WindowFunction, n: usize) -> Vec<f32> {
     let mut w = vec![0.0f32; n];
     let denom = n.saturating_sub(1).max(1) as f32;
